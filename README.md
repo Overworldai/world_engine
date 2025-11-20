@@ -2,19 +2,18 @@
 
 Wayfarers Inference Library
 
-# Usage
+## Usage
 
-Install
+### Setup
 ```
+# Install
 pip install git+https://github.com/Wayfarer-Labs/world_engine
+
+# Specify HuggingFace Token (https://huggingface.co/settings/tokens)
+export HF_TOKEN=<your access token>
 ```
 
-Specify [HuggingFace Token](https://huggingface.co/settings/tokens)
-```
-export HF_TOKEN=...
-```
-
-Run:
+### Run
 ```
 from world_engine import WorldEngine, CtrlInput
 
