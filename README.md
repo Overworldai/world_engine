@@ -9,7 +9,7 @@ Install
 pip install git+https://github.com/Wayfarer-Labs/world_engine
 ```
 
-Specify [HuggingFace Token](# https://huggingface.co/settings/tokens)
+Specify [HuggingFace Token](https://huggingface.co/settings/tokens)
 ```
 export HF_TOKEN=...
 ```
