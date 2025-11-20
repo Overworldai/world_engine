@@ -39,10 +39,12 @@ for controller_input in [
 A tool which does one thing and does it well
 
 In scope:
+- An abstraction away from the WM:
+  - No knowledge of DiT, autoencoder, or text encoder needed
+  - user works in the space of controller inputs, text prompts, and images
 - Optimized implementations for Nvidia, AMD, Apple Silicon, etc
 - Consumer and data center hardware
-- Abstracting away the DiT and Autoencoder models - user only handles controller inputs, text prompts, and images.
-- Loading World Models and LoRA adapters
+- Loading base World Models and LoRA adapters
 
 ### What this package isn't
 This isn't a full featured client, it's a core library.
