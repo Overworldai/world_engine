@@ -1,6 +1,11 @@
-# World Engine
+<div align="center">
 
-World Model Inference Engine Library
+# 🌐 OverWorld Inference Engine
+
+<p align="center">
+  Inference Engine for World Models
+</p>
+
 
 ## Usage
 
