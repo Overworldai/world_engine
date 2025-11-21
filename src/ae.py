@@ -168,4 +168,5 @@ class InferenceAE:
     @torch.compile
     def decode(self, latent: Tensor):
         # Decode single latent: [C, H, W]
-        return self.ae_model.decoder(latent * self.scale)
+        decoded = self.ae_model.decoder(latent * self.scale)
+        return ((decoded + 1) / 2).to(torch.uint8)
