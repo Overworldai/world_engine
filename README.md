@@ -27,7 +27,7 @@ engine = WorldEngine("OpenWorldLabs/CoD-Img-Base", device=device)
 # Specify a prompt
 engine.set_prompt("A fun game")
 
-# Generate 3 video frames using controller inputs
+# Generate 3 video frames conditioned on controller inputs
 for controller_input in [
 		CtrlInput(button={48, 42}, mouse=[0.4, 0.3]),
 		CtrlInput(mouse=[0.1, 0.2]),
@@ -47,13 +47,14 @@ In scope:
 - Optimized implementations for Nvidia, AMD, Apple Silicon, etc
 - Consumer and data center hardware
 - Loading base World Models and LoRA adapters
+- Performing all steps necessary to create a frame image conditioned on history, controls, and a text string
 
 ### What this package isn't
 This isn't a fully featured client, it's a core library.
 
 Out of scope:
-- Rendering video
-- Reading controllers / keyboard inputs
+- Rendering / displaying video and images
+- Reading controllers or keyboard inputs
 - FAL integration, other integrations
 
 Anything out of scope can be added to `examples/`, which isn't part of the `world_engine.*` package.

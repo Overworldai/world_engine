@@ -20,38 +20,31 @@ def parse_requirements(path: str):
     requirements = []
 
     def _parse(file_path: Path):
-        for line in file_path.read_text().splitlines():
-            line = line.strip()
+        for raw in file_path.read_text().splitlines():
+            line = raw.strip()
             if not line or line.startswith("#"):
                 continue
+
+            # Follow included requirement files
             if line.startswith("-r "):
                 included = line.split(maxsplit=1)[1]
                 _parse(file_path.parent / included)
                 continue
 
-            # Normalize git-based requirements to valid PEP 508
-            if "git+" in line:
-                s = line
-                # drop editable flag if present
-                if s.startswith("-e "):
-                    s = s[3:].strip()
+            # Special case: owl-vaes uses this git URL, which actually installs lpips
+            if line.startswith("git+https://github.com/shahbuland/PerceptualSimilarity"):
+                # Use the published package instead of the bare git URL
+                requirements.append("lpips==0.1.4")
+                continue
 
-                url = s
-                name = None
+            # For any other VCS lines, you can either ignore or handle later.
+            if line.startswith("git+"):
+                # For now: skip other git dependencies rather than breaking install_requires
+                # (add handling if you need them installed automatically)
+                continue
 
-                if "#egg=" in s:
-                    url, egg = s.split("#egg=", 1)
-                    url = url.strip()
-                    name = egg.strip()
-                else:
-                    url = s.split()[0]
-                    name = url.rsplit("/", 1)[-1]
-                    if name.endswith(".git"):
-                        name = name[:-4]
-
-                requirements.append(f"{name} @ {url}")
-            else:
-                requirements.append(line)
+            # Normal requirement line
+            requirements.append(line)
 
     _parse(path)
     return requirements
