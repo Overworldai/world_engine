@@ -6,7 +6,26 @@
 </div>
 
 
-## Usage
+## Overview
+
+Core library for model and inference plumbing:
+
+- Simple API to load models and generate image frames from text, control inputs, and prior frames
+- Encapsulates the frame-generation stack (DiT, autoencoder, text encoder, KV cache)
+- Optimized backends for Nvidia, AMD, Apple Silicon, etc., on consumer and data center GPUs
+- Loading base World Models and LoRA adapters
+
+### Out of scope
+
+Not a full client:
+
+- No rendering/display of video or images
+- No reading controller/keyboard/mouse input
+- No FAL or other external integrations
+
+Out-of-scope pieces can go in `examples/`, which is **not** part of the `world_engine.*` package.
+
+## Quick Start
 
 #### Setup
 ```
@@ -27,6 +46,10 @@ engine = WorldEngine("OpenWorldLabs/CoD-Img-Base", device="cuda")
 # Specify a prompt
 engine.set_prompt("A fun game")
 
+# Optional: Force the next frame to be a specific image
+img = pipeline.append_frame(uint8_img)
+
+
 # Generate 3 video frames conditioned on controller inputs
 for controller_input in [
 		CtrlInput(button={48, 42}, mouse=[0.4, 0.3]),
@@ -36,25 +59,41 @@ for controller_input in [
 	img = engine.gen_frame(ctrl=controller_input)
 ```
 
-## Scope
+## Docs
 
-### What this package is
-A library that takes care of model and inference plumbing
-- Encapsulates the frame-generation pipeline, including the DiT, autoencoder, text encoder, and KV cache
-- Provides you a simple interface to specify a model and perform generation steps conditioned on controller inputs, text prompts, and images
+### WorldEngine
 
-In scope:
-- Optimized implementations for Nvidia, AMD, Apple Silicon, etc
-- Support for both consumer and data center GPUs
-- Loading base World Models and LoRA adapters
-- Generating frame images conditioned on prior frames, control inputs, and text prompts
+`WorldEngine` computes each new frame from past frames, the controls, and the current prompt, then appends it to the sequence so later frames stay aligned with what has already been generated.
 
-### What this package isn't
-This isn't a fully featured client, it's a core library.
+## Usage
+```
+from world_engine import WorldEngine, CtrlInput
+```
 
-Out of scope:
-- Rendering or displaying video and images
-- Reading controller, keyboard, or mouse input from devices
-- FAL, and other integrations
+Load model to GPU
+```
+engine = WorldEngine("OpenWorldLabs/CoD-Img-Base", device="cuda")
+```
 
-Anything out of scope can be added to `examples/`, which isn't part of the `world_engine.*` package.
+Avoid expensive recompilation through caching
+```
+engine = WorldEngine("OpenWorldLabs/CoD-Img-Base", device="cuda", compile_cache_path="~/.cache/world_engine/")
+```
+
+Specify a prompt which will be used until this function is called again
+```
+engine.set_prompt("A fun game")
+```
+
+Generate a image conditioned on current controller input (explicit) and history / prompt (implicit)
+```
+controller_input = CtrlInput(button={48, 42}, mouse=[0.4, 0.3])
+img = engine.gen_frame(ctrl=controller_input)
+```
+
+Instead of generating next frame, **set** the next frame to be a specific image. This is typically done as the first step.
+```
+# example: random noise image
+uint8_img = torch.randint(0, 256, (512, 512, 3), dtype=torch.uint8)
+img = pipeline.append_frame(uint8_img)  # returns passed image
+```
