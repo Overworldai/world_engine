@@ -5,6 +5,7 @@
 <p align="center">
   Inference Engine for World Models
 </p>
+</div>
 
 
 ## Usage
