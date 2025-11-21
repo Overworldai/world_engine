@@ -1,3 +1,7 @@
+# World Engine
+
+World Model Inference Engine Library
+
 ## Usage
 
 ### Setup
@@ -28,7 +32,7 @@ for controller_input in [
 	img = engine.gen_frame(ctrl=controller_input)
 ```
 
-# Scope
+## Scope
 
 ### What this package is
 A tool which does one thing and does it well
