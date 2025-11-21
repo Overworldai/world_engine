@@ -10,4 +10,4 @@ xformers
 -r submodules/owl-wms/owl-vaes/requirements.txt
 
 # Hacky imports (should be bundled by dependencies, but aren't)
-PerceptualSimilarity @ git+https://github.com/shahbuland/PerceptualSimilarity
+# PerceptualSimilarity @ git+https://github.com/shahbuland/PerceptualSimilarity
