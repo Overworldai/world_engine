@@ -60,6 +60,7 @@ setup(
         "world_engine",
         "depth_anything_v2",
         "depth_anything_v2.dinov2_layers",
+        "depth_anything_v2.util",
         "owl_vaes",
         "owl_wms",
         "owl_wms.models",
