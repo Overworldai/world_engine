@@ -1,7 +1,3 @@
-# World Engine
-
-Wayfarers Inference Library
-
 ## Usage
 
 ### Setup
