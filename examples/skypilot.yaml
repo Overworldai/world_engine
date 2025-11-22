@@ -13,7 +13,7 @@ file_mounts:
 
 setup: |
   set -a && source /app/my.env && set +a
-  pip install -e git+https://$GITHUB_USER:$GITHUB_TOKEN@github.com/Wayfarer-Labs/world_engine.git#egg=world_engine
+  pip install -e world_engine@git+https://$GITHUB_USER:$GITHUB_TOKEN@github.com/Wayfarer-Labs/world_engine.git
 
 run: |
   python3 - c "from world_engine import WorldEngine, CtrlInput"

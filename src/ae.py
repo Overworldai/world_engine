@@ -169,4 +169,6 @@ class InferenceAE:
     def decode(self, latent: Tensor):
         # Decode single latent: [C, H, W]
         decoded = self.ae_model.decoder(latent * self.scale)
-        return ((decoded + 1) / 2 * 256).to(torch.uint8)
+        decoded = (decoded / 2 + 0.5).clamp(0, 1)  # [-1,1] -> [0,1]
+        decoded = (decoded * 255).round().to(torch.uint8)  # uint8 [0,255]
+        return decoded
