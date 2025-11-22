@@ -73,6 +73,7 @@ class WorldEngine:
 
     @torch.inference_mode()
     def _push_frame_state(self, x, ctrl=None):
+        ctrl = ctrl if ctrl is not None else CtrlInput()
         new_frame_state = {
             "button": torch.bincount(
                 torch.tensor(list(ctrl.button), dtype=torch.long), minlength=self.model_cfg.n_buttons,

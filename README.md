@@ -30,7 +30,7 @@ Out-of-scope pieces can go in `examples/`, which is **not** part of the `world_e
 #### Setup
 ```
 # Install
-pip install "world_engine@git+https://github.com/Wayfarer-Labs/world_engine.git"
+pip install "world_engine @ git+https://github.com/Wayfarer-Labs/world_engine.git"
 
 # Specify HuggingFace Token (https://huggingface.co/settings/tokens)
 export HF_TOKEN=<your access token>
@@ -48,7 +48,6 @@ engine.set_prompt("A fun game")
 
 # Optional: Force the next frame to be a specific image
 img = pipeline.append_frame(uint8_img)
-
 
 # Generate 3 video frames conditioned on controller inputs
 for controller_input in [
@@ -95,9 +94,28 @@ controller_input = CtrlInput(button={48, 42}, mouse=[0.4, 0.3])
 img = engine.gen_frame(ctrl=controller_input)
 ```
 
-Instead of generating next frame, **set** the next frame to be a specific image. This is typically done as the first step.
+Instead of generating, **set** the next frame as a specific image. Typically done as a step before generating.
 ```
 # example: random noise image
 uint8_img = torch.randint(0, 256, (512, 512, 3), dtype=torch.uint8)
 img = pipeline.append_frame(uint8_img)  # returns passed image
 ```
+
+Note: returned `img` is always on the same device as `engine.device`
+
+
+### CtrlInput
+
+```
+@dataclass
+class CtrlInput:
+    button: Set[int] = field(default_factory=set)  # pressed button IDs
+    mouse: Tuple[float, float] = (0.0, 0.0)  # (x, y) position
+```
+
+Keycodes are defined by [Owl-Control](https://github.com/Wayfarer-Labs/owl-control/blob/main/src/system/keycode.rs)
+
+
+## Examples
+- Play game locally
+- Deploy to skypilot with
