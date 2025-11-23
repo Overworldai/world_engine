@@ -26,9 +26,7 @@ class InferenceConfig:
 # Global torch optimizations
 torch._dynamo.config.recompile_limit = 64
 
-torch.set_float32_matmul_precision("medium")  # or "medium" for more TF32, "highest" to disable TF32
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision("medium")  # low: bf16, medium: tf32, high: fp32
 
 
 class WorldEngine:
