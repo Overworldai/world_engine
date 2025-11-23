@@ -171,4 +171,5 @@ class InferenceAE:
         decoded = self.ae_model.decoder(latent * self.scale)
         decoded = (decoded / 2 + 0.5).clamp(0, 1)  # [-1,1] -> [0,1]
         decoded = (decoded * 255).round().to(torch.uint8)  # uint8 [0,255]
+        decoded = decoded.squeeze(0).permute(1, 2, 0)[:3]  # [H, W, 3]  (strips depth)
         return decoded
