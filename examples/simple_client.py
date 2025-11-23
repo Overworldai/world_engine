@@ -9,7 +9,7 @@ import torch
 from world_engine import WorldEngine, CtrlInput
 
 
-async def render(frames: AsyncIterable[torch.Tensor], win_name="OverWorLd (ESC to exit)") -> None:
+async def render(frames: AsyncIterable[torch.Tensor], win_name="Hello (Over)World (ESC to exit)") -> None:
     """Render stream of RGB tensor images."""
     cv2.namedWindow(win_name, cv2.WINDOW_AUTOSIZE | cv2.WINDOW_GUI_NORMAL)
     async for t in frames:
