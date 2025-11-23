@@ -64,6 +64,19 @@ for controller_input in [
 
 `WorldEngine` computes each new frame from past frames, the controls, and the current prompt, then appends it to the sequence so later frames stay aligned with what has already been generated.
 
+
+### CtrlInput
+
+```
+@dataclass
+class CtrlInput:
+    button: Set[int] = field(default_factory=set)  # pressed button IDs
+    mouse: Tuple[float, float] = (0.0, 0.0)  # (x, y) position
+```
+
+- `button` keycodes are defined by [Owl-Control](https://github.com/Wayfarer-Labs/owl-control/blob/main/src/system/keycode.rs)
+- `mouse` is the raw mouse velocity vector
+
 ## Usage
 ```
 from world_engine import WorldEngine, CtrlInput
@@ -102,19 +115,6 @@ img = pipeline.append_frame(uint8_img)  # returns passed image
 ```
 
 Note: returned `img` is always on the same device as `engine.device`
-
-
-### CtrlInput
-
-```
-@dataclass
-class CtrlInput:
-    button: Set[int] = field(default_factory=set)  # pressed button IDs
-    mouse: Tuple[float, float] = (0.0, 0.0)  # (x, y) position
-```
-
-- `button` keycodes are defined by [Owl-Control](https://github.com/Wayfarer-Labs/owl-control/blob/main/src/system/keycode.rs)
-- `mouse` is the raw mouse velocity vector
 
 
 ## Examples
