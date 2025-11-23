@@ -23,7 +23,7 @@ class CtrlInput:
 
 @dataclass
 class InferenceConfig:
-    scheduler_sigmas: List[float] = field(default_factory=[1.0, 0.8, 0.6, 0.4, 0.2, 0.0])
+    scheduler_sigmas: List[float] = field(default_factory=lambda: [1.0, 0.8, 0.6, 0.4, 0.2, 0.0])
     noise_prev: float = 0.0
 
 
