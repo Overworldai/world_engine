@@ -117,6 +117,6 @@ Keycodes are defined by [Owl-Control](https://github.com/Wayfarer-Labs/owl-contr
 
 
 ## Examples
-- ["Hello OverWorLd" client](./examples/simple_client.py)
+- ["Hello (Over)World" client](./examples/simple_client.py)
 - [Deploy to skypilot](./examples/skypilot.yaml)
 - [Benchmark](./examples/benchmark.py)
