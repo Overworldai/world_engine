@@ -117,5 +117,6 @@ Keycodes are defined by [Owl-Control](https://github.com/Wayfarer-Labs/owl-contr
 
 
 ## Examples
-- Play game locally
-- Deploy to skypilot with
+- ["Hello OverWorLd" client](./examples/simple_client.py)
+- [Deploy to skypilot](./examples/skypilot.yaml)
+- [Benchmark](./examples/benchmark.py)
