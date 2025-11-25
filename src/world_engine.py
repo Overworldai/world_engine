@@ -34,8 +34,6 @@ class OptimizationConfig:
 
 
 class WorldEngine:
-    uncached_k = 1  # Number of uncached frames, a property of our denoising strategy
-
     def __init__(
         self,
         model_uri: str,
@@ -84,11 +82,8 @@ class WorldEngine:
             "mouse": torch.empty(1, 0, 2, device=dev, dtype=dt),
             "button": torch.empty(1, 0, cfg.n_buttons, device=dev, dtype=dt),
         }
-        self.kv_cache = StaticKVCache(
-            cfg, max_seq_len=512, batch_size=1, dtype=dt, n_uncached_frames=self.uncached_k
-        ).to(dev)
+        self.kv_cache = StaticKVCache(cfg, max_seq_len=512, batch_size=1, dtype=dt).to(dev)
         self.frame_idx = 0
-
 
     @torch.inference_mode()
     def _push_frame_state(self, x, ctrl=None):
@@ -145,9 +140,9 @@ class WorldEngine:
             x[:, -1:] = (x[:, -1:] + step_dsig * v[:, -1:]).type_as(x)
 
             # remove cached portions from sequence
-            state = {k: s[:, -self.uncached_k:] for k, s in state.items()}
-            x = x[:, -self.uncached_k:]
-            sigma = sigma[:, -self.uncached_k:]
+            state = {k: s[:, -self.kv_cache.n_uncached:] for k, s in state.items()}
+            x = x[:, -self.kv_cache.n_uncached:]
+            sigma = sigma[:, -self.kv_cache.n_uncached:]
 
         state["x"] = x
         self.uncached_buffer = state
