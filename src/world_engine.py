@@ -118,9 +118,10 @@ class WorldEngine:
             x=torch.randn(shape[0], 1, *shape[2:], device=self.device, dtype=self.dtype),
             ctrl=ctrl,
         )
-        self.denoise_frame()  # Denoise last frame. Side effect: update buffer / kv cache
-        img = self.vae.decode(self.uncached_buffer["x"][:, -1])  # decode last frame -> image
-        return img
+        with torch.amp.autocast('cuda', torch.bfloat16):
+            self.denoise_frame()  # Denoise last frame. Side effect: update buffer / kv cache
+            img = self.vae.decode(self.uncached_buffer["x"][:, -1])  # decode last frame -> image
+            return img
 
     def set_prompt(self, prompt: str, timestamp: float = 0.0):
         """Apply text conditioning for T2V"""
