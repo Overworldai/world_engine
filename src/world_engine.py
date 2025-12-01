@@ -50,7 +50,6 @@ class WorldEngine:
 
         # TODO: remove these hardcoding hacks:
         self.model_cfg.n_buttons = self.model_cfg.n_controller_inputs - 2
-        self.model_cfg.causal = True
 
         if model_config_overrides:
             self.model_cfg.merge_with(model_config_overrides)
@@ -61,6 +60,7 @@ class WorldEngine:
         # self.prompt_encoder = PromptEncoder("google/umt5-xl").to(device).eval()  # TODO: dont hardcode
 
         # Inference Scheduler
+        assert self.inference_config.noise_prev == 0.0, "Only zero-noise supported currently"
         self.scheduler_sigmas = torch.tensor(self.inference_config.scheduler_sigmas, device=device, dtype=dtype)
 
         # State
@@ -111,7 +111,6 @@ class WorldEngine:
         return img
 
     @torch.inference_mode()
-    @torch.compile()
     def gen_frame(self, ctrl: CtrlInput = None):
         shape = self.uncached_buffer["x"].shape
         # prepare frame inputs + random N latent
@@ -120,7 +119,7 @@ class WorldEngine:
             ctrl=ctrl,
         )
         with torch.amp.autocast('cuda', torch.bfloat16):
-            self.denoise_frame()  # Denoise last frame. Side effect: update buffer / kv cache
+            self.uncached_buffer, self.kv_cache = self.denoise_frame(self.uncached_buffer, self.kv_cache)
             img = self.vae.decode(self.uncached_buffer["x"][:, -1])  # decode last frame -> image
             return img
 
@@ -130,24 +129,25 @@ class WorldEngine:
         warnings.warn("Not Implemented")
 
     @torch.compile
-    def denoise_frame(self):
+    def denoise_frame(self, uncached_buffer: Dict[str, Tensor], kv_cache):
         """Advance state. Side effects: Updates uncached_buffer, kv_cache"""
-        x = self.uncached_buffer["x"]
-        state = {k: v for k, v in self.uncached_buffer.items() if k != "x"}
+        x = uncached_buffer["x"]
+        state = {k: v for k, v in uncached_buffer.items() if k != "x"}
         sigma = x.new_full((x.size(0), x.size(1)), self.inference_config.noise_prev)
+        # Note: doesn't renoise latents, only noise_prev == 0.0 supported
 
         for step_sig, step_dsig in zip(self.scheduler_sigmas, self.scheduler_sigmas.diff()):
             sigma[:, -1] = step_sig  # update rollout sigma
-            v = self.model(x, sigma, **state, kv_cache=self.kv_cache)
+            v = self.model(x, sigma, **state, kv_cache=kv_cache)
             x[:, -1:] = (x[:, -1:] + step_dsig * v[:, -1:]).type_as(x)
 
             # remove cached portions from sequence
-            state = {k: s[:, -self.kv_cache.n_uncached_frames:] for k, s in state.items()}
-            x = x[:, -self.kv_cache.n_uncached_frames:]
-            sigma = sigma[:, -self.kv_cache.n_uncached_frames:]
+            state = {k: s[:, -kv_cache.n_uncached_frames:] for k, s in state.items()}
+            x = x[:, -kv_cache.n_uncached_frames:]
+            sigma = sigma[:, -kv_cache.n_uncached_frames:]
 
         state["x"] = x
-        self.uncached_buffer = state
+        return state, kv_cache
 
 
 # TODO
