@@ -4,8 +4,8 @@ from torch.profiler import profile, ProfilerActivity
 from world_engine import WorldEngine
 
 
-def do_profile(n_frames=8, row_limit=20):
-    engine = WorldEngine("OpenWorldLabs/CoDCtl-Causal", device="cuda")
+def do_profile(n_frames=64, row_limit=20):
+    engine = WorldEngine("OpenWorldLabs/CoDCtl-Causal-Flux-SelfForcing", device="cuda")
     # warmup
     for _ in range(4):
         engine.gen_frame()

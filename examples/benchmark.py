@@ -49,12 +49,8 @@ def print_env_info():
 
 
 @pytest.fixture(scope="session")
-def engine():
-    engine = WorldEngine(
-        "OpenWorldLabs/CoDCtl-Causal",
-        device="cuda",
-        model_config_overrides={"n_frames": 512},
-    )
+def engine(model_uri="OpenWorldLabs/CoDCtl-Causal-Flux-SelfForcing"):
+    engine = WorldEngine(model_uri, device="cuda")
     # global warmup
     for _ in range(3):
         engine.gen_frame()

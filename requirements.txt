@@ -4,7 +4,7 @@
 -r submodules/owl-wms/owl-vaes/requirements.txt
 
 # Core stack
-torch==2.9.0
+torch==2.9.1
 torchvision
 torchaudio
 xformers

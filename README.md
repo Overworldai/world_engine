@@ -41,7 +41,7 @@ export HF_TOKEN=<your access token>
 from world_engine import WorldEngine, CtrlInput
 
 # Create inference engine
-engine = WorldEngine("OpenWorldLabs/CoD-Img-Base", device="cuda")
+engine = WorldEngine("OpenWorldLabs/CoDCtl-Causal-SelfForcing-UniformSigma", device="cuda")
 
 # Specify a prompt
 engine.set_prompt("A fun game")
@@ -84,16 +84,7 @@ from world_engine import WorldEngine, CtrlInput
 
 Load model to GPU
 ```
-engine = WorldEngine("OpenWorldLabs/CoD-Img-Base", device="cuda")
-```
-
-Avoid expensive recompilation through caching
-```
-engine = WorldEngine(
-    "OpenWorldLabs/CoD-Img-Base",
-    device="cuda",
-    compile_cache_path="~/.cache/world_engine/"
-)
+engine = WorldEngine("OpenWorldLabs/CoDCtl-Causal-SelfForcing-UniformSigma", device="cuda")
 ```
 
 Specify a prompt which will be used until this function is called again
@@ -119,5 +110,4 @@ Note: returned `img` is always on the same device as `engine.device`
 
 ## Examples
 - ["Hello (Over)World" client](./examples/simple_client.py)
-- [Deploy to skypilot](./examples/skypilot.yaml)
 - [Run Performance Benchmarks (`pytest examples/benchmark.py`)](./examples/benchmark.py)
