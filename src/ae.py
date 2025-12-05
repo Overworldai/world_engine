@@ -138,6 +138,8 @@ class BatchedDepthPipe:
 
 class InferenceAE:
     def __init__(self, ae_model, device=None, dtype=torch.bfloat16):
+        self.device = device
+        self.dtype = dtype
         self.ae_model = ae_model.eval().to(device=device, dtype=dtype)
         self.depth_model = BatchedDepthPipe(input_mode="bfloat16", batch_size=1)
 
@@ -154,10 +156,9 @@ class InferenceAE:
 
     def encode(self, img: Tensor):
         """RGB -> RGB+D -> latent"""
-        device = next(self.ae_model.parameters()).device
         assert img.dim() == 3
         img = img.unsqueeze(0)  # [H,W,C] -> [1,H,W,C]
-        img = img.to(device=device, dtype=torch.bfloat16)
+        img = img.to(device=self.device, dtype=self.dtype)
         img = img.permute(0, 3, 1, 2).contiguous()
         rgb = img.div(255.0).mul(2.0).sub(1.0)
         depth = self.depth_model(rgb)

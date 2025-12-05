@@ -120,4 +120,4 @@ Note: returned `img` is always on the same device as `engine.device`
 ## Examples
 - ["Hello (Over)World" client](./examples/simple_client.py)
 - [Deploy to skypilot](./examples/skypilot.yaml)
-- [Benchmark](./examples/benchmark.py)
+- [Run Performance Benchmarks (`pytest examples/benchmark.py`)](./examples/benchmark.py)
