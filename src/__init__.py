@@ -1,3 +1,3 @@
-from .world_engine import WorldEngine, CtrlInput
+from .world_engine import WorldEngine, CtrlInput, InferenceConfig
 
-__all__ = ["WorldEngine", "CtrlInput"]
+__all__ = ["WorldEngine", "CtrlInput", "InferenceConfig"]

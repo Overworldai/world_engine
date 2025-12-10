@@ -26,20 +26,10 @@ class CtrlInput:
 
 @dataclass
 class InferenceConfig:
-    quantize: bool = True  # False: bf16, true: w8a8
+    quant: Optional[str] = "fp8"
     # TODO: use model config scheduler sigmas
     # scheduler_sigmas: Optional[List[float]] = field(default_factory=lambda: [1.0, 0.75, 0.5, 0.25, 0.0])
     # noise_prev: float = 0.0  # always 0 due to self forcing
-
-
-@dataclass
-class OptimizationConfig:
-    pass  # TODO
-"""
-TODO: quantization options
-- bf16
-- a8w8: Float8DynamicActivationFloat8WeightConfig
-"""
 
 
 class WorldEngine:
@@ -47,7 +37,6 @@ class WorldEngine:
         self,
         model_uri: str,
         inference_config: Optional[InferenceConfig] = None,
-        optimization_config: Optional[OptimizationConfig] = None,
         model_config_overrides: Optional[Dict] = None,
         device=None,
         dtype=torch.bfloat16,
@@ -70,9 +59,8 @@ class WorldEngine:
         # self.prompt_encoder = PromptEncoder("google/umt5-xl").to(device).eval()  # TODO: dont hardcode
         self.model = WorldModel.from_pretrained(model_uri, cfg=self.model_cfg).to(device=device, dtype=dtype).eval()
 
-        # TODO: clean up quantization logic
-        if inference_config.quantize:
-            self.quantize(self.model)
+        self.model = WorldModel(self.model_cfg).to(device=device, dtype=dtype).eval()
+        self.quantize(self.model, inference_config.quant)
 
         # Inference Scheduler
         self.scheduler_sigmas = torch.tensor(self.model_cfg.scheduler_sigmas, device=device, dtype=dtype)
@@ -85,14 +73,51 @@ class WorldEngine:
         self.frame_ts = torch.tensor([[0]], dtype=torch.long, device=device)
         self.reset()
 
-    def quantize(self, model):
-        from torchao.quantization import quantize_, Float8DynamicActivationFloat8WeightConfig, PerRow
+    def quantize(self, model, quant: Optional[str] = None):
+        import torch
+        from torchao.quantization import (
+            quantize_,
+            Float8DynamicActivationFloat8WeightConfig,
+            Int4WeightOnlyConfig,
+            Int8WeightOnlyConfig,
+            PerRow,
+            int4_dynamic_activation_int4_weight
+        )
+        from torchao.prototype.mx_formats import (
+            MXDynamicActivationMXWeightConfig,
+            NVFP4DynamicActivationNVFP4WeightConfig,
+        )
+        from torchao.dtypes import MarlinSparseLayout
+        from torchao.quantization.utils import recommended_inductor_config_setter
+
+        if quant is None:
+            return
 
         def is_bf16_linear(mod: nn.Module, _: str) -> bool:
             weight = getattr(mod, "weight", None)
-            return isinstance(mod, nn.Linear) and getattr(weight, "dtype", None) is torch.bfloat16
+            divisible = all([d % 32 == 0 for d in getattr(weight, "shape", [])])
+            return isinstance(mod, nn.Linear) and getattr(weight, "dtype", None) is torch.bfloat16 and divisible
 
-        quant_cfg = Float8DynamicActivationFloat8WeightConfig(granularity=PerRow())
+        # Short names -> torchao config factories
+        quant_cfg = {
+            # Float8 dynamic activations + weights (original behavior)
+            "fp8": lambda: Float8DynamicActivationFloat8WeightConfig(granularity=PerRow()),
+            # Int4 weight-only
+            "int4": lambda: Int4WeightOnlyConfig(version=1),
+            # Int4 weight-only + 2:4 layout (Sparse-Marlin kernel; assumes 2:4-sparse weights)
+            "int4sp": lambda: Int4WeightOnlyConfig(group_size=128, layout=MarlinSparseLayout(), version=1),
+            # Int8 weight-only
+            "int8": lambda: Int8WeightOnlyConfig(),
+            # W4A4 dynamic activations + weights (CUTLASS-based kernel)
+            "w4a4": lambda: int4_dynamic_activation_int4_weight(),
+            # Microscaling formats (prototype; MXFP8 + NVFP4/FP4)
+            "mxfp8": lambda: MXDynamicActivationMXWeightConfig(),
+            "nvfp4": lambda: NVFP4DynamicActivationNVFP4WeightConfig(),
+        }[quant]()
+
+        recommended_inductor_config_setter()
+
+        # Preserve original behavior: quantize self.model in-place, ignoring `model` arg
         quantize_(
             self.model,
             quant_cfg,
