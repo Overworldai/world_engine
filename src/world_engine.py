@@ -21,7 +21,7 @@ torch._dynamo.config.capture_scalar_outputs = True
 @dataclass
 class CtrlInput:
     button: Set[int] = field(default_factory=set)  # pressed button IDs
-    mouse: Tuple[float, float] = (0.0, 0.0)  # (x, y) position
+    mouse: Tuple[float, float] = (0.0, 0.0)  # (x, y) velocity
 
 
 @dataclass
@@ -36,14 +36,17 @@ class WorldEngine:
     def __init__(
         self,
         model_uri: str,
-        inference_config: Optional[InferenceConfig] = None,
+        quant: Optional[str] = None,
         model_config_overrides: Optional[Dict] = None,
         device=None,
         dtype=torch.bfloat16,
     ):
+        """
+        model_uri: HF URI or local folder containing model.safetensors and config.yaml
+        quant: None -> bf16, fp8 -> torchao w8a8, other options exist but are not recommended
+        """
         # Meta
         self.device, self.dtype = device, dtype
-        inference_config = inference_config or InferenceConfig()
         self.model_cfg = WorldModel.load_config(model_uri)
 
         # TODO: remove these hardcoding hacks:
@@ -58,7 +61,7 @@ class WorldEngine:
         self.vae = InferenceAE.from_pretrained(model_uri, device=device, dtype=dtype)
         # self.prompt_encoder = PromptEncoder("google/umt5-xl").to(device).eval()  # TODO: dont hardcode
         self.model = WorldModel.from_pretrained(model_uri, cfg=self.model_cfg).to(device=device, dtype=dtype).eval()
-        self.quantize(self.model, inference_config.quant)
+        self.quantize(self.model, quant)
 
         # Inference Scheduler
         self.scheduler_sigmas = torch.tensor(self.model_cfg.scheduler_sigmas, device=device, dtype=dtype)
@@ -87,6 +90,7 @@ class WorldEngine:
             MXDynamicActivationMXWeightConfig,
             NVFP4DynamicActivationNVFP4WeightConfig,
         )
+        from torchao.quantization.qat import QATConfig
         from torchao.dtypes import MarlinSparseLayout
         from torchao.quantization.utils import recommended_inductor_config_setter
 
@@ -170,24 +174,24 @@ class WorldEngine:
 
     @torch.inference_mode()
     @torch.compile(fullgraph=True, mode="max-autotune", dynamic=False)
-    def denoise_frame(self, x, state: Dict[str, Tensor], kv_cache, denoise: bool = True):
-        """Advance state, generate new frame, provide updated kv_cache, and denoised x"""
+    def denoise_frame(self, x, ctx: Dict[str, Tensor], kv_cache, denoise: bool = True):
+        """Generate new frame, provide updated kv_cache, and denoised x"""
         if denoise:
             kv_cache.set_frozen(True)
-            x = self._denoise_pass(x, state, kv_cache)
+            x = self._denoise_pass(x, ctx, kv_cache)
         kv_cache.set_frozen(False)
-        kv_cache = self._update_kv_pass(x, state, kv_cache)
+        kv_cache = self._update_kv_pass(x, ctx, kv_cache)
         return kv_cache, x.squeeze(1)
 
-    def _denoise_pass(self, x, state: Dict[str, Tensor], kv_cache):
+    def _denoise_pass(self, x, ctx: Dict[str, Tensor], kv_cache):
         sigma = x.new_empty((x.size(0), x.size(1)))
         for step_sig, step_dsig in zip(self.scheduler_sigmas, self.scheduler_sigmas.diff()):
-            v = self.model(x, sigma.fill_(step_sig), **state, kv_cache=kv_cache)
+            v = self.model(x, sigma.fill_(step_sig), **ctx, kv_cache=kv_cache)
             x = x + step_dsig * v
         return x
 
-    def _update_kv_pass(self, x, state: Dict[str, Tensor], kv_cache):
-        self.model(x, x.new_zeros((x.size(0), x.size(1))), **state, kv_cache=kv_cache)
+    def _update_kv_pass(self, x, ctx: Dict[str, Tensor], kv_cache):
+        self.model(x, x.new_zeros((x.size(0), x.size(1))), **ctx, kv_cache=kv_cache)
         return kv_cache
 
 
