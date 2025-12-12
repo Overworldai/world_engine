@@ -15,6 +15,7 @@ from world_engine import WorldEngine, CtrlInput
 
 # Mouse sensitivity multiplier for velocity
 MOUSE_SENSITIVITY = 2.5
+MODEL_URI = "OpenWorldLabs/CoD-V2-L20-MLP5-Patch5-5-Self-Forcing-Shift1-2.1Step"
 
 
 def load_random_video_frame(video_dir: str = "../../../video_clips", target_size: tuple = (360, 640)) -> torch.Tensor | None:
@@ -58,10 +59,11 @@ async def render(frames: AsyncIterable[torch.Tensor], win_name="World Engine", m
     # Set up mouse callback if mouse_state is provided
     if mouse_state is not None:
         def mouse_callback(event, x, y, flags, param):
+            # Only update position, don't clear buttons on every movement
             mouse_state['pos'] = (x, y)
-            mouse_state['buttons'].clear()
 
-            # Map OpenCV mouse button flags to Windows VK codes
+            # Update button state based on current flags
+            mouse_state['buttons'].clear()
             if flags & cv2.EVENT_FLAG_LBUTTON:
                 mouse_state['buttons'].add(0x01)  # LMB
             if flags & cv2.EVENT_FLAG_RBUTTON:
@@ -169,18 +171,18 @@ async def ctrl_stream(delay: int = 1, mouse_state=None) -> AsyncIterator[CtrlInp
                     # Convert lowercase letters to uppercase for model compatibility
                     if 97 <= k <= 122:  # lowercase a-z
                         k_converted = k - 32
-                        print(f"\n[Button input: {k} ('{chr(k)}') -> sending {k_converted} ('{chr(k_converted)}') to model]")
+                        #print(f"\n[Button input: {k} ('{chr(k)}') -> sending {k_converted} ('{chr(k_converted)}') to model]")
                         buttons.add(k_converted)
                     # Map platform-specific keycodes to Windows VK codes (used in training)
                     elif k == 225:  # OpenCV Linux LShift
                         k_converted = 0xA0  # Windows VK_LSHIFT (160)
-                        print(f"\n[Button input: {k} (LShift) -> sending {k_converted} (0xA0/VK_LSHIFT) to model]")
+                        #print(f"\n[Button input: {k} (LShift) -> sending {k_converted} (0xA0/VK_LSHIFT) to model]")
                         buttons.add(k_converted)
                     elif k == 32:  # Space (already correct)
-                        print(f"\n[Button input: {k} (Space/0x20)]")
+                        #print(f"\n[Button input: {k} (Space/0x20)]")
                         buttons.add(k)
                     else:
-                        print(f"\n[Button input: {k}]")
+                        #print(f"\n[Button input: {k}]")
                         buttons.add(k)
 
         # Add mouse buttons if mouse_state is provided
@@ -188,24 +190,28 @@ async def ctrl_stream(delay: int = 1, mouse_state=None) -> AsyncIterator[CtrlInp
         if mouse_state is not None:
             # Add mouse button inputs
             buttons.update(mouse_state['buttons'])
-            if mouse_state['buttons']:
-                print(f"\n[Mouse buttons: {mouse_state['buttons']}]")
+            #if mouse_state['buttons']:
+            #    print(f"\n[Mouse buttons: {mouse_state['buttons']}]")
 
             # Calculate mouse velocity (position delta)
             curr_pos = mouse_state['pos']
-            mouse_velocity = (
-                float(curr_pos[0] - last_mouse_pos[0]),
-                float(curr_pos[1] - last_mouse_pos[1])
-            )
+            delta_x = float(curr_pos[0] - last_mouse_pos[0])
+            delta_y = float(curr_pos[1] - last_mouse_pos[1])
+
+            # Clamp to prevent huge spikes (max 100 pixels per frame)
+            max_delta = 100.0
+            delta_x = max(-max_delta, min(max_delta, delta_x))
+            delta_y = max(-max_delta, min(max_delta, delta_y))
+
             last_mouse_pos[0], last_mouse_pos[1] = curr_pos
 
             # Normalize to window size (640x360) and apply sensitivity multiplier
-            if mouse_velocity != (0.0, 0.0):
+            if delta_x != 0.0 or delta_y != 0.0:
                 normalized_vel = (
-                    (mouse_velocity[0] / 640.0) * MOUSE_SENSITIVITY,
-                    (mouse_velocity[1] / 360.0) * MOUSE_SENSITIVITY
+                    (delta_x / 640.0) * MOUSE_SENSITIVITY,
+                    (delta_y / 360.0) * MOUSE_SENSITIVITY
                 )
-                print(f"\n[Mouse velocity: {normalized_vel}]")
+                #print(f"\n[Mouse velocity: {normalized_vel}]")
                 mouse_velocity = normalized_vel
 
         ctrl = CtrlInput(button=buttons, mouse=mouse_velocity)
@@ -215,7 +221,7 @@ async def ctrl_stream(delay: int = 1, mouse_state=None) -> AsyncIterator[CtrlInp
 
 
 async def main() -> None:
-    uri = sys.argv[1] if len(sys.argv) > 1 else "OpenWorldLabs/CoDCtl-Causal-Flux-SelfForcing"
+    uri = sys.argv[1] if len(sys.argv) > 1 else MODEL_URI
     video_dir = sys.argv[2] if len(sys.argv) > 2 else "../../../video_clips"
 
     print("Loading initial seed frame...")
