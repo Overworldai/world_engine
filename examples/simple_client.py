@@ -16,6 +16,7 @@ from world_engine import WorldEngine, CtrlInput
 # Mouse sensitivity multiplier for velocity
 MOUSE_SENSITIVITY = 2.5
 MODEL_URI = "OpenWorldLabs/CoD-V2-L20-MLP5-Patch5-5-Self-Forcing-Shift1-2.1Step"
+MAX_FRAMES = 4096
 
 
 def load_random_video_frame(video_dir: str = "../../../video_clips", target_size: tuple = (360, 640)) -> torch.Tensor | None:
@@ -85,7 +86,7 @@ async def render(frames: AsyncIterable[torch.Tensor], win_name="World Engine", m
     cv2.destroyAllWindows()
 
 
-async def frame_stream(engine: WorldEngine, ctrls: AsyncIterable[CtrlInput], seed_frame: torch.Tensor | None, max_frames: int = 510) -> AsyncIterator[torch.Tensor]:
+async def frame_stream(engine: WorldEngine, ctrls: AsyncIterable[CtrlInput], seed_frame: torch.Tensor | None, max_frames: int = MAX_FRAMES-2) -> AsyncIterator[torch.Tensor]:
     """Generate frame by calling Engine for each ctrl. Resets context after max_frames to avoid positional encoding crash."""
     frame_count = 0
     current_seed = seed_frame
@@ -233,7 +234,7 @@ async def main() -> None:
         print("Seed frame loaded successfully")
 
     print("Initializing WorldEngine...")
-    engine = WorldEngine(uri, device="cuda")
+    engine = WorldEngine(uri, device="cuda", model_config_overrides={"n_frames" : MAX_FRAMES})
 
     print("Starting interactive session...")
     if seed_frame is not None:
