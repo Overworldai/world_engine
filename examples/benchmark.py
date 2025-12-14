@@ -49,7 +49,7 @@ def print_env_info():
 
 
 @pytest.fixture(scope="session")
-def engine(model_uri="OpenWorldLabs/CoDCtl-Causal-Flux-SelfForcing"):
+def engine(model_uri="OpenWorldLabs/Codbuland"):
     engine = WorldEngine(model_uri, device="cuda")
     # global warmup
     for _ in range(3):
