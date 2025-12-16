@@ -14,7 +14,7 @@ dependencies = [
   "rotary-embedding-torch>=0.8.8",
   "tensordict",
   "torchao==0.15.0+cu128",
-  "fbgemm_gpu_genai==1.4.1+cu128",
+  "fbgemm_gpu-2025.12.13",  # Nightly
   "transformers==4.57.3",
   "ftfy",
   "diffusers",
