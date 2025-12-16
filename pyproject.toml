@@ -15,10 +15,10 @@ dependencies = [
   "tensordict",
   "torchao",
   "fbgemm-gpu",
-  "transformers==4.57",
+  "transformers==4.57.3",
   "ftfy",
   "diffusers",
-  "xformers==0.0.33.post2",
+#  "xformers",
   "huggingface-hub==0.36.0",
   "omegaconf",
 ]
