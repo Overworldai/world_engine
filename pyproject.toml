@@ -7,7 +7,7 @@ name = "world_engine"
 version = "0.0.1"
 requires-python = ">=3.9"
 dependencies = [
-  "torch==2.10.0+cu128",
+  "torch==2.10.0.dev20251208+cu128",
   "torchvision",
   "torchaudio",
   "einops",
