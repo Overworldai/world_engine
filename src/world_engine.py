@@ -115,7 +115,8 @@ class WorldEngine:
         x0 = self._denoise_pass(x, inputs, self.kv_cache).clone()
         self.kv_cache = self._cache_pass(x0, inputs, self.kv_cache)
         with torch.amp.autocast('cuda', torch.bfloat16):
-            return (self.vae.decode(x0.squeeze(1)) if return_img else x0)
+            x0 = x0.squeeze(1)
+            return (self.vae.decode(x0) if return_img else x0)
 
     def _prep_inputs(self, x, ctrl=None):
         ctrl = ctrl if ctrl is not None else CtrlInput()
