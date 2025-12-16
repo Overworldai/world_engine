@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "world_engine"
+version = "0.0.1"
+requires-python = ">=3.9"
+dependencies = [
+  "torch==2.10.0+cu128",
+  "torchvision",
+  "torchaudio",
+  "einops",
+  "rotary-embedding-torch>=0.8.8",
+  "tensordict",
+  "torchao",
+  "fbgemm-gpu",
+  "transformers",
+  "ftfy",
+  "diffusers",
+  "xformers",
+  "huggingface-hub",
+  "omegaconf",
+]
+
+[tool.setuptools]
+# Map your top-level packages to where their sources actually live
+package-dir = {
+  "world_engine" = "src",
+  "owl_vaes" = "submodules/owl-wms/owl-vaes/owl_vaes",
+  "owl_wms"  = "submodules/owl-wms/owl_wms",
+}
+
+# Explicit list (simple + robust with multiple roots)
+packages = [
+  "world_engine",
+  "owl_vaes",
+  "owl_vaes.models",
+  "owl_vaes.utils",
+  "owl_vaes.nn",
+  "owl_wms",
+  "owl_wms.models",
+  "owl_wms.nn",
+]
