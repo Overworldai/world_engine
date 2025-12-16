@@ -1,11 +1,36 @@
 # Reuse upstream requirements
--r submodules/Depth-Anything-V2/requirements.txt
--r submodules/owl-wms/requirements.txt
--r submodules/owl-wms/owl-vaes/requirements.txt
+# -r submodules/Depth-Anything-V2/requirements.txt  # not used for flux
+# -r submodules/owl-wms/requirements.txt
+# -r submodules/owl-wms/owl-vaes/requirements.txt
 
-# Core stack
-torch==2.9.0
+# torch beta
+--pre
+--index-url https://download.pytorch.org/whl/test/cu128
+--extra-index-url https://pypi.org/simple
+
+
+# DiT torch Requirements
+torch==2.10.0+cu128
 torchvision
 torchaudio
+
+# torch utils
+einops
+rotary-embedding-torch>=0.8.8
+tensordict
+
+# quantization
 torchao
+fbgemm-gpu
+
+# umt5 (text encoder) deps
+transformers
+ftfy
+
+# autoencoder deps
+diffusers
 xformers
+
+# utilities
+huggingface-hub
+omegaconf
