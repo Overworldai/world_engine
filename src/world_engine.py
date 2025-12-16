@@ -74,93 +74,26 @@ class WorldEngine:
         if quant is None:
             return
 
-        from torchao.quantization import (
-            quantize_,
-            Float8DynamicActivationFloat8WeightConfig,
-            Int4WeightOnlyConfig,
-            Int8WeightOnlyConfig,
-            PerRow,
-        )
-        from torchao.prototype.mx_formats import (
-            MXDynamicActivationMXWeightConfig,
-            NVFP4DynamicActivationNVFP4WeightConfig,
-        )
-        from torchao.quantization.qat import QATConfig
-        from torchao.dtypes import MarlinSparseLayout
-        from torchao.quantization.utils import recommended_inductor_config_setter
-
         def is_bf16_linear(mod: nn.Module, _: str) -> bool:
             weight = getattr(mod, "weight", None)
             divisible = all([d % 32 == 0 for d in getattr(weight, "shape", [])])
             return isinstance(mod, nn.Linear) and getattr(weight, "dtype", None) is torch.bfloat16 and divisible
 
-        # Short names -> torchao config factories
-        quant_cfg = {
-            # Float8 dynamic activations + weights (original behavior)
-            "fp8": lambda: Float8DynamicActivationFloat8WeightConfig(granularity=PerRow()),
-            # Int4 weight-only
-            "int4": lambda: Int4WeightOnlyConfig(version=1),
-            # Int4 weight-only + 2:4 layout (Sparse-Marlin kernel; assumes 2:4-sparse weights)
-            "int4sp": lambda: Int4WeightOnlyConfig(group_size=128, layout=MarlinSparseLayout(), version=1),
-            # Int8 weight-only
-            "int8": lambda: Int8WeightOnlyConfig(),
-            # W4A4 dynamic activations + weights (CUTLASS-based kernel)
-            # ?, deprecated "w4a4": lambda: int4_dynamic_activation_int4_weight(),
-            # Microscaling formats (prototype; MXFP8 + NVFP4/FP4)
-            "mxfp8": lambda: MXDynamicActivationMXWeightConfig(),
-            "nvfp4": lambda: NVFP4DynamicActivationNVFP4WeightConfig(use_dynamic_per_tensor_scale=False),
-        }[quant]()
+        if quant == "fp8":
+            from torchao.quantization import quantize_, Float8DynamicActivationFloat8WeightConfig, PerRow
+            from torchao.quantization.utils import recommended_inductor_config_setter
+            recommended_inductor_config_setter()
+            quant_cfg = Float8DynamicActivationFloat8WeightConfig(granularity=PerRow())
+            quantize_(self.model, quant_cfg, filter_fn=is_bf16_linear, device=self.device)
 
-        recommended_inductor_config_setter()
-
-        # Preserve original behavior: quantize self.model in-place, ignoring `model` arg
-        quantize_(
-            self.model,
-            quant_cfg,
-            filter_fn=is_bf16_linear,
-            device=self.device,
-        )
+        else:
+            raise ValueError(f"Invalid quantization: {quant}")
 
     @torch.inference_mode()
     def reset(self):
         """Reset state for new generation"""
-        self.frame_ts = self.frame_ts * 0
+        self.frame_ts.zero_()
         self.kv_cache = StaticKVCache(self.model_cfg, max_seq_len=512, batch_size=1, dtype=self.dtype).to(self.device)
-
-    @torch.inference_mode()
-    @torch.compile
-    def _push_frame_state(self, x, ctrl=None):
-        ctrl = ctrl if ctrl is not None else CtrlInput()
-        button = x.new_zeros(1, 1, self.model_cfg.n_buttons)
-        if ctrl.button:
-            idx = x.new_tensor(list(ctrl.button), dtype=torch.long)
-            button.index_fill_(-1, idx, 1.0)
-        mouse = x.new_tensor(ctrl.mouse, dtype=self.dtype)[None, None]
-        inputs = {
-            "button": button,
-            "mouse": mouse,
-            "frame_timestamp": self.frame_ts.clone(),
-        }
-        self.frame_ts = self.frame_ts + 1
-        return inputs
-
-    @torch.inference_mode()
-    def append_frame(self, img: Tensor, ctrl: CtrlInput = None):
-        assert img.dtype == torch.uint8, img.dtype
-        # push frame inputs w/ clean latent
-        x = self.vae.encode(img).unsqueeze(1)
-        inputs = self._push_frame_state(x=x, ctrl=ctrl)
-        self.kv_cache, _ = self.denoise_frame(x, inputs, self.kv_cache, denoise=False)
-        return img
-
-    @torch.inference_mode()
-    def gen_frame(self, ctrl: CtrlInput = None, return_img: bool = True):
-        # prepare frame inputs + random N latent
-        x = torch.randn(self.frm_shape, device=self.device, dtype=self.dtype)
-        inputs = self._push_frame_state(x=x, ctrl=ctrl)
-        self.kv_cache, x = self.denoise_frame(x, inputs, self.kv_cache)
-        with torch.amp.autocast('cuda', torch.bfloat16):
-            return (self.vae.decode(x) if return_img else x)
 
     def set_prompt(self, prompt: str, timestamp: float = 0.0):
         """Apply text conditioning for T2V"""
@@ -168,28 +101,46 @@ class WorldEngine:
         warnings.warn("Not Implemented")
 
     @torch.inference_mode()
-    @torch.compile(fullgraph=True, mode="max-autotune", dynamic=False)
-    def denoise_frame(self, x, ctx: Dict[str, Tensor], kv_cache, denoise: bool = True):
-        """Generate new frame, provide updated kv_cache, and denoised x"""
-        if denoise:
-            kv_cache.set_frozen(True)
-            x = self._denoise_pass(x, ctx, kv_cache)
-        kv_cache.set_frozen(False)
-        kv_cache = self._update_kv_pass(x, ctx, kv_cache)
-        return kv_cache, x.squeeze(1)
+    def append_frame(self, img: Tensor, ctrl: CtrlInput = None):
+        assert img.dtype == torch.uint8, img.dtype
+        x0 = self.vae.encode(img).unsqueeze(1)
+        inputs = self._prep_inputs(x=x0, ctrl=ctrl)
+        self.kv_cache = self._cache_pass(x0, inputs, self.kv_cache)
+        return img
 
+    @torch.inference_mode()
+    def gen_frame(self, ctrl: CtrlInput = None, return_img: bool = True):
+        x = torch.randn(self.frm_shape, device=self.device, dtype=self.dtype)
+        inputs = self._prep_inputs(x=x, ctrl=ctrl)
+        x0 = self._denoise_pass(x, inputs, self.kv_cache).clone()
+        self.kv_cache = self._cache_pass(x0, inputs, self.kv_cache)
+        with torch.amp.autocast('cuda', torch.bfloat16):
+            return (self.vae.decode(x0.squeeze(1)) if return_img else x0)
+
+    def _prep_inputs(self, x, ctrl=None):
+        ctrl = ctrl if ctrl is not None else CtrlInput()
+        button = x.new_zeros(1, 1, self.model_cfg.n_buttons)
+        button[..., x.new_tensor(tuple(ctrl.button or ()), dtype=torch.long)] = 1.0
+        mouse = x.new_tensor(ctrl.mouse, dtype=self.dtype)[None, None]
+        out = {"button": button, "mouse": mouse, "frame_timestamp": self.frame_ts.clone()}
+        self.frame_ts += 1
+        return out
+
+    @torch.compile(fullgraph=True, mode="max-autotune", dynamic=False)
     def _denoise_pass(self, x, ctx: Dict[str, Tensor], kv_cache):
+        kv_cache.set_frozen(True)
         sigma = x.new_empty((x.size(0), x.size(1)))
         for step_sig, step_dsig in zip(self.scheduler_sigmas, self.scheduler_sigmas.diff()):
             v = self.model(x, sigma.fill_(step_sig), **ctx, kv_cache=kv_cache)
             x = x + step_dsig * v
         return x
 
-    def _update_kv_pass(self, x, ctx: Dict[str, Tensor], kv_cache):
+    @torch.compile(fullgraph=True, mode="max-autotune", dynamic=False)
+    def _cache_pass(self, x, ctx: Dict[str, Tensor], kv_cache):
+        kv_cache.set_frozen(False)
         self.model(x, x.new_zeros((x.size(0), x.size(1))), **ctx, kv_cache=kv_cache)
         return kv_cache
 
 
 # TODO
-# - Push inference config overrides to hub (if reasonable, set an inference config in training)
 # - RoPE for inference
