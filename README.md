@@ -30,8 +30,13 @@ Out-of-scope pieces can go in `examples/`, which is **not** part of the `world_e
 #### Setup
 ```
 # Install
-pip install "world_engine @ git+https://github.com/Wayfarer-Labs/world_engine.git"
+pip install --pre \
+  --index-url https://download.pytorch.org/whl/test/cu128 \
+  --extra-index-url https://pypi.org/simple \
+  "world_engine @ git+https://$GITHUB_USER:$GITHUB_TOKEN@github.com/Wayfarer-Labs/world_engine.git"
+```
 
+```
 # Specify HuggingFace Token (https://huggingface.co/settings/tokens)
 export HF_TOKEN=<your access token>
 ```
