@@ -43,8 +43,6 @@ class WorldEngine:
         self.model_cfg = WorldModel.load_config(model_uri)
 
         # TODO: remove these hardcoding hacks:
-        if not hasattr(self.model_cfg, "n_buttons"):
-            self.model_cfg.n_buttons = self.model_cfg.n_controller_inputs - 2
         self.model_cfg.mlp_gradient_checkpointing = getattr(self.model_cfg, "mlp_gradient_checkpointing", False)
 
         if model_config_overrides:
