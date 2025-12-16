@@ -24,14 +24,6 @@ dependencies = [
 ]
 
 [tool.setuptools]
-# Map your top-level packages to where their sources actually live
-package-dir = {
-  "world_engine" = "src",
-  "owl_vaes" = "submodules/owl-wms/owl-vaes/owl_vaes",
-  "owl_wms"  = "submodules/owl-wms/owl_wms",
-}
-
-# Explicit list (simple + robust with multiple roots)
 packages = [
   "world_engine",
   "owl_vaes",
@@ -42,3 +34,8 @@ packages = [
   "owl_wms.models",
   "owl_wms.nn",
 ]
+
+[tool.setuptools.package-dir]
+world_engine = "src"
+owl_vaes = "submodules/owl-wms/owl-vaes/owl_vaes"
+owl_wms = "submodules/owl-wms/owl_wms"
