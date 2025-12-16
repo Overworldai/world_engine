@@ -40,6 +40,7 @@ pip install \
   --index-url https://download.pytorch.org/whl/test/cu128 \
   --extra-index-url https://download.pytorch.org/whl/nightly/cu128 \
   --extra-index-url https://pypi.org/simple \
+  --upgrade --ignore-installed \
   "world_engine @ git+https://$GITHUB_USER:$GITHUB_TOKEN@github.com/Wayfarer-Labs/world_engine.git"
 ```
 
