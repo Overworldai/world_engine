@@ -12,7 +12,7 @@ dependencies = [
   "torchaudio",
   "einops",
   "rotary-embedding-torch>=0.8.8",
-  "tensordict>=0.10.0",
+  "tensordict==0.10.0",
   "torchao==0.15.0+cu128",
   "fbgemm-gpu-genai==2025.12.13+cu128",  # nightly
   "transformers==4.57.3",
