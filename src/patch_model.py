@@ -88,43 +88,35 @@ def patch_cached_noise_conditioning(model) -> None:
 
 class MergedQKVAttn(Attn):
     def __init__(self, src: Attn, config):
-        nn.Module.__init__(self)  # don't run Attn.__init__; we reuse src pieces
-
-        self.layer_idx = src.layer_idx
-        self.n_heads, self.n_kv_heads, self.d_head = src.n_heads, src.n_kv_heads, src.d_head
-        self.enable_gqa = src.enable_gqa
-
-        self.value_residual = getattr(config, "value_residual", False)
-        if self.value_residual:
-            self.v_lamb = nn.Parameter(torch.tensor(0.5))
-
-        self.rope = src.rope
-        self.out_proj = src.out_proj
-
-        self.gated_attn = getattr(src, "gated_attn", False)
-        if self.gated_attn:
-            self.gate_proj = src.gate_proj
+        super().__init__(config, src.layer_idx)          # makes fresh q/k/v/out/etc
+        self.to(device=src.q_proj.weight.device, dtype=src.q_proj.weight.dtype)
+        self.load_state_dict(src.state_dict(), strict=False)  # copies trained weights/buffers
+        self.train(src.training)                          # preserve train/eval mode
 
         self.q_out = self.n_heads * self.d_head
         self.kv_out = self.n_kv_heads * self.d_head
 
         self.qkv_proj = nn.Linear(
-            src.q_proj.in_features,
+            self.q_proj.in_features,
             self.q_out + 2 * self.kv_out,
             bias=False,
-            device=src.q_proj.weight.device,
-            dtype=src.q_proj.weight.dtype,
+            device=self.q_proj.weight.device,
+            dtype=self.q_proj.weight.dtype,
         )
         with torch.no_grad():
-            self.qkv_proj.weight.copy_(torch.cat([src.q_proj.weight, src.k_proj.weight, src.v_proj.weight], 0))
+            self.qkv_proj.weight.copy_(torch.cat(
+                [self.q_proj.weight, self.k_proj.weight, self.v_proj.weight], dim=0
+            ))
+
+        del self.q_proj, self.k_proj, self.v_proj
 
     def forward(self, x, pos_ids, bm, v1, kv_cache=None):
         q, k, v = self.qkv_proj(x).split((self.q_out, self.kv_out, self.kv_out), dim=-1)
 
         B, T = x.shape[:2]
-        q = q.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
-        k = k.view(B, T, self.n_kv_heads, self.d_head).transpose(1, 2)
-        v = v.view(B, T, self.n_kv_heads, self.d_head).transpose(1, 2)
+        q = q.reshape(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        k = k.reshape(B, T, self.n_kv_heads, self.d_head).transpose(1, 2)
+        v = v.reshape(B, T, self.n_kv_heads, self.d_head).transpose(1, 2)
 
         if self.value_residual:
             v1 = v if v1 is None else v1
@@ -143,7 +135,8 @@ class MergedQKVAttn(Attn):
             y = y * gates.permute(0, 2, 1).unsqueeze(-1)
 
         y = y.transpose(1, 2).reshape(B, T, -1)
-        return self.out_proj(y)
+        y = self.out_proj(y)
+        return y, v1
 
 
 def patch_Attn_merge_qkv(model) -> None:
@@ -154,4 +147,4 @@ def patch_Attn_merge_qkv(model) -> None:
 
 def apply_inference_patches(model) -> None:
     patch_cached_noise_conditioning(model)
-    # patch_Attn_merge_qkv(model)  # TODO
+    patch_Attn_merge_qkv(model)
