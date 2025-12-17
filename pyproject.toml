@@ -13,14 +13,18 @@ dependencies = [
   "einops",
   "rotary-embedding-torch>=0.8.8",
   "tensordict==0.10.0",
-  "torchao==0.15.0+cu128",
-  "fbgemm-gpu-genai==2025.12.13+cu128; platform_system=='Linux'",  # nightly
   "transformers==4.57.3",
   "ftfy",
   "diffusers",
-  "xformers==0.0.34.dev20251208+cu128; platform_system=='Linux'",  # nightly
   "huggingface-hub==0.36.0",
   "omegaconf",
+]
+
+[project.optional-dependencies]
+linux = [
+  "torchao==0.15.0+cu128; platform_system=='Linux'",
+  "fbgemm-gpu-genai==2025.12.13+cu128; platform_system=='Linux'",
+  "xformers==0.0.34.dev20251208+cu128; platform_system=='Linux'",
 ]
 
 [tool.setuptools]
