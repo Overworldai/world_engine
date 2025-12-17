@@ -18,7 +18,7 @@ dependencies = [
   "transformers==4.57.3",
   "ftfy",
   "diffusers",
-  "xformers==0.0.34.dev20251208+cu128",  # nightly
+  "xformers==0.0.34.dev20251208+cu128; platform_system=='Linux'",  # nightly
   "huggingface-hub==0.36.0",
   "omegaconf",
 ]
