@@ -23,6 +23,8 @@ Not a full client:
 - No reading controller/keyboard/mouse input
 - No FAL or other external integrations
 
+Reference client can be found in the [LocalWorld repo](https://github.com/Wayfarer-Labs/local_world)
+
 Out-of-scope pieces can go in `examples/`, which is **not** part of the `world_engine.*` package.
 
 ## Quick Start
