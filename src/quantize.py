@@ -2,6 +2,9 @@ import torch
 import torch.nn as nn
 
 
+QUANT = [None, "w8a8"]
+
+
 class FP8W8A8Linear(nn.Module):
     __constants__ = ("in_features", "out_features")
 
@@ -39,6 +42,9 @@ class FP8W8A8Linear(nn.Module):
 
 
 def quantize_model(model: nn.Module, quant: str):
+    if quant is None:
+        return model
+
     def eligible(m: nn.Module) -> bool:
         w = getattr(m, "weight", None)
         if not (isinstance(m, nn.Linear) and getattr(w, "dtype", None) is torch.bfloat16):
