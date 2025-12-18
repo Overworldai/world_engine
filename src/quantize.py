@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 
-QUANT = [None, "w8a8"]
+QUANTS = [None, "w8a8"]
 
 
 class FP8W8A8Linear(nn.Module):
