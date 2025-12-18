@@ -1,13 +1,14 @@
 from typing import Dict, Optional, Set, Tuple
 import torch
 from torch import Tensor
-import torch.nn as nn
 from dataclasses import dataclass, field
 
 from owl_wms.models.world import WorldModel
 from owl_wms.nn.kv_cache import StaticKVCache
 
 from world_engine.ae import InferenceAE
+from world_engine.patch_model import apply_inference_patches
+from world_engine.quantize import quantize_model
 
 
 # Global torch optimizations
@@ -29,14 +30,14 @@ class WorldEngine:
         self,
         model_uri: str,
         quant: Optional[str] = None,
-        apply_patches: bool = False,
+        apply_patches: bool = True,
         model_config_overrides: Optional[Dict] = None,
         device=None,
         dtype=torch.bfloat16,
     ):
         """
         model_uri: HF URI or local folder containing model.safetensors and config.yaml
-        quant: None -> bf16, fp8 -> torchao w8a8, other options exist but are not recommended
+        quant: None | w8a8
         """
         # Meta
         self.device, self.dtype = device, dtype
@@ -53,9 +54,9 @@ class WorldEngine:
         # self.prompt_encoder = PromptEncoder("google/umt5-xl").to(device).eval()  # TODO: dont hardcode
         self.model = WorldModel.from_pretrained(model_uri, cfg=self.model_cfg).to(device=device, dtype=dtype).eval()
         if apply_patches:
-            from world_engine.patch_model import apply_inference_patches
             apply_inference_patches(self.model)
-        self.quantize(self.model, quant)
+        if quant is not None:
+            quantize_model(self.model, quant)
 
         # Inference Scheduler
         self.scheduler_sigmas = torch.tensor(self.model_cfg.scheduler_sigmas, device=device, dtype=dtype)
@@ -67,25 +68,6 @@ class WorldEngine:
         self.kv_cache = StaticKVCache(self.model_cfg, max_seq_len=512, batch_size=1, dtype=dtype).to(device)
         self.frame_ts = torch.tensor([[0]], dtype=torch.long, device=device)
         self.reset()
-
-    def quantize(self, model, quant: Optional[str] = None):
-        if quant is None:
-            return
-
-        def is_bf16_linear(mod: nn.Module, _: str) -> bool:
-            weight = getattr(mod, "weight", None)
-            divisible = all([d % 32 == 0 for d in getattr(weight, "shape", [])])
-            return isinstance(mod, nn.Linear) and getattr(weight, "dtype", None) is torch.bfloat16 and divisible
-
-        if quant == "fp8":
-            from torchao.quantization import quantize_, Float8DynamicActivationFloat8WeightConfig, PerRow
-            from torchao.quantization.utils import recommended_inductor_config_setter
-            recommended_inductor_config_setter()
-            quant_cfg = Float8DynamicActivationFloat8WeightConfig(granularity=PerRow())
-            quantize_(self.model, quant_cfg, filter_fn=is_bf16_linear, device=self.device)
-
-        else:
-            raise ValueError(f"Invalid quantization: {quant}")
 
     @torch.inference_mode()
     def reset(self):
