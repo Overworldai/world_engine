@@ -122,14 +122,6 @@ img = pipeline.append_frame(uint8_img)  # returns passed image
 
 Note: returned `img` is always on the same device as `engine.device`
 
-## Bleeding Edge Install
-```
-pip uninstall torch torchvision torchaudio xformers fbgemm-gpu torchao transformers diffusers -y
-pip install --pre torch==2.10.0.dev20251208+cu128 torchvision torchaudio xformers fbgemm-gpu torchao==0.16.0.dev20251208+cu128 --index-url https://download.pytorch.org/whl/nightly/cu128
-pip install transformers diffusers
-```
-
-
 ## Examples
 - ["Hello (Over)World" client](./examples/simple_client.py)
 - [Run Performance Benchmarks (`pytest examples/benchmark.py`)](./examples/benchmark.py)
