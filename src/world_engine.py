@@ -67,12 +67,20 @@ class WorldEngine:
         # State
         self.kv_cache = StaticKVCache(self.model_cfg, max_seq_len=None, batch_size=1, dtype=dtype).to(device)
         self.frame_ts = torch.tensor([[0]], dtype=torch.long, device=device)
+        # Persistent ctx dict + persistent CUDA tensors
+        self._ctx = {
+            "button": torch.zeros((1, 1, self.model_cfg.n_buttons), device=device, dtype=dtype),
+            "mouse": torch.zeros((1, 1, 2), device=device, dtype=dtype),
+            "frame_timestamp": torch.empty((1, 1), device=device, dtype=torch.long),
+        }
 
     @torch.inference_mode()
     def reset(self):
         """Reset state for new generation"""
+        self.kv_cache.reset()
         self.frame_ts.zero_()
-        self.kv_cache.reset()  # in-place reset
+        for v in self._ctx.values():
+            v.zero_()
 
     def set_prompt(self, prompt: str, timestamp: float = 0.0):
         """Apply text conditioning for T2V"""
@@ -97,14 +105,20 @@ class WorldEngine:
             x0 = x0.squeeze(1)
             return (self.vae.decode(x0) if return_img else x0)
 
+    @torch.compile
     def _prep_inputs(self, x, ctrl=None):
         ctrl = ctrl if ctrl is not None else CtrlInput()
-        button = x.new_zeros(1, 1, self.model_cfg.n_buttons)
-        button[..., x.new_tensor(tuple(ctrl.button or ()), dtype=torch.long)] = 1.0
-        mouse = x.new_tensor(ctrl.mouse, dtype=self.dtype)[None, None]
-        out = {"button": button, "mouse": mouse, "frame_timestamp": self.frame_ts.clone()}
-        self.frame_ts += 1
-        return out
+        self._ctx["button"].zero_()
+        if ctrl.button:
+            idx = torch.as_tensor(list(ctrl.button), device=self._ctx["button"].device, dtype=torch.long)
+            self._ctx["button"][..., idx] = 1.0
+
+        self._ctx["mouse"][0, 0, 0] = ctrl.mouse[0]
+        self._ctx["mouse"][0, 0, 1] = ctrl.mouse[1]
+
+        self._ctx["frame_timestamp"].copy_(self.frame_ts)
+        self.frame_ts.add_(1)
+        return self._ctx
 
     @torch.compile(fullgraph=True, mode="max-autotune", dynamic=False)
     def _denoise_pass(self, x, ctx: Dict[str, Tensor], kv_cache):
