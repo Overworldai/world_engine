@@ -179,6 +179,7 @@ class InferenceAE:
         return lat / self.scale
 
     @torch.compile
+    @torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
     def decode(self, latent: Tensor):
         # Decode single latent: [C, H, W]
         decoded = self.ae_model.decoder(latent * self.scale)

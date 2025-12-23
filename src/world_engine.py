@@ -92,7 +92,7 @@ class WorldEngine:
         assert img.dtype == torch.uint8, img.dtype
         x0 = self.vae.encode(img).unsqueeze(1)
         inputs = self._prep_inputs(x=x0, ctrl=ctrl)
-        self.kv_cache = self._cache_pass(x0, inputs, self.kv_cache)
+        self._cache_pass(x0, inputs, self.kv_cache)
         return img
 
     @torch.inference_mode()
@@ -100,10 +100,8 @@ class WorldEngine:
         x = torch.randn(self.frm_shape, device=self.device, dtype=self.dtype)
         inputs = self._prep_inputs(x=x, ctrl=ctrl)
         x0 = self._denoise_pass(x, inputs, self.kv_cache).clone()
-        self.kv_cache = self._cache_pass(x0, inputs, self.kv_cache)
-        with torch.amp.autocast('cuda', torch.bfloat16):
-            x0 = x0.squeeze(1)
-            return (self.vae.decode(x0) if return_img else x0)
+        self._cache_pass(x0, inputs, self.kv_cache)
+        return (self.vae.decode(x0.squeeze(1)) if return_img else x0.squeeze(1))
 
     @torch.compile
     def _prep_inputs(self, x, ctrl=None):
