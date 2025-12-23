@@ -82,7 +82,7 @@ class WorldEngine:
         for v in self._ctx.values():
             v.zero_()
 
-    def set_prompt(self, prompt: str, timestamp: float = 0.0):
+    def set_prompt(self, prompt: str):
         """Apply text conditioning for T2V"""
         import warnings
         warnings.warn("Not Implemented")
