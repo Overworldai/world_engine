@@ -39,10 +39,9 @@ class WorldEngine:
         model_uri: HF URI or local folder containing model.safetensors and config.yaml
         quant: None | w8a8 | nvfp4
         """
-        # Meta
         self.device, self.dtype = device, dtype
-        self.model_cfg = WorldModel.load_config(model_uri)
 
+        self.model_cfg = WorldModel.load_config(model_uri)
         if model_config_overrides:
             self.model_cfg.merge_with(model_config_overrides)
 
@@ -64,7 +63,7 @@ class WorldEngine:
         # State
         self.kv_cache = StaticKVCache(self.model_cfg, max_seq_len=None, batch_size=1, dtype=dtype).to(device)
         self.frame_ts = torch.tensor([[0]], dtype=torch.long, device=device)
-        # Persistent ctx dict + persistent CUDA tensors
+        # Static input context tensors
         self._ctx = {
             "button": torch.zeros((1, 1, self.model_cfg.n_buttons), device=device, dtype=dtype),
             "mouse": torch.zeros((1, 1, 2), device=device, dtype=dtype),
