@@ -37,7 +37,7 @@ class WorldEngine:
     ):
         """
         model_uri: HF URI or local folder containing model.safetensors and config.yaml
-        quant: None | w8a8
+        quant: None | w8a8 | nvfp4
         """
         # Meta
         self.device, self.dtype = device, dtype
@@ -65,15 +65,14 @@ class WorldEngine:
         self.frm_shape = 1, 1, self.model_cfg.channels, self.model_cfg.height * pH, self.model_cfg.width * pW
 
         # State
-        self.kv_cache = StaticKVCache(self.model_cfg, max_seq_len=512, batch_size=1, dtype=dtype).to(device)
+        self.kv_cache = StaticKVCache(self.model_cfg, max_seq_len=None, batch_size=1, dtype=dtype).to(device)
         self.frame_ts = torch.tensor([[0]], dtype=torch.long, device=device)
-        self.reset()
 
     @torch.inference_mode()
     def reset(self):
         """Reset state for new generation"""
         self.frame_ts.zero_()
-        self.kv_cache = StaticKVCache(self.model_cfg, max_seq_len=512, batch_size=1, dtype=self.dtype).to(self.device)
+        self.kv_cache.reset()  # in-place reset
 
     def set_prompt(self, prompt: str, timestamp: float = 0.0):
         """Apply text conditioning for T2V"""
