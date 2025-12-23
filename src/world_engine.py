@@ -131,9 +131,9 @@ class WorldEngine:
 
     @torch.compile(fullgraph=True, mode="max-autotune", dynamic=False)
     def _cache_pass(self, x, ctx: Dict[str, Tensor], kv_cache):
+        """Side effect: updates kv cache"""
         kv_cache.set_frozen(False)
         self.model(x, x.new_zeros((x.size(0), x.size(1))), **ctx, kv_cache=kv_cache)
-        return kv_cache
 
 
 # TODO
