@@ -147,17 +147,11 @@ class InferenceAE:
 
     @classmethod
     def from_pretrained(cls, model_uri: str, subdir: Optional[str] = "ae", **kwargs):
-        """
         import huggingface_hub, pathlib
         from owl_vaes import from_pretrained
         base_path = huggingface_hub.snapshot_download(model_uri)
         base_path = pathlib.Path(base_path) / (subdir)
         model = from_pretrained(base_path / "config.yaml", base_path / "ckpt.pt")
-        """
-        # TODO: dont hardcode
-        from diffusers import AutoModel
-        model = AutoModel.from_pretrained("madebyollin/taef1")
-
         return cls(model, **kwargs)
 
     def encode(self, img: Tensor):
