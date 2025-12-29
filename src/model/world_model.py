@@ -115,7 +115,7 @@ class WorldDiTBlock(nn.Module):
         self.mlp = MLP(config.d_model, config.d_model * config.mlp_ratio, config.d_model)
         self.cond_head = CondHead(config)
 
-        if layer_idx % config.prompt_conditioning_period == 0:
+        if config.prompt_conditioning is not None and layer_idx % config.prompt_conditioning_period == 0:
             self.prompt_cross_attn = CrossAttention(config, config.prompt_embedding_dim)
         if layer_idx % config.ctrl_conditioning_period == 0:
             self.ctrl_mlpfusion = MLPFusion(config)
