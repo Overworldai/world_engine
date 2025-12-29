@@ -195,7 +195,7 @@ class WorldDiT(nn.Module):
     def forward(self, x, pos_ids, cond, ctx, kv_cache=None):
         v = None
         for i, block in enumerate(self.blocks):
-            x, v = block(x, pos_ids, ctx, v, kv_cache=kv_cache)
+            x, v = block(x, pos_ids, cond, ctx, v, kv_cache=kv_cache)
         return x
 
 
@@ -265,7 +265,7 @@ class WorldModel(BaseModel):
         assert button is not None
         ctx = {
             "ctrl_emb": self.ctrl_emb(mouse, button),
-            "prompt_emb": prompt_emb if prompt_emb is not None else None,
+            "prompt_emb": prompt_emb,
         }
 
         D = self.unpatchify.in_features
