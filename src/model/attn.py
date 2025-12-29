@@ -1,7 +1,6 @@
 import torch
 import einops as eo
 from torch import nn
-import torch.nn.functional as F
 
 from torch.nn.attention.flex_attention import flex_attention
 

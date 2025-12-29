@@ -158,7 +158,7 @@ class WorldDiTBlock(nn.Module):
         # Self / Causal Attention
         residual = x
         x = ada_rmsnorm(x, s0, b0)
-        x, v = self.attn(x, pos_ids, v, kv_cache=kv_cache)
+        x, v = self.attn(x, pos_ids, v, bm=None, kv_cache=kv_cache)
         x = ada_gate(x, g0) + residual
 
         # Cross Attention Prompt Conditioning
