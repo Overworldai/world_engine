@@ -1,7 +1,8 @@
 import torch
 from torch import nn, Tensor
 
-from owl_wms.nn import Attn, rms_norm
+from .model.nn import rms_norm
+from .model.attn import Attn
 from torch.nn.attention.flex_attention import flex_attention
 
 
@@ -110,7 +111,7 @@ class MergedQKVAttn(Attn):
 
         del self.q_proj, self.k_proj, self.v_proj
 
-    def forward(self, x, pos_ids, bm, v1, kv_cache=None):
+    def forward(self, x, pos_ids, v1, kv_cache):
         q, k, v = self.qkv_proj(x).split((self.q_out, self.kv_out, self.kv_out), dim=-1)
 
         B, T = x.shape[:2]
@@ -125,8 +126,7 @@ class MergedQKVAttn(Attn):
         q, k = rms_norm(q), rms_norm(k)
         q, k = self.rope(q, pos_ids), self.rope(k, pos_ids)
 
-        if kv_cache is not None:
-            k, v, bm = kv_cache.upsert(k, v, pos_ids, self.layer_idx)
+        k, v, bm = kv_cache.upsert(k, v, pos_ids, self.layer_idx)
 
         y = flex_attention(q, k, v, block_mask=bm, enable_gqa=self.enable_gqa)
 

@@ -3,12 +3,10 @@ import torch
 from torch import Tensor
 from dataclasses import dataclass, field
 
-from owl_wms.models.world import WorldModel
-from owl_wms.nn.kv_cache import StaticKVCache
-
-from world_engine.ae import InferenceAE
-from world_engine.patch_model import apply_inference_patches
-from world_engine.quantize import quantize_model
+from .model import WorldModel, StaticKVCache  # , PromptEncoder
+from .ae import InferenceAE
+from .patch_model import apply_inference_patches
+from .quantize import quantize_model
 
 
 # Global torch optimizations
@@ -37,14 +35,11 @@ class WorldEngine:
     ):
         """
         model_uri: HF URI or local folder containing model.safetensors and config.yaml
-        quant: None | w8a8
+        quant: None | w8a8 | nvfp4
         """
-        # Meta
         self.device, self.dtype = device, dtype
-        self.model_cfg = WorldModel.load_config(model_uri)
 
-        # TODO: remove these hardcoding hacks:
-        self.model_cfg.mlp_gradient_checkpointing = getattr(self.model_cfg, "mlp_gradient_checkpointing", False)
+        self.model_cfg = WorldModel.load_config(model_uri)
 
         if model_config_overrides:
             self.model_cfg.merge_with(model_config_overrides)
@@ -65,17 +60,24 @@ class WorldEngine:
         self.frm_shape = 1, 1, self.model_cfg.channels, self.model_cfg.height * pH, self.model_cfg.width * pW
 
         # State
-        self.kv_cache = StaticKVCache(self.model_cfg, max_seq_len=512, batch_size=1, dtype=dtype).to(device)
+        self.kv_cache = StaticKVCache(self.model_cfg, batch_size=1, dtype=dtype).to(device)
         self.frame_ts = torch.tensor([[0]], dtype=torch.long, device=device)
-        self.reset()
+        # Static input context tensors
+        self._ctx = {
+            "button": torch.zeros((1, 1, self.model_cfg.n_buttons), device=device, dtype=dtype),
+            "mouse": torch.zeros((1, 1, 2), device=device, dtype=dtype),
+            "frame_timestamp": torch.empty((1, 1), device=device, dtype=torch.long),
+        }
 
     @torch.inference_mode()
     def reset(self):
         """Reset state for new generation"""
+        self.kv_cache.reset()
         self.frame_ts.zero_()
-        self.kv_cache = StaticKVCache(self.model_cfg, max_seq_len=512, batch_size=1, dtype=self.dtype).to(self.device)
+        for v in self._ctx.values():
+            v.zero_()
 
-    def set_prompt(self, prompt: str, timestamp: float = 0.0):
+    def set_prompt(self, prompt: str):
         """Apply text conditioning for T2V"""
         import warnings
         warnings.warn("Not Implemented")
@@ -85,7 +87,7 @@ class WorldEngine:
         assert img.dtype == torch.uint8, img.dtype
         x0 = self.vae.encode(img).unsqueeze(1)
         inputs = self._prep_inputs(x=x0, ctrl=ctrl)
-        self.kv_cache = self._cache_pass(x0, inputs, self.kv_cache)
+        self._cache_pass(x0, inputs, self.kv_cache)
         return img
 
     @torch.inference_mode()
@@ -93,19 +95,23 @@ class WorldEngine:
         x = torch.randn(self.frm_shape, device=self.device, dtype=self.dtype)
         inputs = self._prep_inputs(x=x, ctrl=ctrl)
         x0 = self._denoise_pass(x, inputs, self.kv_cache).clone()
-        self.kv_cache = self._cache_pass(x0, inputs, self.kv_cache)
-        with torch.amp.autocast('cuda', torch.bfloat16):
-            x0 = x0.squeeze(1)
-            return (self.vae.decode(x0) if return_img else x0)
+        self._cache_pass(x0, inputs, self.kv_cache)
+        return (self.vae.decode(x0.squeeze(1)) if return_img else x0.squeeze(1))
 
+    @torch.compile
     def _prep_inputs(self, x, ctrl=None):
         ctrl = ctrl if ctrl is not None else CtrlInput()
-        button = x.new_zeros(1, 1, self.model_cfg.n_buttons)
-        button[..., x.new_tensor(tuple(ctrl.button or ()), dtype=torch.long)] = 1.0
-        mouse = x.new_tensor(ctrl.mouse, dtype=self.dtype)[None, None]
-        out = {"button": button, "mouse": mouse, "frame_timestamp": self.frame_ts.clone()}
-        self.frame_ts += 1
-        return out
+        self._ctx["button"].zero_()
+        if ctrl.button:
+            idx = torch.as_tensor(list(ctrl.button), device=self._ctx["button"].device, dtype=torch.long)
+            self._ctx["button"][..., idx] = 1.0
+
+        self._ctx["mouse"][0, 0, 0] = ctrl.mouse[0]
+        self._ctx["mouse"][0, 0, 1] = ctrl.mouse[1]
+
+        self._ctx["frame_timestamp"].copy_(self.frame_ts)
+        self.frame_ts.add_(1)
+        return self._ctx
 
     @torch.compile(fullgraph=True, mode="max-autotune", dynamic=False)
     def _denoise_pass(self, x, ctx: Dict[str, Tensor], kv_cache):
@@ -118,10 +124,6 @@ class WorldEngine:
 
     @torch.compile(fullgraph=True, mode="max-autotune", dynamic=False)
     def _cache_pass(self, x, ctx: Dict[str, Tensor], kv_cache):
+        """Side effect: updates kv cache"""
         kv_cache.set_frozen(False)
         self.model(x, x.new_zeros((x.size(0), x.size(1))), **ctx, kv_cache=kv_cache)
-        return kv_cache
-
-
-# TODO
-# - RoPE for inference
