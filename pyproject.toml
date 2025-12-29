@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "world_engine"
-version = "0.0.1"
+version = "0.0.2"
 requires-python = ">=3.9"
 dependencies = [
   "torch==2.10.0.dev20251208+cu128",
@@ -19,6 +19,9 @@ dependencies = [
   "huggingface-hub==0.36.0",
   "omegaconf",
   "accelerate==1.12.0",
+
+  # internal dependencies
+  "owl-vaes @ git+https://github.com/Wayfarer-Labs/owl-vaes.git@installable",
 ]
 
 [project.optional-dependencies]
@@ -29,16 +32,7 @@ linux = [
 [tool.setuptools]
 packages = [
   "world_engine",
-  "owl_vaes",
-  "owl_vaes.models",
-  "owl_vaes.utils",
-  "owl_vaes.nn",
-  "owl_wms",
-  "owl_wms.models",
-  "owl_wms.nn",
 ]
 
 [tool.setuptools.package-dir]
 world_engine = "src"
-owl_vaes = "submodules/owl-wms/owl-vaes/owl_vaes"
-owl_wms = "submodules/owl-wms/owl_wms"
