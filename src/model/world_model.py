@@ -50,6 +50,33 @@ def rms_norm(x: torch.Tensor) -> torch.Tensor:
     return F.rms_norm(x, (x.size(-1),))
 
 
+class CFG(nn.Module):
+    def __init__(self, d_model: int, dropout: float):
+        super().__init__()
+        self.dropout = dropout
+        self.null_emb = nn.Parameter(torch.zeros(1, 1, d_model))
+
+    def forward(self, x: torch.Tensor, is_conditioned: Optional[bool] = None) -> torch.Tensor:
+        """
+        x: [B, L, D]
+        is_conditioned:
+          - None: training-style random dropout
+          - bool: whole batch conditioned / unconditioned at sampling
+        """
+        B, L, _ = x.shape
+        null = self.null_emb.expand(B, L, -1)
+
+        # training-style dropout OR unspecified
+        if self.training or is_conditioned is None:
+            if self.dropout == 0.0:
+                return x
+            drop = torch.rand(B, 1, 1, device=x.device) < self.dropout  # [B,1,1]
+            return torch.where(drop, null, x)
+
+        # sampling-time switch
+        return x if is_conditioned else null
+
+
 class MLP(nn.Module):
     def __init__(self, dim_in, dim_middle, dim_out):
         super().__init__()
@@ -190,6 +217,11 @@ class WorldModel(BaseModel):
 
         self.denoise_step_emb = NoiseConditioner(config.d_model)
         self.ctrl_emb = ControllerInputEmbedding(config)
+
+        if config.ctrl_conditioning is not None:
+            self.ctrl_cfg = CFG(config.d_model, config.ctrl_cond_dropout)
+        if config.prompt_conditioning is not None:
+            self.prompt_cfg = CFG(config.prompt_embedding_dim, config.prompt_cond_dropout)
 
         self.transformer = WorldDiT(config)
 
