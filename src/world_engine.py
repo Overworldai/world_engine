@@ -131,7 +131,3 @@ class WorldEngine:
         """Side effect: updates kv cache"""
         kv_cache.set_frozen(False)
         self.model(x, x.new_zeros((x.size(0), x.size(1))), **ctx, kv_cache=kv_cache)
-
-
-# TODO
-# - RoPE for inference
