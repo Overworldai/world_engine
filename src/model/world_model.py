@@ -263,10 +263,9 @@ class WorldModel(BaseModel):
         cond = self.denoise_step_emb(sigma)  # [B, N, d]
 
         assert button is not None
-        assert prompt_emb is not None
         ctx = {
             "ctrl_emb": self.ctrl_emb(mouse, button),
-            "prompt_emb": prompt_emb,
+            "prompt_emb": prompt_emb if prompt_emb is not None else None,
         }
 
         D = self.unpatchify.in_features
