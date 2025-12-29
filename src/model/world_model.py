@@ -9,8 +9,9 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from .. import nn as owl_nn
-from .base import BaseModel
+from .attn import Attn, CrossAttention
+from .noise_cond import AdaLN, ada_gate, ada_rmsnorm
+from .base_model import BaseModel
 
 
 class PromptEncoder(nn.Module):
@@ -110,12 +111,12 @@ class WorldDiTBlock(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.config = config
-        self.attn = owl_nn.Attn(config, layer_idx)
+        self.attn = Attn(config, layer_idx)
         self.mlp = MLP(config.d_model, config.d_model * config.mlp_ratio, config.d_model)
         self.cond_head = CondHead(config)
 
         if layer_idx % config.prompt_conditioning_period == 0:
-            self.prompt_cross_attn = owl_nn.CrossAttention(config, config.prompt_embedding_dim)
+            self.prompt_cross_attn = CrossAttention(config, config.prompt_embedding_dim)
         if layer_idx % config.ctrl_conditioning_period == 0:
             self.ctrl_mlpfusion = MLPFusion(config)
 
@@ -129,9 +130,9 @@ class WorldDiTBlock(nn.Module):
 
         # Self / Causal Attention
         residual = x
-        x = owl_nn.ada_rmsnorm(x, s0, b0)
+        x = ada_rmsnorm(x, s0, b0)
         x, v = self.attn(x, pos_ids, v, kv_cache=kv_cache)
-        x = owl_nn.ada_gate(x, g0) + residual
+        x = ada_gate(x, g0) + residual
 
         # Cross Attention Prompt Conditioning
         if self.prompt_cross_attn is not None:
@@ -142,7 +143,7 @@ class WorldDiTBlock(nn.Module):
             x = self.ctrl_mlpfusion(rms_norm(x), rms_norm(ctx["ctrl_emb"])) + x
 
         # MLP
-        x = owl_nn.ada_gate(self.mlp(owl_nn.ada_rmsnorm(x, s1, b1)), g1) + x
+        x = ada_gate(self.mlp(ada_rmsnorm(x, s1, b1)), g1) + x
 
         return x, v
 
@@ -187,7 +188,7 @@ class WorldModel(BaseModel):
         self.config = config
         assert config.tokens_per_frame == config.height * config.width
 
-        self.denoise_step_emb = owl_nn.NoiseConditioner(config.d_model)
+        self.denoise_step_emb = NoiseConditioner(config.d_model)
         self.ctrl_emb = ControllerInputEmbedding(config)
 
         self.transformer = WorldDiT(config)
@@ -197,7 +198,7 @@ class WorldModel(BaseModel):
         C, D = config.channels, config.d_model
         self.patchify = nn.Conv2d(C, D, kernel_size=self.patch, stride=self.patch, bias=False)
         self.unpatchify = nn.Linear(D, C * math.prod(self.patch), bias=True)
-        self.out_norm = owl_nn.AdaLN(config.d_model)
+        self.out_norm = AdaLN(config.d_model)
 
     def forward(
         self,
