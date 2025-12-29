@@ -3,7 +3,7 @@ import os
 import tempfile
 
 from omegaconf import OmegaConf
-from safetensors.torch import save_file, load_model
+from safetensors.torch import save_file, load_file
 from torch import nn
 
 
@@ -36,7 +36,7 @@ class BaseModel(nn.Module):
 
         # Stream weights straight into `model` (no CPU state_dict first)
         safetensors_path = os.path.join(path, "model.safetensors")
-        load_model(model, safetensors_path, strict=True, device=device)
+        model.load_state_dict(load_file(safetensors_path, device=device), strict=True)
 
         return model
 
