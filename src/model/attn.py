@@ -41,7 +41,7 @@ class Attn(nn.Module):
             self.gate_proj = nn.Linear(self.n_heads, self.n_heads, bias=False)  # sparse attn gate
             nn.init.zeros_(self.gate_proj.weight)
 
-    def forward(self, x, pos_ids, v1, bm, kv_cache=None):
+    def forward(self, x, pos_ids, v1, bm=None, kv_cache=None):
         # Q, K, V proj -> QK-norm -> RoPE
         q = eo.rearrange(self.q_proj(x), "b t (h d) -> b h t d", h=self.n_heads, d=self.d_head)
         k = eo.rearrange(self.k_proj(x), "b t (h d) -> b h t d", h=self.n_kv_heads, d=self.d_head)
@@ -54,11 +54,8 @@ class Attn(nn.Module):
         q, k = rms_norm(q), rms_norm(k)
         q, k = self.rope(q, pos_ids), self.rope(k, pos_ids)
 
-        if kv_cache is None:
-            torch._assert(bm is not None, "bm must be provided when kv_cache is None")
-        else:
-            # Update KV-cache and K, V in-place
-            k, v, bm = kv_cache.upsert(k, v, pos_ids, self.layer_idx)
+        # Update KV-cache in-place
+        k, v, bm = kv_cache.upsert(k, v, pos_ids, self.layer_idx)
 
         # SDPA -> Attention Gate -> Out Proj
         y = flex_attention(q, k, v, block_mask=bm, enable_gqa=self.enable_gqa)
