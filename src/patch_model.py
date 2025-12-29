@@ -1,7 +1,7 @@
 import torch
 from torch import nn, Tensor
 
-from owl_wms.nn import Attn, rms_norm
+from .model.nn import Attn, rms_norm
 from torch.nn.attention.flex_attention import flex_attention
 
 
