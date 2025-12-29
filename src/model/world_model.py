@@ -10,7 +10,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from .attn import Attn, CrossAttention
-from .noise_cond import AdaLN, ada_gate, ada_rmsnorm
+from .noise_cond import AdaLN, ada_gate, ada_rmsnorm, NoiseConditioner
 from .base_model import BaseModel
 
 
