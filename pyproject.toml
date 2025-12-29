@@ -32,6 +32,7 @@ linux = [
 [tool.setuptools]
 packages = [
   "world_engine",
+  "world_engine.model",
 ]
 
 [tool.setuptools.package-dir]
