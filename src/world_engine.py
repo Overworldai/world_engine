@@ -41,8 +41,6 @@ class WorldEngine:
 
         self.model_cfg = WorldModel.load_config(model_uri)
 
-        model_config_overrides["global_attn_offset"] = False  # TODO, remove hack
-
         if model_config_overrides:
             self.model_cfg.merge_with(model_config_overrides)
 
