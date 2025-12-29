@@ -62,7 +62,7 @@ class WorldEngine:
         self.frm_shape = 1, 1, self.model_cfg.channels, self.model_cfg.height * pH, self.model_cfg.width * pW
 
         # State
-        self.kv_cache = StaticKVCache(self.model_cfg, max_seq_len=None, batch_size=1, dtype=dtype).to(device)
+        self.kv_cache = StaticKVCache(self.model_cfg, batch_size=1, dtype=dtype).to(device)
         self.frame_ts = torch.tensor([[0]], dtype=torch.long, device=device)
         # Static input context tensors
         self._ctx = {
