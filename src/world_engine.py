@@ -3,11 +3,10 @@ import torch
 from torch import Tensor
 from dataclasses import dataclass, field
 
-from world_engine.model import WorldModel, StaticKVCache  # , PromptEncoder
-
-from world_engine.ae import InferenceAE
-from world_engine.patch_model import apply_inference_patches
-from world_engine.quantize import quantize_model
+from .model import WorldModel, StaticKVCache  # , PromptEncoder
+from .ae import InferenceAE
+from .patch_model import apply_inference_patches
+from .quantize import quantize_model
 
 
 # Global torch optimizations
