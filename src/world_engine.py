@@ -3,8 +3,7 @@ import torch
 from torch import Tensor
 from dataclasses import dataclass, field
 
-from owl_wms.models.world import WorldModel
-from owl_wms.nn.kv_cache import StaticKVCache
+from world_engine.model import WorldModel, StaticKVCache  # , PromptEncoder
 
 from world_engine.ae import InferenceAE
 from world_engine.patch_model import apply_inference_patches
