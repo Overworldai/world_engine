@@ -97,7 +97,7 @@ class Attn(nn.Module):
             self.gate_proj = nn.Linear(self.n_heads, self.n_heads, bias=False)  # sparse attn gate
             nn.init.zeros_(self.gate_proj.weight)
 
-    def forward(self, x, pos_ids, v1, bm=None, kv_cache=None):
+    def forward(self, x, pos_ids, v1, kv_cache):
         # Q, K, V proj -> QK-norm -> RoPE
         q = eo.rearrange(self.q_proj(x), "b t (h d) -> b h t d", h=self.n_heads, d=self.d_head)
         k = eo.rearrange(self.k_proj(x), "b t (h d) -> b h t d", h=self.n_kv_heads, d=self.d_head)
