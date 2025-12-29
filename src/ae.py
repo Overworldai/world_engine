@@ -4,14 +4,11 @@ from torch import Tensor
 import torch
 
 
-
 class InferenceAE:
     def __init__(self, ae_model, device=None, dtype=torch.bfloat16):
         self.device = device
         self.dtype = dtype
         self.ae_model = ae_model.eval().to(device=device, dtype=dtype)
-        # self.depth_model = BatchedDepthPipe(input_mode="bfloat16", batch_size=1)
-
         self.scale = 1.0  # TODO: dont hardcode. AE should keep internal scale buffer
 
     @classmethod
@@ -30,15 +27,7 @@ class InferenceAE:
         img = img.to(device=self.device, dtype=self.dtype)
         img = img.permute(0, 3, 1, 2).contiguous()
         rgb = img.div(255.0).mul(2.0).sub(1.0)
-
-        # TODO: fix hack
-        """
-        depth = self.depth_model(rgb)
-        x = torch.cat([rgb, depth], dim=1)
-        """
-        x = rgb
-
-        lat = self.ae_model.encoder(x)
+        lat = self.ae_model.encoder(rgb)
         return lat / self.scale
 
     @torch.compile
