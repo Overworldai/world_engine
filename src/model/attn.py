@@ -9,7 +9,6 @@ from rotary_embedding_torch import RotaryEmbedding
 from .nn import rms_norm, NoCastModule
 
 
-
 class RoPE(NoCastModule):
     def __init__(self, config):
         super().__init__()

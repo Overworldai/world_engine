@@ -43,7 +43,8 @@ class PromptEncoder(nn.Module):
             max_length=128
         ).to(self.encoder.device)
         emb = self.encode(inputs).to(self.dtype)
-        return emb * inputs["attention_mask"].unsqueeze(-1).type_as(emb)
+        pad_mask = inputs["attention_mask"].eq(0)
+        return emb, pad_mask
 
 
 def rms_norm(x: torch.Tensor) -> torch.Tensor:
