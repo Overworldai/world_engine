@@ -232,6 +232,13 @@ class WorldModel(BaseModel):
         self.unpatchify = nn.Linear(D, C * math.prod(self.patch), bias=True)
         self.out_norm = AdaLN(config.d_model)
 
+        # Cached 1-frame pos_ids (buffers + cached TensorDict view)
+        T = config.tokens_per_frame
+        idx = torch.arange(T, dtype=torch.long)
+        self.register_buffer("_t_pos_1f", torch.empty(T, dtype=torch.long), persistent=False)
+        self.register_buffer("_y_pos_1f", idx.div(config.width, rounding_mode="floor"), persistent=False)
+        self.register_buffer("_x_pos_1f", idx.remainder(config.width), persistent=False)
+
     def forward(
         self,
         x: Tensor,
@@ -258,7 +265,12 @@ class WorldModel(BaseModel):
         Hp, Wp = H // ph, W // pw
         torch._assert(Hp * Wp == self.config.tokens_per_frame, f"{Hp} * {Wp} != {self.config.tokens_per_frame}")
 
-        pos_ids = self.get_pos_ids(frame_timestamp, Hp, Wp)
+        torch._assert(B == 1 and N == 1, "WorldModel.forward currently supports B==1, N==1")
+        self._t_pos_1f.copy_(frame_timestamp[0, 0].expand_as(self._t_pos_1f))
+        pos_ids = TensorDict(
+            {"t_pos": self._t_pos_1f[None], "y_pos": self._y_pos_1f[None], "x_pos": self._x_pos_1f[None]},
+            batch_size=[1, self._t_pos_1f.numel()],
+        )
 
         cond = self.denoise_step_emb(sigma)  # [B, N, d]
 
@@ -280,19 +292,3 @@ class WorldModel(BaseModel):
         )
 
         return x
-
-    @staticmethod
-    def get_pos_ids(seq_ts: torch.Tensor, H: int, W: int) -> TensorDict:
-        """Positions for [B, F*H*W]; seq_ts is [B,F] (long)."""
-        B, F = seq_ts.shape
-        device = seq_ts.device
-        y = torch.arange(H, device=device, dtype=torch.long).repeat_interleave(W)  # [H*W]
-        x = torch.arange(W, device=device, dtype=torch.long).repeat(H)             # [H*W]
-        return TensorDict(
-            {
-                "t_pos": seq_ts.repeat_interleave(H * W, 1),  # [B,F*H*W]
-                "y_pos": y.repeat(F).expand(B, -1),           # [B,F*H*W]
-                "x_pos": x.repeat(F).expand(B, -1),           # [B,F*H*W]
-            },
-            batch_size=[B, F * H * W],
-        )
