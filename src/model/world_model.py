@@ -109,9 +109,9 @@ class MLPFusion(nn.Module):
         B, _, D = x.shape
         L = cond.shape[1]
 
+        """
         Wx, Wc = self.mlp.fc1.weight.chunk(2, dim=1)  # each [D, D]
 
-        """
         x = x.view(B, L, -1, D)
         h = F.linear(x, Wx) + F.linear(cond, Wc).unsqueeze(2)  # broadcast, no repeat/cat
         h = F.silu(h)
