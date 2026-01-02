@@ -146,10 +146,16 @@ class FP8Linear(nn.Module):
         super().__init__()
         self.in_features, self.out_features = lin.in_features, lin.out_features
 
-        self.bias = nn.Parameter(lin.bias.data.clone().to(torch.float8_e4m3fn)) if lin.bias is not None else None
-
-        self.weight = nn.Parameter(lin.weight.data.clone().to(torch.float8_e4m3fn))
-        self.dummy_scale = torch.ones(1, device=lin.weight.device, dtype=torch.float32)
+        self.bias = (
+            nn.Parameter(lin.bias.data.clone().to(torch.float8_e4m3fn))
+            if lin.bias is not None
+            else None
+        )
+        w_amax = lin.weight.data.clone().amax().float().squeeze()
+        w = lin.weight.data.clone().div(w_amax).to(torch.float8_e4m3fn)
+        self.register_buffer("w_amax", w_amax)
+        self.register_buffer("weightT", w.t())
+        self.dummy_scale = torch.ones((), device=lin.weight.device, dtype=torch.float32)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -163,21 +169,19 @@ class FP8Linear(nn.Module):
         """
 
         # Convert input to FP8 e4m3
-        x_fp8 = x.to(torch.float8_e4m3fn).flatten(0, -2)
+        x_fp8 = x.to(torch.float8_e4m3fn).reshape(-1, x.size(-1)).contiguous()
 
         result = torch._scaled_mm(
             x_fp8,
-            self.weight.t(),
+            self.weightT,
+            bias=self.bias,
             scale_a=self.dummy_scale,
-            scale_b=self.dummy_scale,
+            scale_b=self.w_amax,
             out_dtype=torch.bfloat16,
             use_fast_accum=True,
-        ).reshape(x.shape[:-1] + (-1,))
+        )
 
-        if self.bias is not None:
-            result += self.bias
-
-        return result
+        return result.reshape(x.shape[:-1] + (-1,))
 
 
 def quantize_model(model: nn.Module, quant: str):
@@ -200,5 +204,7 @@ def quantize_model(model: nn.Module, quant: str):
     }[quant]
 
     for name, child in model.named_children():
-        setattr(model, name, new_linear(child)) if eligible(child) else quantize_model(child, quant)
+        setattr(model, name, new_linear(child)) if eligible(child) else quantize_model(
+            child, quant
+        )
     return model
