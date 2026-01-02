@@ -2,13 +2,14 @@
 
 # 🌐 OverWorld Inference Engine
 
-  Inference Engine for World Models
+<img src="./assets/diagram.svg" alt="Diagram" width="500" />
+
 </div>
 
 
 ## Overview
 
-Core library for model and inference plumbing:
+Core library for world model inference:
 
 - Simple API to load models and generate image frames from text, control inputs, and prior frames
 - Encapsulates the frame-generation stack (DiT, autoencoder, text encoder, KV cache)
