@@ -1,0 +1,20 @@
+Metadata-Version: 2.4
+Name: world_engine
+Version: 0.0.2
+Requires-Python: >=3.9
+License-File: LICENSE
+Requires-Dist: torch>=2.0
+Requires-Dist: torchvision>=0.15
+Requires-Dist: torchaudio>=2.0
+Requires-Dist: einops
+Requires-Dist: rotary-embedding-torch>=0.8.8
+Requires-Dist: tensordict==0.10.0
+Requires-Dist: transformers==4.57.3
+Requires-Dist: ftfy
+Requires-Dist: diffusers
+Requires-Dist: huggingface-hub==0.36.0
+Requires-Dist: omegaconf
+Requires-Dist: accelerate==1.12.0
+Provides-Extra: linux
+Requires-Dist: xformers==0.0.34.dev20251208+cu128; platform_system == "Linux" and extra == "linux"
+Dynamic: license-file

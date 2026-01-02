@@ -1,0 +1,17 @@
+torch>=2.0
+torchvision>=0.15
+torchaudio>=2.0
+einops
+rotary-embedding-torch>=0.8.8
+tensordict==0.10.0
+transformers==4.57.3
+ftfy
+diffusers
+huggingface-hub==0.36.0
+omegaconf
+accelerate==1.12.0
+
+[linux]
+
+[linux:platform_system == "Linux"]
+xformers==0.0.34.dev20251208+cu128
