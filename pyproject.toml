@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "world_engine"
 version = "0.0.2"
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 dependencies = [
   "torch==2.10.0.dev20251208+cu128",
   "torchvision==0.25.0.dev20251208+cu128",
@@ -19,9 +19,13 @@ dependencies = [
   "huggingface-hub==0.36.0",
   "omegaconf",
   "accelerate==1.12.0",
-
   # internal dependencies
   "owl-vaes @ git+https://github.com/Wayfarer-Labs/owl-vaes.git@installable",
+  "opencv-python>=4.12.0.88",
+  "opencv-stubs>=0.1.1",
+  "fastapi>=0.128.0",
+  "uvicorn>=0.40.0",
+  "websockets>=15.0.1",
 ]
 
 [project.optional-dependencies]
@@ -37,3 +41,14 @@ packages = [
 
 [tool.setuptools.package-dir]
 world_engine = "src"
+
+[tool.uv]
+index-url = "https://pypi.org/simple"
+extra-index-url = [
+  "https://download.pytorch.org/whl/nightly/cu128",
+]
+index-strategy = "unsafe-best-match"
+
+[tool.pyright]
+extraPaths = ["src"]
+typeCheckingMode = "off"

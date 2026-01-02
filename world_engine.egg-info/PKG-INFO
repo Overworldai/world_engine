@@ -1,0 +1,26 @@
+Metadata-Version: 2.4
+Name: world_engine
+Version: 0.0.2
+Requires-Python: >=3.11
+License-File: LICENSE
+Requires-Dist: torch==2.10.0.dev20251208+cu128
+Requires-Dist: torchvision==0.25.0.dev20251208+cu128
+Requires-Dist: torchaudio==2.10.0.dev20251208+cu128
+Requires-Dist: einops
+Requires-Dist: rotary-embedding-torch>=0.8.8
+Requires-Dist: tensordict==0.10.0
+Requires-Dist: transformers==4.57.3
+Requires-Dist: ftfy
+Requires-Dist: diffusers
+Requires-Dist: huggingface-hub==0.36.0
+Requires-Dist: omegaconf
+Requires-Dist: accelerate==1.12.0
+Requires-Dist: owl-vaes@ git+https://github.com/Wayfarer-Labs/owl-vaes.git@installable
+Requires-Dist: opencv-python>=4.12.0.88
+Requires-Dist: opencv-stubs>=0.1.1
+Requires-Dist: fastapi>=0.128.0
+Requires-Dist: uvicorn>=0.40.0
+Requires-Dist: websockets>=15.0.1
+Provides-Extra: linux
+Requires-Dist: xformers==0.0.34.dev20251208+cu128; platform_system == "Linux" and extra == "linux"
+Dynamic: license-file

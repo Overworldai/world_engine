@@ -1,0 +1,23 @@
+torch==2.10.0.dev20251208+cu128
+torchvision==0.25.0.dev20251208+cu128
+torchaudio==2.10.0.dev20251208+cu128
+einops
+rotary-embedding-torch>=0.8.8
+tensordict==0.10.0
+transformers==4.57.3
+ftfy
+diffusers
+huggingface-hub==0.36.0
+omegaconf
+accelerate==1.12.0
+owl-vaes@ git+https://github.com/Wayfarer-Labs/owl-vaes.git@installable
+opencv-python>=4.12.0.88
+opencv-stubs>=0.1.1
+fastapi>=0.128.0
+uvicorn>=0.40.0
+websockets>=15.0.1
+
+[linux]
+
+[linux:platform_system == "Linux"]
+xformers==0.0.34.dev20251208+cu128
