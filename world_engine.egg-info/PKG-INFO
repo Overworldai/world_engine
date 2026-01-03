@@ -21,6 +21,8 @@ Requires-Dist: opencv-stubs>=0.1.1
 Requires-Dist: fastapi>=0.128.0
 Requires-Dist: uvicorn>=0.40.0
 Requires-Dist: websockets>=15.0.1
+Requires-Dist: aiortc>=1.9.0
+Requires-Dist: av>=12.0.0
 Provides-Extra: linux
 Requires-Dist: xformers==0.0.34.dev20251208+cu128; platform_system == "Linux" and extra == "linux"
 Dynamic: license-file

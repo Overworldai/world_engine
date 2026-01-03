@@ -1,13 +1,6 @@
 """
 Low-latency WebSocket server for WorldEngine frame streaming.
 
-Optimizations for latency:
-- Pre-allocated JPEG encoding buffer
-- Minimal JSON overhead in message protocol
-- Direct tensor-to-bytes pipeline
-- No unnecessary copies or conversions
-- Configurable JPEG quality for bandwidth/quality tradeoff
-
 Usage:
     python examples/websocket_server.py
 
@@ -19,9 +12,9 @@ import base64
 import io
 import json
 import logging
+import time
 import urllib.request
 from dataclasses import dataclass
-from typing import Set
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,7 +40,7 @@ MODEL_URI = "OpenWorldLabs/Medium-0-NoCaption-SF-Shift8"
 QUANT = "w8a8"
 N_FRAMES = 4096
 DEVICE = "cuda"
-JPEG_QUALITY = 80  # Lower = faster encoding, smaller size, lower quality
+JPEG_QUALITY = 85
 
 BUTTON_CODES = {
     "W": ord("W"),
@@ -74,11 +67,15 @@ seed_frame = None
 
 def load_seed_frame(target_size: tuple[int, int] = (360, 640)) -> torch.Tensor:
     """Load and preprocess the seed frame."""
+    logger.info("Downloading seed frame...")
     urllib.request.urlretrieve(SEED_URL, "/tmp/seed.png")
+    logger.info("Reading seed image...")
     img = torchvision.io.read_image("/tmp/seed.png")
     img = img[:3].unsqueeze(0).float()
     frame = F.interpolate(img, size=target_size, mode="bilinear", align_corners=False)[0]
-    return frame.to(dtype=torch.uint8, device=DEVICE).permute(1, 2, 0).contiguous()
+    result = frame.to(dtype=torch.uint8, device=DEVICE).permute(1, 2, 0).contiguous()
+    logger.info(f"Seed frame ready: {result.shape}, {result.dtype}, {result.device}")
+    return result
 
 
 def load_engine():
@@ -86,39 +83,30 @@ def load_engine():
     global engine, seed_frame
     from world_engine import WorldEngine
 
+    logger.info(f"Loading WorldEngine: {MODEL_URI} (quant={QUANT})")
     engine = WorldEngine(
         MODEL_URI,
         device=DEVICE,
         model_config_overrides={"n_frames": N_FRAMES, "ae_uri": "OpenWorldLabs/owl_vae_f16_c16_distill_v0_nogan"},
         quant=QUANT,
     )
+    logger.info("WorldEngine loaded")
     seed_frame = load_seed_frame()
+    logger.info("All initialization complete")
 
 
 # ============================================================================
-# Frame Encoding (Latency Optimized)
+# Frame Encoding
 # ============================================================================
-
-_jpeg_buffer = io.BytesIO()
-
 
 def frame_to_jpeg(frame: torch.Tensor, quality: int = JPEG_QUALITY) -> bytes:
-    """Convert frame tensor to JPEG bytes with minimal latency."""
+    """Convert frame tensor to JPEG bytes."""
     if frame.dtype != torch.uint8:
         frame = frame.clamp(0, 255).to(torch.uint8)
-
-    _jpeg_buffer.seek(0)
-    _jpeg_buffer.truncate()
-
     img = Image.fromarray(frame.cpu().numpy(), mode="RGB")
-    img.save(_jpeg_buffer, format="JPEG", quality=quality, optimize=False)
-    return _jpeg_buffer.getvalue()
-
-
-def frame_to_base64(frame: torch.Tensor) -> str:
-    """Convert frame to base64-encoded JPEG string."""
-    jpeg_bytes = frame_to_jpeg(frame)
-    return base64.b64encode(jpeg_bytes).decode("ascii")
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality)
+    return buf.getvalue()
 
 
 # ============================================================================
@@ -130,37 +118,6 @@ class Session:
     """Tracks state for a single WebSocket connection."""
     frame_count: int = 0
     max_frames: int = N_FRAMES - 2
-
-    def should_reset(self) -> bool:
-        return self.frame_count >= self.max_frames
-
-    def reset(self):
-        self.frame_count = 0
-
-    def increment(self):
-        self.frame_count += 1
-
-
-# ============================================================================
-# Message Protocol
-# ============================================================================
-
-class MessageType:
-    """WebSocket message types."""
-    STATUS = "status"
-    FRAME = "frame"
-    ERROR = "error"
-    CONTROL = "control"
-    RESET = "reset"
-
-
-def parse_buttons(button_names: list[str]) -> Set[int]:
-    """Convert button name strings to button code set."""
-    return {
-        BUTTON_CODES[name.upper()]
-        for name in button_names
-        if name.upper() in BUTTON_CODES
-    }
 
 
 # ============================================================================
@@ -185,6 +142,14 @@ async def health():
     })
 
 
+# Status codes (client maps these to display text)
+class Status:
+    INIT = "init"          # Engine resetting
+    LOADING = "loading"    # Loading seed frame
+    READY = "ready"        # Ready for game loop
+    RESET = "reset"        # Session reset
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """
@@ -192,13 +157,15 @@ async def websocket_endpoint(websocket: WebSocket):
 
     Protocol:
         Server -> Client:
-            {"type": "status", "message": str}
-            {"type": "frame", "data": base64_jpeg, "id": int}
+            {"type": "status", "code": str}
+            {"type": "frame", "data": base64_jpeg, "frame_id": int, "client_ts": float, "gen_ms": float}
             {"type": "error", "message": str}
 
         Client -> Server:
-            {"type": "control", "buttons": [str], "mouse_dx": float, "mouse_dy": float}
+            {"type": "control", "buttons": [str], "mouse_dx": float, "mouse_dy": float, "ts": float}
             {"type": "reset"}
+
+    Status codes: init, loading, ready, reset
     """
     from world_engine import CtrlInput
 
@@ -208,27 +175,32 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     session = Session()
 
-    async def send(msg_type: str, **kwargs):
-        await websocket.send_text(json.dumps({"type": msg_type, **kwargs}))
-
-    async def send_frame(frame: torch.Tensor):
-        b64_data = await asyncio.to_thread(frame_to_base64, frame)
-        await send(MessageType.FRAME, data=b64_data, id=session.frame_count)
-
-    async def do_reset():
-        await asyncio.to_thread(engine.reset)
-        await asyncio.to_thread(engine.append_frame, seed_frame)
-        session.reset()
-        await send(MessageType.STATUS, message="reset")
+    async def send_json(data: dict):
+        await websocket.send_text(json.dumps(data))
 
     try:
-        await send(MessageType.STATUS, message="initializing")
+        await send_json({"type": "status", "code": Status.INIT})
+
+        logger.info(f"[{client_host}] Calling engine.reset()...")
         await asyncio.to_thread(engine.reset)
 
-        await send(MessageType.STATUS, message="loading seed frame")
+        await send_json({"type": "status", "code": Status.LOADING})
+
+        logger.info(f"[{client_host}] Calling append_frame...")
         await asyncio.to_thread(engine.append_frame, seed_frame)
 
-        await send(MessageType.STATUS, message="ready")
+        # Send initial frame so client has something to display
+        jpeg = await asyncio.to_thread(frame_to_jpeg, seed_frame)
+        await send_json({
+            "type": "frame",
+            "data": base64.b64encode(jpeg).decode("ascii"),
+            "frame_id": 0,
+            "client_ts": 0,
+            "gen_ms": 0,
+        })
+
+        await send_json({"type": "status", "code": Status.READY})
+        logger.info(f"[{client_host}] Ready for game loop")
 
         while True:
             try:
@@ -237,41 +209,59 @@ async def websocket_endpoint(websocket: WebSocket):
             except asyncio.TimeoutError:
                 continue
             except WebSocketDisconnect:
+                logger.info(f"[{client_host}] Client disconnected")
                 break
 
-            msg_type = msg.get("type", MessageType.CONTROL)
-            logger.info(f"[{client_host}] Received: {msg_type}")
+            msg_type = msg.get("type", "control")
 
-            if msg_type == MessageType.RESET:
+            if msg_type == "reset":
                 logger.info(f"[{client_host}] Reset requested")
-                await do_reset()
+                await asyncio.to_thread(engine.reset)
+                await asyncio.to_thread(engine.append_frame, seed_frame)
+                session.frame_count = 0
+                await send_json({"type": "status", "code": Status.RESET})
                 continue
 
-            if msg_type == MessageType.CONTROL:
-                if session.should_reset():
-                    logger.info(f"[{client_host}] Auto-reset at frame limit")
-                    await do_reset()
-
-                buttons_raw = msg.get("buttons", [])
-                buttons = parse_buttons(buttons_raw)
+            if msg_type == "control":
+                buttons = {BUTTON_CODES[b.upper()] for b in msg.get("buttons", []) if b.upper() in BUTTON_CODES}
                 mouse_dx = float(msg.get("mouse_dx", 0))
                 mouse_dy = float(msg.get("mouse_dy", 0))
+                client_ts = msg.get("ts", 0)
 
-                logger.info(
-                    f"[{client_host}] Frame {session.frame_count}: "
-                    f"buttons={buttons_raw}, mouse=({mouse_dx:.1f}, {mouse_dy:.1f})"
-                )
+                if session.frame_count >= session.max_frames:
+                    logger.info(f"[{client_host}] Auto-reset at frame limit")
+                    await asyncio.to_thread(engine.reset)
+                    await asyncio.to_thread(engine.append_frame, seed_frame)
+                    session.frame_count = 0
+                    await send_json({"type": "status", "code": Status.RESET})
 
                 ctrl = CtrlInput(button=buttons, mouse=(mouse_dx, mouse_dy))
-                frame = await asyncio.to_thread(engine.gen_frame, ctrl=ctrl)
-                session.increment()
 
-                await send_frame(frame)
+                t0 = time.perf_counter()
+                frame = await asyncio.to_thread(engine.gen_frame, ctrl=ctrl)
+                gen_time = (time.perf_counter() - t0) * 1000
+
+                session.frame_count += 1
+
+                # Encode and send frame with timing info
+                jpeg = await asyncio.to_thread(frame_to_jpeg, frame)
+                await send_json({
+                    "type": "frame",
+                    "data": base64.b64encode(jpeg).decode("ascii"),
+                    "frame_id": session.frame_count,
+                    "client_ts": client_ts,
+                    "gen_ms": gen_time,
+                })
+
+                # Logging
+                logger.info(f"[{client_host}] Received control (buttons={buttons}, mouse=({mouse_dx},{mouse_dy})) -> Sent frame {session.frame_count} (gen={gen_time:.1f}ms)")
+                if session.frame_count % 60 == 0:
+                    logger.info(f"[{client_host}] Frame {session.frame_count} (gen={gen_time:.1f}ms)")
 
     except Exception as e:
-        logger.error(f"[{client_host}] Error: {e}")
+        logger.error(f"[{client_host}] Error: {e}", exc_info=True)
         try:
-            await send(MessageType.ERROR, message=str(e))
+            await send_json({"type": "error", "message": str(e)})
         except Exception:
             pass
     finally:
