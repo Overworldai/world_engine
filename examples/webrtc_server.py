@@ -58,6 +58,8 @@ from aiortc import (
 )
 from aiortc.mediastreams import MediaStreamTrack, MediaStreamError
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 import uvicorn
@@ -105,7 +107,7 @@ engine_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="engine")
 
 async def run_in_engine_thread(func, *args):
     """Run a function in the dedicated engine thread."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(engine_executor, func, *args)
 
 
@@ -147,7 +149,6 @@ class Status:
     INIT = "init"          # Server initializing
     LOADING = "loading"    # Engine warming up
     READY = "ready"        # Ready to receive offer
-    CONNECTED = "connected"  # Peer connection established
     STREAMING = "streaming"  # Actively streaming frames
     RESET = "reset"        # Session reset
 
@@ -208,14 +209,21 @@ class WorldEngineVideoTrack(MediaStreamTrack):
     async def warm(self):
         """
         Warm up the engine - reset and prepare for streaming.
-        Called early to keep the engine ready for quick connection.
+        Runs a warmup frame to trigger JIT compilation before actual streaming.
         """
         if self._warmed:
             return
 
+        from world_engine import CtrlInput
+
         logger.info(f"[{self.client_id}] Warming engine...")
         await run_in_engine_thread(engine.reset)
         await run_in_engine_thread(engine.append_frame, seed_frame)
+
+        # Generate a warmup frame to trigger JIT compilation
+        logger.info(f"[{self.client_id}] Running warmup frame (JIT compile)...")
+        await run_in_engine_thread(engine.gen_frame, CtrlInput())
+
         self._warmed = True
         logger.info(f"[{self.client_id}] Engine warm")
 
@@ -260,7 +268,7 @@ class WorldEngineVideoTrack(MediaStreamTrack):
 
         logger.info(f"[{self.client_id}] Video track stopped")
 
-    async def set_paused(self, paused: bool):
+    def set_paused(self, paused: bool):
         """Pause or resume frame generation."""
         self._paused = paused
 
@@ -295,7 +303,7 @@ class WorldEngineVideoTrack(MediaStreamTrack):
 
                 # Generate frame (40-80ms on GPU)
                 t0 = time.perf_counter()
-                frame_tensor = await run_in_engine_thread(lambda: engine.gen_frame(ctrl=ctrl))
+                frame_tensor = await run_in_engine_thread(engine.gen_frame, ctrl)
                 self.last_gen_time = (time.perf_counter() - t0) * 1000
 
                 self.frame_count += 1
@@ -414,12 +422,12 @@ async def cleanup_session(client_id: str):
 # FastAPI Application
 # ============================================================================
 
-app = FastAPI(title="WorldEngine WebRTC Server")
-
-
-@app.on_event("startup")
-async def startup():
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
     load_engine()
+    yield
+
+app = FastAPI(title="WorldEngine WebRTC Server", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -509,15 +517,11 @@ async def signaling_endpoint(websocket: WebSocket):
                 pc.addTrack(video_track)
                 logger.info(f"[{client_id}] Added video track to peer connection")
 
-                # Peer connection event handlers
                 @pc.on("connectionstatechange")
                 async def on_conn_state():
                     state = pc.connectionState
                     logger.info(f"[{client_id}] Connection state: {state}")
-                    if state == "connected":
-                        # Streaming already started earlier, just notify client
-                        await send_status(Status.STREAMING)
-                    elif state in ("failed", "closed", "disconnected"):
+                    if state in ("failed", "closed", "disconnected"):
                         await cleanup_session(client_id)
 
                 @pc.on("iceconnectionstatechange")
@@ -647,7 +651,7 @@ async def _handle_dc_message(message, video_track, client_id, send_json):
 
         elif msg_type == "pause":
             paused = msg.get("paused", True)
-            await video_track.set_paused(paused)
+            video_track.set_paused(paused)
             logger.info(f"[{client_id}] Pause: {paused}")
 
         elif msg_type == "reset":
