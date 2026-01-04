@@ -194,6 +194,7 @@ class WorldEngineVideoTrack(MediaStreamTrack):
         self.max_frames = N_FRAMES - 2
         self._warmed = False
         self._streaming = False
+        self._paused = False
 
         # Frame queue (size 2: one generating, one ready)
         self._frame_queue: asyncio.Queue[VideoFrame] = asyncio.Queue(maxsize=2)
@@ -201,6 +202,8 @@ class WorldEngineVideoTrack(MediaStreamTrack):
 
         # Stats
         self.last_gen_time = 0.0
+        self._stats_callback = None  # Set by session to send stats via DataChannel
+        self._last_client_ts = 0  # Last client timestamp for RTT calculation
 
     async def warm(self):
         """
@@ -257,6 +260,10 @@ class WorldEngineVideoTrack(MediaStreamTrack):
 
         logger.info(f"[{self.client_id}] Video track stopped")
 
+    async def set_paused(self, paused: bool):
+        """Pause or resume frame generation."""
+        self._paused = paused
+
     async def _generate_frames(self):
         """Background loop generating frames continuously."""
         from world_engine import CtrlInput
@@ -265,6 +272,11 @@ class WorldEngineVideoTrack(MediaStreamTrack):
 
         while self._streaming:
             try:
+                # Skip frame generation when paused
+                if self._paused:
+                    await asyncio.sleep(0.1)
+                    continue
+
                 # Get latest control input (atomic read + clear)
                 async with self._ctrl_lock:
                     ctrl = self._latest_ctrl
@@ -306,6 +318,18 @@ class WorldEngineVideoTrack(MediaStreamTrack):
                         pass
                     self._frame_queue.put_nowait(video_frame)
 
+                # Send stats to client via data channel
+                if self._stats_callback:
+                    stats_msg = {
+                        "type": "stats",
+                        "gentime": round(self.last_gen_time, 1),
+                        "frame": self.frame_count,
+                        "client_ts": self._last_client_ts  # Echo client timestamp for RTT calc
+                    }
+                    await self._stats_callback(stats_msg)
+                    if self.frame_count % 60 == 0:
+                        logger.info(f"[{self.client_id}] Stats sent: {stats_msg}")
+
                 # Log first frame and then periodically
                 if self.frame_count == 1 or self.frame_count % 60 == 0:
                     logger.info(f"[{self.client_id}] Frame {self.frame_count} (gen={self.last_gen_time:.1f}ms)")
@@ -324,17 +348,21 @@ class WorldEngineVideoTrack(MediaStreamTrack):
             logger.debug(f"[{self.client_id}] recv() called but not streaming")
             raise MediaStreamError("Track not streaming")
 
-        # Wait for frame from generator
-        # First frame may take longer due to JIT compilation
-        timeout = 30.0 if self.frame_count == 0 else 5.0
-        try:
-            frame = await asyncio.wait_for(self._frame_queue.get(), timeout=timeout)
-            return frame
-        except asyncio.TimeoutError:
-            logger.warning(f"[{self.client_id}] recv() timeout after {timeout}s - no frames in queue (frame_count={self.frame_count})")
-            raise MediaStreamError("Frame timeout")
+        # Wait for frame from generator (no timeout - handles pause and slow JIT)
+        # When paused, generator sleeps but doesn't produce frames
+        # We poll the queue with short timeouts to stay responsive to stop()
+        while self._streaming:
+            try:
+                frame = await asyncio.wait_for(self._frame_queue.get(), timeout=0.5)
+                return frame
+            except asyncio.TimeoutError:
+                # No frame yet, keep waiting if still streaming
+                continue
 
-    async def update_control(self, buttons: set, mouse_dx: float, mouse_dy: float):
+        # Streaming stopped while waiting
+        raise MediaStreamError("Track stopped")
+
+    async def update_control(self, buttons: set, mouse_dx: float, mouse_dy: float, client_ts: float = 0):
         """
         Update latest control input (called by DataChannel handler).
         Uses latest-only policy: overwrites any pending input.
@@ -344,6 +372,7 @@ class WorldEngineVideoTrack(MediaStreamTrack):
         ctrl = CtrlInput(button=buttons, mouse=(mouse_dx, mouse_dy))
         async with self._ctrl_lock:
             self._latest_ctrl = ctrl
+            self._last_client_ts = client_ts
 
     async def reset_session(self):
         """Reset the engine and frame counter."""
@@ -480,24 +509,6 @@ async def signaling_endpoint(websocket: WebSocket):
                 pc.addTrack(video_track)
                 logger.info(f"[{client_id}] Added video track to peer connection")
 
-                # Create data channel for controls
-                data_channel = pc.createDataChannel("controls", ordered=False)
-                session.data_channel = data_channel
-                logger.info(f"[{client_id}] Created data channel")
-
-                # Data channel event handlers
-                @data_channel.on("open")
-                def on_dc_open():
-                    logger.info(f"[{client_id}] DataChannel open")
-
-                @data_channel.on("close")
-                def on_dc_close():
-                    logger.info(f"[{client_id}] DataChannel closed")
-
-                @data_channel.on("message")
-                def on_dc_message(message):
-                    asyncio.create_task(_handle_dc_message(message, video_track, client_id, send_json))
-
                 # Peer connection event handlers
                 @pc.on("connectionstatechange")
                 async def on_conn_state():
@@ -512,6 +523,42 @@ async def signaling_endpoint(websocket: WebSocket):
                 @pc.on("iceconnectionstatechange")
                 async def on_ice_state():
                     logger.debug(f"[{client_id}] ICE connection state: {pc.iceConnectionState}")
+
+                # Handle data channel from client
+                @pc.on("datachannel")
+                def on_datachannel(channel):
+                    logger.info(f"[{client_id}] DataChannel received: {channel.label}, state: {channel.readyState}")
+                    session.data_channel = channel
+
+                    # Set up stats callback to send via this channel
+                    def setup_stats_callback():
+                        logger.info(f"[{client_id}] Setting up stats callback")
+                        async def send_stats(stats):
+                            if channel.readyState == "open":
+                                try:
+                                    channel.send(json.dumps(stats))
+                                except Exception as e:
+                                    logger.warning(f"[{client_id}] Failed to send stats: {e}")
+                        video_track._stats_callback = send_stats
+                        logger.info(f"[{client_id}] Stats callback set")
+
+                    # Channel might already be open when we receive it
+                    if channel.readyState == "open":
+                        setup_stats_callback()
+
+                    @channel.on("open")
+                    def on_dc_open():
+                        logger.info(f"[{client_id}] DataChannel open event")
+                        setup_stats_callback()
+
+                    @channel.on("close")
+                    def on_dc_close():
+                        logger.info(f"[{client_id}] DataChannel closed")
+                        video_track._stats_callback = None
+
+                    @channel.on("message")
+                    def on_dc_message(message):
+                        asyncio.create_task(_handle_dc_message(message, video_track, client_id, send_json))
 
                 # Process the offer
                 offer = RTCSessionDescription(sdp=msg["sdp"], type="offer")
@@ -593,7 +640,15 @@ async def _handle_dc_message(message, video_track, client_id, send_json):
             }
             mouse_dx = float(msg.get("mouse_dx", 0))
             mouse_dy = float(msg.get("mouse_dy", 0))
-            await video_track.update_control(buttons, mouse_dx, mouse_dy)
+            client_ts = float(msg.get("ts", 0))  # Client timestamp for RTT
+            if video_track._last_client_ts == 0 and client_ts > 0:
+                logger.info(f"[{client_id}] First control with ts: {client_ts}")
+            await video_track.update_control(buttons, mouse_dx, mouse_dy, client_ts)
+
+        elif msg_type == "pause":
+            paused = msg.get("paused", True)
+            await video_track.set_paused(paused)
+            logger.info(f"[{client_id}] Pause: {paused}")
 
         elif msg_type == "reset":
             await video_track.reset_session()
