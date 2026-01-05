@@ -562,7 +562,7 @@ async def signaling_endpoint(websocket: WebSocket):
 
                     @channel.on("message")
                     def on_dc_message(message):
-                        asyncio.create_task(_handle_dc_message(message, video_track, client_id, send_json))
+                        asyncio.create_task(_handle_dc_message(message, video_track, client_id, channel))
 
                 # Process the offer
                 offer = RTCSessionDescription(sdp=msg["sdp"], type="offer")
@@ -630,7 +630,7 @@ async def signaling_endpoint(websocket: WebSocket):
         logger.info(f"[{client_id}] Disconnected")
 
 
-async def _handle_dc_message(message, video_track, client_id, send_json):
+async def _handle_dc_message(message, video_track, client_id, data_channel):
     """Handle control messages from data channel."""
     try:
         msg = json.loads(message)
@@ -656,7 +656,13 @@ async def _handle_dc_message(message, video_track, client_id, send_json):
 
         elif msg_type == "reset":
             await video_track.reset_session()
-            await send_json({"type": "status", "code": Status.RESET})
+            # Send reset confirmation via data channel
+            if data_channel and data_channel.readyState == "open":
+                try:
+                    data_channel.send(json.dumps({"type": "reset", "success": True}))
+                    logger.info(f"[{client_id}] Reset complete, confirmation sent")
+                except Exception as e:
+                    logger.warning(f"[{client_id}] Failed to send reset confirmation: {e}")
 
     except Exception as e:
         logger.error(f"[{client_id}] DataChannel message error: {e}")
