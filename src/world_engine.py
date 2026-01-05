@@ -107,7 +107,6 @@ class WorldEngine:
 
     @torch.compile
     def _prep_inputs(self, x, ctrl=None):
-        ctrl = ctrl if ctrl is not None else CtrlInput()
         self._ctx["button"].zero_()
         if ctrl.button:
             idx = torch.as_tensor(list(ctrl.button), device=self._ctx["button"].device, dtype=torch.long)
@@ -122,6 +121,8 @@ class WorldEngine:
         return self._ctx
 
     def prep_inputs(self, x, ctrl=None):
+        ctrl = ctrl if ctrl is not None else CtrlInput()
+        ctrl.mouse = torch.tensor(ctrl.mouse)
         ctx = self._prep_inputs(x, ctrl)
 
         # prepare prompt conditioning
