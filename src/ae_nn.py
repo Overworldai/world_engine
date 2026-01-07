@@ -38,7 +38,7 @@ class LandscapeToSquare(nn.Module):
     def __init__(self, ch_in, ch_out):
         super().__init__()
 
-        self.proj = WeightNormConv2d(ch_in, ch_out, 3, 3, 1)
+        self.proj = WeightNormConv2d(ch_in, ch_out, 3, 1, 1)
     
     def forward(self, x):
         x = F.interpolate(x, (512, 512), mode = 'bicubic')
@@ -107,7 +107,7 @@ class SquareToLandscape(nn.Module):
     def __init__(self, ch_in, ch_out):
         super().__init__()
         
-        self.proj = WeightNormConv2d(ch_in, ch_out, 3, 3, 1)
+        self.proj = WeightNormConv2d(ch_in, ch_out, 3, 1, 1)
     
     def forward(self, x):
         x = self.proj(x) # TODO This ordering is wrong for both
@@ -184,7 +184,7 @@ class Encoder(nn.Module):
             next_ch = min(ch*2, config.ch_max)
 
             blocks.append(DownBlock(ch, next_ch, block_count))
-            residuals.append(SpaceToChannel(next_ch, next_ch))
+            residuals.append(SpaceToChannel(ch, next_ch))
             
             ch =  next_ch
     
@@ -212,7 +212,7 @@ class Decoder(nn.Module):
             next_ch = min(ch*2, config.ch_max)
 
             blocks.append(UpBlock(next_ch, ch, block_count))
-            residuals.append(ChannelToSpace(next_ch, next_ch))
+            residuals.append(ChannelToSpace(next_ch, ch))
 
             ch = next_ch
         
