@@ -3,7 +3,7 @@ import torch
 from torch import Tensor
 from dataclasses import dataclass, field
 
-from .model import WorldModel, StaticKVCache  # , PromptEncoder
+from .model import WorldModel, StaticKVCache, PromptEncoder
 from .ae import InferenceAE
 from .patch_model import apply_inference_patches
 from .quantize import quantize_model
@@ -45,7 +45,10 @@ class WorldEngine:
 
         # Model
         self.vae = InferenceAE.from_pretrained(self.model_cfg.ae_uri, device=device, dtype=dtype)
-        # self.prompt_encoder = PromptEncoder("google/umt5-xl").to(device).eval()  # TODO: dont hardcode
+
+        self.prompt_encoder = None
+        if self.model_cfg.prompt_conditioning is not None:
+            self.prompt_encoder = PromptEncoder("google/umt5-xl", dtype=dtype).to(device).eval()  # TODO: dont hardcode
 
         self.model = WorldModel.from_pretrained(model_uri, cfg=self.model_cfg).to(device=device, dtype=dtype).eval()
         apply_inference_patches(self.model)
@@ -62,12 +65,15 @@ class WorldEngine:
         # State
         self.kv_cache = StaticKVCache(self.model_cfg, batch_size=1, dtype=dtype).to(device)
         self.frame_ts = torch.tensor([[0]], dtype=torch.long, device=device)
+
         # Static input context tensors
         self._ctx = {
             "button": torch.zeros((1, 1, self.model_cfg.n_buttons), device=device, dtype=dtype),
             "mouse": torch.zeros((1, 1, 2), device=device, dtype=dtype),
             "frame_timestamp": torch.empty((1, 1), device=device, dtype=torch.long),
         }
+
+        self._prompt_ctx = {"prompt_emb": None, "prompt_pad_mask": None}
 
     @torch.inference_mode()
     def reset(self):
@@ -79,28 +85,28 @@ class WorldEngine:
 
     def set_prompt(self, prompt: str):
         """Apply text conditioning for T2V"""
-        import warnings
-        warnings.warn("Not Implemented")
+        if self.prompt_encoder is None:
+            raise RuntimeError("prompt_conditioning enabled but prompt_encoder is not initialized")
+        self._prompt_ctx["prompt_emb"], self._prompt_ctx["prompt_pad_mask"] = self.prompt_encoder([prompt])
 
     @torch.inference_mode()
     def append_frame(self, img: Tensor, ctrl: CtrlInput = None):
         assert img.dtype == torch.uint8, img.dtype
         x0 = self.vae.encode(img).unsqueeze(1)
-        inputs = self._prep_inputs(x=x0, ctrl=ctrl)
+        inputs = self.prep_inputs(x=x0, ctrl=ctrl)
         self._cache_pass(x0, inputs, self.kv_cache)
         return img
 
     @torch.inference_mode()
     def gen_frame(self, ctrl: CtrlInput = None, return_img: bool = True):
         x = torch.randn(self.frm_shape, device=self.device, dtype=self.dtype)
-        inputs = self._prep_inputs(x=x, ctrl=ctrl)
+        inputs = self.prep_inputs(x=x, ctrl=ctrl)
         x0 = self._denoise_pass(x, inputs, self.kv_cache).clone()
         self._cache_pass(x0, inputs, self.kv_cache)
         return (self.vae.decode(x0.squeeze(1)) if return_img else x0.squeeze(1))
 
     @torch.compile
     def _prep_inputs(self, x, ctrl=None):
-        ctrl = ctrl if ctrl is not None else CtrlInput()
         self._ctx["button"].zero_()
         if ctrl.button:
             idx = torch.as_tensor(list(ctrl.button), device=self._ctx["button"].device, dtype=torch.long)
@@ -111,7 +117,20 @@ class WorldEngine:
 
         self._ctx["frame_timestamp"].copy_(self.frame_ts)
         self.frame_ts.add_(1)
+
         return self._ctx
+
+    def prep_inputs(self, x, ctrl=None):
+        ctrl = ctrl if ctrl is not None else CtrlInput()
+        ctrl.mouse = torch.tensor(ctrl.mouse)
+        ctx = self._prep_inputs(x, ctrl)
+
+        # prepare prompt conditioning
+        if self.model_cfg.prompt_conditioning is None:
+            return ctx
+        if self._prompt_ctx["prompt_emb"] is None:
+            self.set_prompt("An explorable world")
+        return {**ctx, **self._prompt_ctx}
 
     @torch.compile(fullgraph=True, mode="max-autotune", dynamic=False)
     def _denoise_pass(self, x, ctx: Dict[str, Tensor], kv_cache):

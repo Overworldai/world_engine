@@ -1,0 +1,209 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 380" width="720" height="380">
+  <defs>
+    <marker id="arrow"
+            viewBox="0 0 10 10"
+            refX="10" refY="5"
+            markerUnits="strokeWidth"
+            markerWidth="5.4" markerHeight="5.4"
+            orient="auto"
+            overflow="visible">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+    </marker>
+
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="2" stdDeviation="2.2" flood-color="#0b1020" flood-opacity="0.12"/>
+    </filter>
+
+    <!-- Core component: slightly stronger depth + subtle cool glow (clean) -->
+    <filter id="coreShadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="2" stdDeviation="2.2" flood-color="#0b1020" flood-opacity="0.14"/>
+      <feDropShadow dx="0" dy="0" stdDeviation="6.5" flood-color="#3b82f6" flood-opacity="0.12"/>
+    </filter>
+
+    <linearGradient id="cardFill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#f7f9fc"/>
+    </linearGradient>
+
+    <linearGradient id="thumbFill" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#eef2ff"/>
+      <stop offset="1" stop-color="#ecfeff"/>
+    </linearGradient>
+
+    <linearGradient id="engineFill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#f8fafc"/>
+    </linearGradient>
+
+    <!-- Core component: very subtle tint -->
+    <linearGradient id="engineCoreFill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#eef2ff"/>
+    </linearGradient>
+
+    <radialGradient id="ctrlBtnShineV5" cx="30%" cy="30%" r="70%">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+
+    <radialGradient id="sunFill" cx="30%" cy="30%" r="75%">
+      <stop offset="0" stop-color="#fff7cc"/>
+      <stop offset="1" stop-color="#fbbf24"/>
+    </radialGradient>
+
+    <!-- Thumb clips -->
+    <clipPath id="thumbClip1"><rect x="68"  y="248" width="66" height="66" rx="12"/></clipPath>
+    <clipPath id="thumbClip2"><rect x="158" y="248" width="66" height="66" rx="12"/></clipPath>
+    <clipPath id="thumbClip3"><rect x="248" y="248" width="66" height="66" rx="12"/></clipPath>
+    <clipPath id="thumbClip4"><rect x="378" y="248" width="66" height="66" rx="12"/></clipPath>
+
+    <!-- NEW FRAME thumb clip -->
+    <clipPath id="thumbClip5"><rect x="570" y="253" width="66" height="66" rx="12"/></clipPath>
+
+    <style>
+      .ui{
+        font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
+        fill:#111827;
+      }
+      .muted{ fill:#64748b; }
+
+      .conn{
+        stroke:#64748b;
+        stroke-width:1.6;
+        stroke-linecap:round;
+        stroke-linejoin:round;
+        fill:none;
+        vector-effect: non-scaling-stroke;
+        shape-rendering: crispEdges;
+      }
+
+      .dashbox{
+        stroke:#94a3b8;
+        stroke-width:1.25;
+        stroke-dasharray:5 6;
+        stroke-linecap:round;
+        stroke-linejoin:round;
+        fill:none;
+        vector-effect: non-scaling-stroke;
+        shape-rendering: crispEdges;
+      }
+    </style>
+  </defs>
+
+  <!-- LEFT: INPUTS -->
+  <g filter="url(#shadow)">
+    <!-- Scene description prompt -->
+    <rect x="48" y="60" width="420" height="58" rx="16" fill="url(#cardFill)" stroke="#cbd5e1" stroke-width="1.6"/>
+    <g transform="translate(66,74)">
+      <rect x="0" y="0" width="30" height="30" rx="8" fill="url(#thumbFill)" stroke="#c7d2fe" stroke-width="1.2"/>
+      <path d="M 8 10 H 22" class="conn" stroke-width="1.2"/>
+      <path d="M 8 16 H 20" class="conn" stroke-width="1.2" opacity="0.9"/>
+      <path d="M 8 22 H 18" class="conn" stroke-width="1.2" opacity="0.8"/>
+    </g>
+    <text class="ui" x="108" y="83" font-size="12.5" font-weight="800">Scene description prompt</text>
+    <text class="ui muted" x="108" y="101" font-size="11.2" font-weight="650">Text guidance</text>
+
+    <!-- User inputs -->
+    <rect x="48" y="130" width="420" height="58" rx="16" fill="url(#cardFill)" stroke="#cbd5e1" stroke-width="1.6"/>
+    <g transform="translate(66,144)">
+      <rect x="0" y="7" width="30" height="18" rx="9" fill="url(#thumbFill)" stroke="#c7d2fe" stroke-width="1.2"/>
+      <circle cx="10" cy="16" r="3.8" fill="#e2e8f0" stroke="#94a3b8" stroke-width="0.9"/>
+      <path d="M 8.4 16 H 11.6" stroke="#475569" stroke-width="1.2" stroke-linecap="round"/>
+      <path d="M 10 14.4 V 17.6" stroke="#475569" stroke-width="1.2" stroke-linecap="round"/>
+      <circle cx="21.0" cy="14.7" r="2.0" fill="#60a5fa" opacity="0.9"/>
+      <circle cx="24.2" cy="17.8" r="2.0" fill="#f87171" opacity="0.9"/>
+      <circle cx="21.0" cy="14.7" r="2.0" fill="url(#ctrlBtnShineV5)"/>
+      <circle cx="24.2" cy="17.8" r="2.0" fill="url(#ctrlBtnShineV5)"/>
+    </g>
+    <text class="ui" x="108" y="153" font-size="12.5" font-weight="800">User inputs</text>
+    <text class="ui muted" x="108" y="171" font-size="11.2" font-weight="650">Controls / interactions</text>
+  </g>
+
+  <!-- Context frames dashed box -->
+  <rect class="dashbox" x="48" y="202" width="420" height="154" rx="18"/>
+
+  <!-- Context frames label -->
+  <text class="ui" x="258" y="224" text-anchor="middle" font-size="12.5" font-weight="800">Context frames (1…N)</text>
+
+  <!-- Context frames thumbnails -->
+  <g filter="url(#shadow)">
+    <!-- Frame 1 -->
+    <g>
+      <rect x="60" y="240" width="82" height="82" rx="16" fill="url(#cardFill)" stroke="#d3dbe6" stroke-width="1.6"/>
+      <rect x="68" y="248" width="66" height="66" rx="12" fill="url(#thumbFill)" stroke="#c7d2fe" stroke-width="1.4"/>
+      <g clip-path="url(#thumbClip1)">
+        <circle cx="92" cy="298" r="7.8" fill="url(#sunFill)" stroke="#f59e0b" stroke-width="0.9" opacity="0.95"/>
+      </g>
+      <path d="M 76 310 L 90 295 L 104 304 L 116 292 L 126 310 Z" fill="#93c5fd" opacity="0.9"/>
+      <text class="ui muted" x="101" y="336" text-anchor="middle" font-size="11.5" font-weight="600">Frame 1</text>
+    </g>
+
+    <!-- Frame 2 -->
+    <g>
+      <rect x="150" y="240" width="82" height="82" rx="16" fill="url(#cardFill)" stroke="#d3dbe6" stroke-width="1.6"/>
+      <rect x="158" y="248" width="66" height="66" rx="12" fill="url(#thumbFill)" stroke="#c7d2fe" stroke-width="1.4"/>
+      <g clip-path="url(#thumbClip2)">
+        <circle cx="184" cy="286" r="7.8" fill="url(#sunFill)" stroke="#f59e0b" stroke-width="0.9" opacity="0.95"/>
+      </g>
+      <path d="M 166 310 L 180 297 L 194 305 L 206 293 L 216 310 Z" fill="#93c5fd" opacity="0.9"/>
+      <text class="ui muted" x="191" y="336" text-anchor="middle" font-size="11.5" font-weight="600">Frame 2</text>
+    </g>
+
+    <!-- Frame 3 -->
+    <g>
+      <rect x="240" y="240" width="82" height="82" rx="16" fill="url(#cardFill)" stroke="#d3dbe6" stroke-width="1.6"/>
+      <rect x="248" y="248" width="66" height="66" rx="12" fill="url(#thumbFill)" stroke="#c7d2fe" stroke-width="1.4"/>
+      <g clip-path="url(#thumbClip3)">
+        <circle cx="280" cy="268" r="7.8" fill="url(#sunFill)" stroke="#f59e0b" stroke-width="0.9" opacity="0.95"/>
+      </g>
+      <path d="M 256 310 L 270 296 L 284 304 L 296 292 L 306 310 Z" fill="#93c5fd" opacity="0.9"/>
+      <text class="ui muted" x="281" y="336" text-anchor="middle" font-size="11.5" font-weight="600">Frame 3</text>
+    </g>
+
+    <!-- Ellipsis -->
+    <text class="ui muted" x="345" y="336" text-anchor="middle" font-size="16" font-weight="800">…</text>
+
+    <!-- Frame N -->
+    <g>
+      <rect x="370" y="240" width="82" height="82" rx="16" fill="url(#cardFill)" stroke="#d3dbe6" stroke-width="1.6"/>
+      <rect x="378" y="248" width="66" height="66" rx="12" fill="url(#thumbFill)" stroke="#c7d2fe" stroke-width="1.4"/>
+      <g clip-path="url(#thumbClip4)">
+        <circle cx="430" cy="280" r="7.8" fill="url(#sunFill)" stroke="#f59e0b" stroke-width="0.9" opacity="0.95"/>
+      </g>
+      <path d="M 386 310 L 400 297 L 414 305 L 426 293 L 436 310 Z" fill="#93c5fd" opacity="0.9"/>
+      <text class="ui muted" x="411" y="336" text-anchor="middle" font-size="11.5" font-weight="600">Frame N</text>
+    </g>
+  </g>
+
+  <!-- WORLD ENGINE (core styling) -->
+  <g filter="url(#coreShadow)">
+    <rect x="510" y="107" width="185" height="105" rx="22"
+          fill="url(#engineCoreFill)" stroke="#93c5fd" stroke-width="1.9"/>
+    <!-- subtle inner highlight stroke -->
+    <rect x="512" y="109" width="181" height="101" rx="21"
+          fill="none" stroke="#ffffff" stroke-opacity="0.55" stroke-width="1"/>
+    <text class="ui" x="602.5" y="157" text-anchor="middle" font-size="18" font-weight="900">World Engine</text>
+  </g>
+
+  <!-- Independent arrows (no dots); User inputs arrow is straight -->
+  <g>
+    <path class="conn" d="M 468 89  H 492 V 137 H 510" marker-end="url(#arrow)"/>
+    <path class="conn" d="M 468 159 H 510" marker-end="url(#arrow)"/>
+    <path class="conn" d="M 468 286 H 492 V 181 H 510" marker-end="url(#arrow)"/>
+  </g>
+
+  <!-- NEW FRAME below World Engine -->
+  <g filter="url(#shadow)">
+    <rect x="562" y="245" width="82" height="82" rx="16" fill="url(#cardFill)" stroke="#d3dbe6" stroke-width="1.6"/>
+    <rect x="570" y="253" width="66" height="66" rx="12" fill="url(#thumbFill)" stroke="#c7d2fe" stroke-width="1.4"/>
+    <g clip-path="url(#thumbClip5)">
+      <circle cx="620" cy="301" r="7.8" fill="url(#sunFill)" stroke="#f59e0b" stroke-width="0.9" opacity="0.95"/>
+    </g>
+    <path d="M 578 315 L 592 300 L 606 309 L 618 297 L 628 315 Z" fill="#93c5fd" opacity="0.9"/>
+    <text class="ui muted" x="603" y="341" text-anchor="middle" font-size="11.5" font-weight="700">New frame</text>
+    <text class="ui muted" x="603" y="355" text-anchor="middle" font-size="10.6" font-weight="650">becomes next context</text>
+  </g>
+
+  <!-- Engine -> new frame -->
+  <path class="conn" d="M 602.5 212 V 245" marker-end="url(#arrow)"/>
+</svg>

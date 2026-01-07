@@ -15,13 +15,12 @@ from .base_model import BaseModel
 
 
 class PromptEncoder(nn.Module):
-    """Callable for text -> UMT5 embedding"""
     import os
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+    """Callable for text -> UMT5 embedding"""
     def __init__(self, model_id="google/umt5-xl", dtype=torch.bfloat16):
         from transformers import AutoTokenizer, UMT5EncoderModel
-
         super().__init__()
         self.dtype = dtype
         self.tok = AutoTokenizer.from_pretrained(model_id)
@@ -40,10 +39,12 @@ class PromptEncoder(nn.Module):
             return_tensors="pt",
             padding="max_length",
             truncation=True,
-            max_length=128
+            max_length=512
         ).to(self.encoder.device)
+        attn = inputs["attention_mask"]                      # [B,S] 1=token 0=pad
         emb = self.encode(inputs).to(self.dtype)
-        pad_mask = inputs["attention_mask"].eq(0)
+        emb = emb * attn.unsqueeze(-1).type_as(emb)          # preserve old behavior
+        pad_mask = attn.eq(0)
         return emb, pad_mask
 
 
@@ -164,7 +165,11 @@ class WorldDiTBlock(nn.Module):
 
         # Cross Attention Prompt Conditioning
         if self.prompt_cross_attn is not None:
-            x = self.prompt_cross_attn(rms_norm(x), context=rms_norm(ctx["prompt_emb"])) + x
+            x = self.prompt_cross_attn(
+                rms_norm(x),
+                context=rms_norm(ctx["prompt_emb"]),
+                context_pad_mask=ctx["prompt_pad_mask"],
+            ) + x
 
         # MLPFusion Controller Conditioning
         if self.ctrl_mlpfusion is not None:
@@ -246,6 +251,7 @@ class WorldModel(BaseModel):
         sigma: Tensor,
         frame_timestamp: Tensor,
         prompt_emb: Optional[Tensor] = None,
+        prompt_pad_mask: Optional[Tensor] = None,
         mouse: Optional[Tensor] = None,
         button: Optional[Tensor] = None,
         kv_cache=None,
@@ -279,6 +285,7 @@ class WorldModel(BaseModel):
         ctx = {
             "ctrl_emb": self.ctrl_emb(mouse, button),
             "prompt_emb": prompt_emb,
+            "prompt_pad_mask": prompt_pad_mask,
         }
 
         D = self.unpatchify.in_features

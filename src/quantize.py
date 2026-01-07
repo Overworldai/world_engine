@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 
 
-QUANTS = [None, "w8a8", "fp8"]
+QUANTS = [None]  # TODO: enable specific quant based on model config, which should specify compatible quants [None, "w8a8", "fp8"]
 
 
 try:
