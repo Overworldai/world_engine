@@ -14,14 +14,16 @@ class ResBlock(nn.Module):
     def __init__(self, ch):
         super().__init__()
 
-        n_grps = (2 * ch) // 16 # 16 grps
-        
-        self.conv1 = WeightNormConv2d(ch, ch, 1, 1, 0)
-        self.conv2 = WeightNormConv2d(ch, ch, 3, 1, 1, groups=n_grps)
-        self.conv3 = WeightNormConv2d(ch, ch, 1, 1, 0, bias=False)
+        hidden = 2 * ch
+        # 16 channels per group (matches checkpoint shapes like [128,16,3,3] when ch=64)
+        n_grps = max(1, hidden // 16)
 
-        self.act1 = nn.LeakyReLU(inplace=True)
-        self.act2 = nn.LeakyReLU(inplace=True)
+        self.conv1 = WeightNormConv2d(ch, hidden, 1, 1, 0)
+        self.conv2 = WeightNormConv2d(hidden, hidden, 3, 1, 1, groups=n_grps)
+        self.conv3 = WeightNormConv2d(hidden, ch, 1, 1, 0, bias=False)
+
+        self.act1 = nn.LeakyReLU(inplace=False)
+        self.act2 = nn.LeakyReLU(inplace=False)
 
     def forward(self, x):
         h = self.conv1(x)
@@ -30,7 +32,7 @@ class ResBlock(nn.Module):
         h = self.act2(h)
         h = self.conv3(h)
         return x + h
-    
+
 # === Encoder ===
 
 class LandscapeToSquare(nn.Module):
@@ -39,7 +41,7 @@ class LandscapeToSquare(nn.Module):
         super().__init__()
 
         self.proj = WeightNormConv2d(ch_in, ch_out, 3, 1, 1)
-    
+
     def forward(self, x):
         x = F.interpolate(x, (512, 512), mode = 'bicubic')
         x = self.proj(x)
@@ -50,7 +52,7 @@ class Downsample(nn.Module):
         super().__init__()
 
         self.proj = WeightNormConv2d(ch_in, ch_out, 1, 1, 0, bias = False)
-    
+
     def forward(self, x):
         x = F.interpolate(x, scale_factor = 0.5, mode = 'bicubic')
         x = self.proj(x)
@@ -65,7 +67,7 @@ class DownBlock(nn.Module):
         for _ in range(num_res):
             blocks.append(ResBlock(ch_in))
         self.blocks = nn.ModuleList(blocks)
-    
+
     def forward(self, x):
         for block in self.blocks:
             x = block(x)
@@ -75,9 +77,9 @@ class DownBlock(nn.Module):
 class SpaceToChannel(nn.Module):
     def __init__(self, ch_in, ch_out):
         super().__init__()
-        
+
         self.proj = WeightNormConv2d(ch_in, ch_out // 4, 3, 1, 1)
-    
+
     def forward(self, x):
         x = self.proj(x)
         x = F.pixel_unshuffle(x, 2).contiguous()
@@ -90,15 +92,15 @@ class ChannelAverage(nn.Module):
         self.proj = WeightNormConv2d(ch_in, ch_out, 3, 1, 1)
         self.grps = ch_in // ch_out
         self.scale = (self.grps) ** 0.5
-    
+
     def forward(self, x):
-        res = x.clone()
+        res = x
         x = self.proj(x.contiguous()) # [b, ch_out, h, w]
 
         # Residual goes through channel avg
         res = res.view(res.shape[0], self.grps, res.shape[1] // self.grps, res.shape[2], res.shape[3]).contiguous()
         res = res.mean(dim=1) * self.scale # [b, ch_out, h, w]
-        
+
         return res + x
 
 # === Decoder ===
@@ -106,20 +108,22 @@ class ChannelAverage(nn.Module):
 class SquareToLandscape(nn.Module):
     def __init__(self, ch_in, ch_out):
         super().__init__()
-        
+
         self.proj = WeightNormConv2d(ch_in, ch_out, 3, 1, 1)
-    
+
     def forward(self, x):
         x = self.proj(x) # TODO This ordering is wrong for both
-        x = F.interpolate(x, (360, 640), mode = 'bicubic') 
+        x = F.interpolate(x, (360, 640), mode = 'bicubic')
         return x
 
 class Upsample(nn.Module):
     def __init__(self, ch_in, ch_out):
         super().__init__()
 
-        self.proj = WeightNormConv2d(ch_in, ch_out, 1, 1, 0, bias = False)
-    
+        self.proj = nn.Identity() if ch_in == ch_out else WeightNormConv2d(
+            ch_in, ch_out, 1, 1, 0, bias=False
+        )
+
     def forward(self, x):
         x = self.proj(x)
         x = F.interpolate(x, scale_factor = 2.0, mode = 'bicubic')
@@ -128,13 +132,13 @@ class Upsample(nn.Module):
 class UpBlock(nn.Module):
     def __init__(self, ch_in, ch_out, num_res=1):
         super().__init__()
-        
+
         self.up = Upsample(ch_in, ch_out)
         blocks = []
         for _ in range(num_res):
             blocks.append(ResBlock(ch_out))
         self.blocks = nn.ModuleList(blocks)
-    
+
     def forward(self, x):
         x = self.up(x)
         for block in self.blocks:
@@ -144,9 +148,9 @@ class UpBlock(nn.Module):
 class ChannelToSpace(nn.Module):
     def __init__(self, ch_in, ch_out):
         super().__init__()
-        
+
         self.proj = WeightNormConv2d(ch_in, ch_out * 4, 3, 1, 1)
-    
+
     def forward(self, x):
         x = self.proj(x)
         x = F.pixel_shuffle(x, 2).contiguous()
@@ -161,10 +165,14 @@ class ChannelDuplication(nn.Module):
         self.scale = (self.reps) ** -0.5
 
     def forward(self, x):
-        res = x.clone()
+        res = x
         x = self.proj(x.contiguous())
 
-        res = res.repeat_interleave(self.reps, dim = 1).contiguous() * self.scale
+        b, c, h, w = res.shape
+        res = res.unsqueeze(2)  # [b, c, 1, h, w]
+        res = res.expand(b, c, self.reps, h, w)  # [b, c, reps, h, w]
+        res = res.reshape(b, c * self.reps, h, w).contiguous()
+        res = res * self.scale
 
         return res + x
 
@@ -185,12 +193,17 @@ class Encoder(nn.Module):
 
             blocks.append(DownBlock(ch, next_ch, block_count))
             residuals.append(SpaceToChannel(ch, next_ch))
-            
+
             ch =  next_ch
-    
+
         self.blocks = nn.ModuleList(blocks)
         self.residuals = nn.ModuleList(residuals)
         self.conv_out = ChannelAverage(ch, config.latent_channels)
+
+        self.skip_logvar = bool(getattr(config, "skip_logvar", False))
+        if not self.skip_logvar:
+            # Checkpoint expects a 1-channel logvar head: [1, ch, 3, 3]
+            self.conv_out_logvar = WeightNormConv2d(ch, 1, 3, 1, 1)
 
     def forward(self, x):
         x = self.conv_in(x)
@@ -215,13 +228,13 @@ class Decoder(nn.Module):
             residuals.append(ChannelToSpace(next_ch, ch))
 
             ch = next_ch
-        
+
         self.blocks = nn.ModuleList(reversed(blocks))
         self.residuals = nn.ModuleList(reversed(residuals))
-        
+
         self.act_out = nn.SiLU()
         self.conv_out = SquareToLandscape(config.ch_0, config.channels)
-    
+
     def forward(self, x):
         x = self.conv_in(x)
         for block, residual in zip(self.blocks, self.residuals):
@@ -238,6 +251,6 @@ class AutoEncoder(nn.Module):
 
         self.encoder = Encoder(encoder_config)
         self.decoder = Decoder(decoder_config)
-    
+
     def forward(self, x):
         return self.decoder(self.encoder(x))
