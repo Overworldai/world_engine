@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 
 
-QUANTS = [None]  # TODO: enable specific quant based on model config, which should specify compatible quants
+QUANTS = [None]  # TODO: enable specific quant based on model config, which should specify compatible quants [None, "w8a8", "fp8"]
 
 
 try:
@@ -204,5 +204,7 @@ def quantize_model(model: nn.Module, quant: str):
     }[quant]
 
     for name, child in model.named_children():
-        setattr(model, name, new_linear(child)) if eligible(child) else quantize_model(child, quant)
+        setattr(model, name, new_linear(child)) if eligible(child) else quantize_model(
+            child, quant
+        )
     return model
