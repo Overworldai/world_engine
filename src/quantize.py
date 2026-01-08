@@ -141,6 +141,49 @@ class FP8W8A8Linear(nn.Module):
         return y.reshape(*s[:-1], self.out_features).to(x.dtype)
 
 
+class FP8Linear(nn.Module):
+    def __init__(self, lin: nn.Linear):
+        super().__init__()
+        self.in_features, self.out_features = lin.in_features, lin.out_features
+
+        self.bias = (
+            nn.Parameter(lin.bias.data.clone().to(torch.float8_e4m3fn))
+            if lin.bias is not None
+            else None
+        )
+        w_amax = lin.weight.data.clone().amax().float().squeeze()
+        w = lin.weight.data.clone().div(w_amax).to(torch.float8_e4m3fn)
+        self.register_buffer("w_amax", w_amax)
+        self.register_buffer("weightT", w.t())
+        self.dummy_scale = torch.ones((), device=lin.weight.device, dtype=torch.float32)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass using FP8 matmul.
+
+        Args:
+            x: Input tensor of shape [..., in_features] (flattens if > 2D)
+
+        Returns:
+            Output tensor of shape [..., out_features] in BF16 format, unflattened if input is > 2D
+        """
+
+        # Convert input to FP8 e4m3
+        x_fp8 = x.to(torch.float8_e4m3fn).reshape(-1, x.size(-1)).contiguous()
+
+        result = torch._scaled_mm(
+            x_fp8,
+            self.weightT,
+            bias=self.bias,
+            scale_a=self.dummy_scale,
+            scale_b=self.w_amax,
+            out_dtype=torch.bfloat16,
+            use_fast_accum=True,
+        )
+
+        return result.reshape(x.shape[:-1] + (-1,))
+
+
 def quantize_model(model: nn.Module, quant: str):
     if quant is None:
         return model
@@ -157,6 +200,7 @@ def quantize_model(model: nn.Module, quant: str):
     new_linear = {
         "w8a8": FP8W8A8Linear,
         "nvfp4": FP4Linear,
+        "fp8": FP8Linear,
     }[quant]
 
     for name, child in model.named_children():
