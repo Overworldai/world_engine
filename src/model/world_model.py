@@ -26,7 +26,7 @@ class PromptEncoder(nn.Module):
         self.tok = AutoTokenizer.from_pretrained(model_id)
         self.encoder = UMT5EncoderModel.from_pretrained(model_id, torch_dtype=dtype).eval()
 
-    @torch.compile(mode="max-autotune")
+    @torch.compile
     def encode(self, inputs):
         return self.encoder(**inputs).last_hidden_state
 

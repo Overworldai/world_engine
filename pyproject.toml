@@ -19,9 +19,6 @@ dependencies = [
   "huggingface-hub==0.36.0",
   "omegaconf",
   "accelerate==1.12.0",
-
-  # internal dependencies
-  "owl-vaes @ git+https://github.com/Wayfarer-Labs/owl-vaes.git@installable",
 ]
 
 [tool.setuptools]
