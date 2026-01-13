@@ -40,7 +40,10 @@ class InferenceAE:
         from safetensors.torch import load_file
         from .ae_nn import AutoEncoder
 
-        base = pathlib.Path(huggingface_hub.snapshot_download(model_uri))
+        try:
+            base = pathlib.Path(huggingface_hub.snapshot_download(model_uri))
+        except Exception:
+            base = pathlib.Path(model_uri)
 
         enc_cfg = OmegaConf.load(base / "encoder_conf.yml").model
         dec_cfg = OmegaConf.load(base / "decoder_conf.yml").model

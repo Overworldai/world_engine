@@ -36,6 +36,7 @@ class WorldEngine:
         """
         model_uri: HF URI or local folder containing model.safetensors and config.yaml
         quant: None | w8a8 | nvfp4
+        model_config_overrides: Dict to override model config values
         """
         self.device, self.dtype = device, dtype
 
@@ -49,7 +50,8 @@ class WorldEngine:
 
         self.prompt_encoder = None
         if self.model_cfg.prompt_conditioning is not None:
-            self.prompt_encoder = PromptEncoder("google/umt5-xl", dtype=dtype).to(device).eval()  # TODO: dont hardcode
+            pe_uri = getattr(self.model_cfg, "prompt_encoder_uri", "google/umt5-xl")
+            self.prompt_encoder = PromptEncoder(pe_uri, dtype=dtype).to(device).eval()
 
         self.model = WorldModel.from_pretrained(model_uri, cfg=self.model_cfg).to(device=device, dtype=dtype).eval()
         apply_inference_patches(self.model)
