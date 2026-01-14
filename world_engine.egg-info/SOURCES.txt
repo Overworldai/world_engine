@@ -3,6 +3,7 @@ README.md
 pyproject.toml
 src/__init__.py
 src/ae.py
+src/ae_nn.py
 src/patch_model.py
 src/quantize.py
 src/world_engine.py

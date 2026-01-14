@@ -68,7 +68,7 @@ import uvicorn
 # Configuration
 # ============================================================================
 
-MODEL_URI = "OpenWorldLabs/Medium-0-NoCaption-SF-Shift8"
+MODEL_URI = "OverWorld/Waypoint-Medium-Beta-2026-01-11"
 QUANT = "w8a8"
 N_FRAMES = 4096
 DEVICE = "cuda"
