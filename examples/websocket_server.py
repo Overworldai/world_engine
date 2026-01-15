@@ -14,6 +14,7 @@ import json
 import logging
 import time
 import urllib.request
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 logging.basicConfig(
@@ -36,26 +37,48 @@ import uvicorn
 # Configuration
 # ============================================================================
 
-MODEL_URI = "OpenWorldLabs/Medium-0-NoCaption-SF-Shift8"
+MODEL_URI = "OverWorld/Waypoint-Medium-Beta-2026-01-11"
 QUANT = "w8a8"
 N_FRAMES = 4096
 DEVICE = "cuda"
 JPEG_QUALITY = 85
 
-BUTTON_CODES = {
-    "W": ord("W"),
-    "A": ord("A"),
-    "S": ord("S"),
-    "D": ord("D"),
-    "R": ord("R"),
-    "SPACE": ord(" "),
-    "SHIFT": 0x10,
-    "MOUSE_LEFT": 0x01,
-    "MOUSE_RIGHT": 0x02,
-    "MOUSE_MIDDLE": 0x04,
-}
+BUTTON_CODES = {}
+# A-Z keys
+for i in range(65, 91):
+    BUTTON_CODES[chr(i)] = i
+# 0-9 keys
+for i in range(10):
+    BUTTON_CODES[str(i)] = ord(str(i))
+# Special keys
+BUTTON_CODES["UP"] = 0x26
+BUTTON_CODES["DOWN"] = 0x28
+BUTTON_CODES["LEFT"] = 0x25
+BUTTON_CODES["RIGHT"] = 0x27
+BUTTON_CODES["SHIFT"] = 0x10
+BUTTON_CODES["CTRL"] = 0x11
+BUTTON_CODES["SPACE"] = 0x20
+BUTTON_CODES["TAB"] = 0x09
+BUTTON_CODES["ENTER"] = 0x0D
+BUTTON_CODES["MOUSE_LEFT"] = 0x01
+BUTTON_CODES["MOUSE_RIGHT"] = 0x02
+BUTTON_CODES["MOUSE_MIDDLE"] = 0x04
+
 
 SEED_URL = "https://gist.github.com/user-attachments/assets/5d91c49a-2ae9-418f-99c0-e93ae387e1de"
+
+# Default prompt - describes the expected visual style
+DEFAULT_PROMPT = """
+First-person shooter gameplay footage from a true POV perspective, 
+the camera locked to the player's eyes as assault rifles, carbines, 
+machine guns, laser-sighted firearms, bullet-fed weapons, magazines, 
+barrels, muzzles, tracers, ammo, and launchers dominate the frame, 
+with constant gun handling, recoil, muzzle flash, shell ejection, 
+and ballistic impacts. Continuous real-time FPS motion with no cuts, 
+weapon-centric framing, realistic gun physics, authentic firearm 
+materials, high-caliber ammunition, laser optics, iron sights, and 
+relentless gun-driven action, rendered in ultra-realistic 4K at 60fps.
+"""
 
 # ============================================================================
 # Engine Setup
@@ -63,7 +86,8 @@ SEED_URL = "https://gist.github.com/user-attachments/assets/5d91c49a-2ae9-418f-9
 
 engine = None
 seed_frame = None
-
+CtrlInput = None
+current_prompt = DEFAULT_PROMPT
 
 def load_seed_frame(target_size: tuple[int, int] = (360, 640)) -> torch.Tensor:
     """Load and preprocess the seed frame."""
@@ -77,6 +101,19 @@ def load_seed_frame(target_size: tuple[int, int] = (360, 640)) -> torch.Tensor:
     logger.info(f"Seed frame ready: {result.shape}, {result.dtype}, {result.device}")
     return result
 
+def load_seed_from_url(url, target_size=(360, 640)):
+    """Load a seed frame from URL (used for prompt_with_seed)"""
+    try:
+        with urllib.request.urlopen(url, timeout=10) as response:
+            img_data = response.read()
+        img = Image.open(io.BytesIO(img_data)).convert("RGB")
+        import numpy as np
+        img_tensor = torch.from_numpy(np.array(img)).permute(2, 0, 1).unsqueeze(0).float()
+        frame = F.interpolate(img_tensor, size=target_size, mode="bilinear", align_corners=False)[0]
+        return frame.to(dtype=torch.uint8, device=DEVICE).permute(1, 2, 0).contiguous()
+    except Exception as e:
+        print(f"[ERROR] Failed to load seed from URL: {e}")
+        return None
 
 def load_engine():
     """Initialize the WorldEngine and seed frame."""
@@ -94,6 +131,34 @@ def load_engine():
     seed_frame = load_seed_frame()
     logger.info("All initialization complete")
 
+def load_engine():
+    """Initialize the WorldEngine with configured model."""
+    global engine, seed_frame, CtrlInput
+    from world_engine import WorldEngine, CtrlInput as CI
+    CtrlInput = CI
+
+    logger.info(f"Loading WorldEngine: {MODEL_URI}")
+    logger.info(f"N_FRAMES: {N_FRAMES}")
+    logger.info(f"Default prompt: {DEFAULT_PROMPT[:80]}...")
+
+    # Model config overrides
+    # scheduler_sigmas: diffusion denoising schedule (MUST end with 0.0)
+    # ae_uri: VAE model for encoding/decoding frames
+    engine = WorldEngine(
+        MODEL_URI,
+        device=DEVICE,
+        model_config_overrides={
+            "n_frames": N_FRAMES,
+            "ae_uri": "OpenWorldLabs/owl_vae_f16_c16_distill_v0_nogan",
+            "scheduler_sigmas": [1.0, 0.8, 0.2, 0.0],
+        },
+        quant=QUANT,
+        dtype=torch.bfloat16,
+    )
+    logger.info("WorldEngine loaded")
+
+    seed_frame = load_seed_frame()
+    logger.info("All initialization complete")
 
 # ============================================================================
 # Frame Encoding
@@ -124,12 +189,15 @@ class Session:
 # FastAPI Application
 # ============================================================================
 
-app = FastAPI(title="WorldEngine WebSocket Server")
-
-
-@app.on_event("startup")
-async def startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan event handler for startup and shutdown."""
+    # Startup
     load_engine()
+    yield
+    # Shutdown (if needed in the future)
+
+app = FastAPI(title="WorldEngine WebSocket Server", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -149,7 +217,6 @@ class Status:
     READY = "ready"        # Ready for game loop
     RESET = "reset"        # Session reset
 
-
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """
@@ -167,8 +234,6 @@ async def websocket_endpoint(websocket: WebSocket):
 
     Status codes: init, loading, ready, reset
     """
-    from world_engine import CtrlInput
-
     client_host = websocket.client.host if websocket.client else "unknown"
     logger.info(f"Client connected: {client_host}")
 
@@ -177,6 +242,14 @@ async def websocket_endpoint(websocket: WebSocket):
 
     async def send_json(data: dict):
         await websocket.send_text(json.dumps(data))
+
+    async def reset_engine():
+        await asyncio.to_thread(engine.reset)
+        await asyncio.to_thread(engine.append_frame, seed_frame)
+        await asyncio.to_thread(engine.set_prompt, current_prompt)
+        session.frame_count = 0
+        await send_json({"type": "status", "code": Status.RESET})
+        logger.info(f"[{client_host}] Engine Reset")
 
     try:
         await send_json({"type": "status", "code": Status.INIT})
@@ -201,7 +274,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
         await send_json({"type": "status", "code": Status.READY})
         logger.info(f"[{client_host}] Ready for game loop")
-
+        paused = False
         while True:
             try:
                 raw = await asyncio.wait_for(websocket.receive_text(), timeout=0.5)
@@ -214,49 +287,75 @@ async def websocket_endpoint(websocket: WebSocket):
 
             msg_type = msg.get("type", "control")
 
-            if msg_type == "reset":
-                logger.info(f"[{client_host}] Reset requested")
-                await asyncio.to_thread(engine.reset)
-                await asyncio.to_thread(engine.append_frame, seed_frame)
-                session.frame_count = 0
-                await send_json({"type": "status", "code": Status.RESET})
-                continue
+            match msg_type:
+                case "reset":
+                    logger.info(f"[{client_host}] Reset requested")
+                    reset_engine()
+                    continue
+                case "pause":
+                    # don't really have to do anything special for pausing
+                    paused = True
+                    logger.info("[RECV] Paused")
+                case "resume":
+                    # don't really have to do anything special for resuming
+                    paused = False
+                    logger.info("[RECV] Resumed")
+                case "prompt":
+                    new_prompt = msg.get("prompt", "").strip()
+                    logger.info(f"[RECV] Prompt received: '{new_prompt[:50]}...'")
+                    try:
+                        current_prompt = new_prompt if new_prompt else DEFAULT_PROMPT
+                        reset_engine()
+                    except Exception as e:
+                        logger.info(f"[GEN] Failed to set prompt: {e}")
+                case "prompt_with_seed":
+                    new_prompt = msg.get("prompt", "").strip()
+                    seed_url = msg.get("seed_url")
+                    logger.info(f"[RECV] Prompt with seed: '{new_prompt}', URL: {seed_url}")
+                    try:
+                        if seed_url:
+                            url_frame = load_seed_from_url(seed_url)
+                            if url_frame is not None:
+                                seed_frame = url_frame
+                                logger.info("[RECV] Seed frame loaded from URL")
+                        current_prompt = new_prompt if new_prompt else DEFAULT_PROMPT
+                        logger.info("[RECV] Seed frame prompt loaded from URL, resetting engine")
+                        reset_engine()
+                    except Exception as e:
+                        logger.info(f"[GEN] Failed to set prompt: {e}")
+                case "control":
+                    if paused: continue
+                    buttons = {BUTTON_CODES[b.upper()] for b in msg.get("buttons", []) if b.upper() in BUTTON_CODES}
+                    mouse_dx = float(msg.get("mouse_dx", 0))
+                    mouse_dy = float(msg.get("mouse_dy", 0))
+                    client_ts = msg.get("ts", 0)
 
-            if msg_type == "control":
-                buttons = {BUTTON_CODES[b.upper()] for b in msg.get("buttons", []) if b.upper() in BUTTON_CODES}
-                mouse_dx = float(msg.get("mouse_dx", 0))
-                mouse_dy = float(msg.get("mouse_dy", 0))
-                client_ts = msg.get("ts", 0)
+                    if session.frame_count >= session.max_frames:
+                        logger.info(f"[{client_host}] Auto-reset at frame limit")
+                        reset_engine()
 
-                if session.frame_count >= session.max_frames:
-                    logger.info(f"[{client_host}] Auto-reset at frame limit")
-                    await asyncio.to_thread(engine.reset)
-                    await asyncio.to_thread(engine.append_frame, seed_frame)
-                    session.frame_count = 0
-                    await send_json({"type": "status", "code": Status.RESET})
+                    ctrl = CtrlInput(button=buttons, mouse=(mouse_dx, mouse_dy))
 
-                ctrl = CtrlInput(button=buttons, mouse=(mouse_dx, mouse_dy))
+                    t0 = time.perf_counter()
+                    frame = await asyncio.to_thread(engine.gen_frame, ctrl=ctrl)
+                    gen_time = (time.perf_counter() - t0) * 1000
 
-                t0 = time.perf_counter()
-                frame = await asyncio.to_thread(engine.gen_frame, ctrl=ctrl)
-                gen_time = (time.perf_counter() - t0) * 1000
+                    session.frame_count += 1
 
-                session.frame_count += 1
+                    # Encode and send frame with timing info
+                    jpeg = await asyncio.to_thread(frame_to_jpeg, frame)
+                    await send_json({
+                        "type": "frame",
+                        "data": base64.b64encode(jpeg).decode("ascii"),
+                        "frame_id": session.frame_count,
+                        "client_ts": client_ts,
+                        "gen_ms": gen_time,
+                    })
 
-                # Encode and send frame with timing info
-                jpeg = await asyncio.to_thread(frame_to_jpeg, frame)
-                await send_json({
-                    "type": "frame",
-                    "data": base64.b64encode(jpeg).decode("ascii"),
-                    "frame_id": session.frame_count,
-                    "client_ts": client_ts,
-                    "gen_ms": gen_time,
-                })
-
-                # Logging
-                logger.info(f"[{client_host}] Received control (buttons={buttons}, mouse=({mouse_dx},{mouse_dy})) -> Sent frame {session.frame_count} (gen={gen_time:.1f}ms)")
-                if session.frame_count % 60 == 0:
-                    logger.info(f"[{client_host}] Frame {session.frame_count} (gen={gen_time:.1f}ms)")
+                    # Logging
+                    logger.info(f"[{client_host}] Received control (buttons={buttons}, mouse=({mouse_dx},{mouse_dy})) -> Sent frame {session.frame_count} (gen={gen_time:.1f}ms)")
+                    if session.frame_count % 60 == 0:
+                        logger.info(f"[{client_host}] Frame {session.frame_count} (gen={gen_time:.1f}ms)")
 
     except Exception as e:
         logger.error(f"[{client_host}] Error: {e}", exc_info=True)
