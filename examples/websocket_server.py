@@ -65,7 +65,8 @@ BUTTON_CODES["MOUSE_RIGHT"] = 0x02
 BUTTON_CODES["MOUSE_MIDDLE"] = 0x04
 
 
-SEED_URL = "https://gist.github.com/user-attachments/assets/5d91c49a-2ae9-418f-99c0-e93ae387e1de"
+# SEED_URL = "https://gist.github.com/user-attachments/assets/5d91c49a-2ae9-418f-99c0-e93ae387e1de"
+SEED_URL = "https://images.gamebanana.com/img/ss/mods/5aaaf43065f65.jpg"
 
 # Default prompt - describes the expected visual style
 DEFAULT_PROMPT = """
@@ -88,6 +89,7 @@ engine = None
 seed_frame = None
 CtrlInput = None
 current_prompt = DEFAULT_PROMPT
+engine_warmed_up = False
 
 def load_seed_frame(target_size: tuple[int, int] = (360, 640)) -> torch.Tensor:
     """Load and preprocess the seed frame."""
@@ -114,22 +116,6 @@ def load_seed_from_url(url, target_size=(360, 640)):
     except Exception as e:
         print(f"[ERROR] Failed to load seed from URL: {e}")
         return None
-
-def load_engine():
-    """Initialize the WorldEngine and seed frame."""
-    global engine, seed_frame
-    from world_engine import WorldEngine
-
-    logger.info(f"Loading WorldEngine: {MODEL_URI} (quant={QUANT})")
-    engine = WorldEngine(
-        MODEL_URI,
-        device=DEVICE,
-        model_config_overrides={"n_frames": N_FRAMES, "ae_uri": "OpenWorldLabs/owl_vae_f16_c16_distill_v0_nogan"},
-        quant=QUANT,
-    )
-    logger.info("WorldEngine loaded")
-    seed_frame = load_seed_frame()
-    logger.info("All initialization complete")
 
 def load_engine():
     """Initialize the WorldEngine with configured model."""
@@ -234,6 +220,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
     Status codes: init, loading, ready, reset
     """
+    global seed_frame, current_prompt, engine_warmed_up
     client_host = websocket.client.host if websocket.client else "unknown"
     logger.info(f"Client connected: {client_host}")
 
@@ -242,6 +229,23 @@ async def websocket_endpoint(websocket: WebSocket):
 
     async def send_json(data: dict):
         await websocket.send_text(json.dumps(data))
+
+    # Warmup on first connection (CUDA graphs will complain if its not all called in the same thread context)
+    if not engine_warmed_up:
+        logger.info("First connection - warming up model...")
+        await send_json({"type": "status", "code": "warmup"})
+
+        def do_warmup():
+            warmup_start = time.perf_counter()
+            engine.reset()
+            engine.append_frame(seed_frame)
+            engine.set_prompt(current_prompt)
+            _ = engine.gen_frame(ctrl=CtrlInput(button=set(), mouse=(0.0, 0.0)))
+            return time.perf_counter() - warmup_start
+
+        warmup_time = await asyncio.to_thread(do_warmup)
+        logger.info(f"Warmup complete ({warmup_time:.2f}s)")
+        engine_warmed_up = True
 
     async def reset_engine():
         await asyncio.to_thread(engine.reset)
@@ -275,12 +279,41 @@ async def websocket_endpoint(websocket: WebSocket):
         await send_json({"type": "status", "code": Status.READY})
         logger.info(f"[{client_host}] Ready for game loop")
         paused = False
+
+        # Helper to drain all pending messages and return only the latest control input
+        async def get_latest_control():
+            """Drain the message queue and return only the most recent control input."""
+            latest_control_msg = None
+            skipped_count = 0
+
+            while True:
+                try:
+                    raw = await asyncio.wait_for(websocket.receive_text(), timeout=0.001)
+                    msg = json.loads(raw)
+
+                    # Handle non-control messages immediately
+                    msg_type = msg.get("type", "control")
+                    if msg_type != "control":
+                        return msg  # Return special messages immediately
+
+                    # For control messages, keep only the latest
+                    if latest_control_msg is not None:
+                        skipped_count += 1
+                    latest_control_msg = msg
+
+                except asyncio.TimeoutError:
+                    # No more messages in queue
+                    # if skipped_count > 0:
+                    #     logger.info(f"[{client_host}] Skipped {skipped_count} queued inputs, using latest")
+                    return latest_control_msg
+                except WebSocketDisconnect:
+                    raise
+
         while True:
             try:
-                raw = await asyncio.wait_for(websocket.receive_text(), timeout=0.5)
-                msg = json.loads(raw)
-            except asyncio.TimeoutError:
-                continue
+                msg = await get_latest_control()
+                if msg is None:
+                    continue
             except WebSocketDisconnect:
                 logger.info(f"[{client_host}] Client disconnected")
                 break
@@ -290,7 +323,7 @@ async def websocket_endpoint(websocket: WebSocket):
             match msg_type:
                 case "reset":
                     logger.info(f"[{client_host}] Reset requested")
-                    reset_engine()
+                    await reset_engine()
                     continue
                 case "pause":
                     # don't really have to do anything special for pausing
@@ -305,7 +338,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     logger.info(f"[RECV] Prompt received: '{new_prompt[:50]}...'")
                     try:
                         current_prompt = new_prompt if new_prompt else DEFAULT_PROMPT
-                        reset_engine()
+                        await reset_engine()
                     except Exception as e:
                         logger.info(f"[GEN] Failed to set prompt: {e}")
                 case "prompt_with_seed":
@@ -320,7 +353,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 logger.info("[RECV] Seed frame loaded from URL")
                         current_prompt = new_prompt if new_prompt else DEFAULT_PROMPT
                         logger.info("[RECV] Seed frame prompt loaded from URL, resetting engine")
-                        reset_engine()
+                        await reset_engine()
                     except Exception as e:
                         logger.info(f"[GEN] Failed to set prompt: {e}")
                 case "control":
@@ -332,7 +365,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
                     if session.frame_count >= session.max_frames:
                         logger.info(f"[{client_host}] Auto-reset at frame limit")
-                        reset_engine()
+                        await reset_engine()
 
                     ctrl = CtrlInput(button=buttons, mouse=(mouse_dx, mouse_dy))
 
