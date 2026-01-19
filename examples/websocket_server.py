@@ -37,7 +37,7 @@ import uvicorn
 # Configuration
 # ============================================================================
 
-MODEL_URI = "OverWorld/Waypoint-Medium-Beta-2026-01-11"
+MODEL_URI = "OverWorld/Waypoint-Medium-Beta-2026-01-16"
 QUANT = "w8a8"
 N_FRAMES = 4096
 DEVICE = "cuda"
@@ -69,17 +69,16 @@ BUTTON_CODES["MOUSE_MIDDLE"] = 0x04
 SEED_URL = "https://images.gamebanana.com/img/ss/mods/5aaaf43065f65.jpg"
 
 # Default prompt - describes the expected visual style
-DEFAULT_PROMPT = """
-First-person shooter gameplay footage from a true POV perspective, 
-the camera locked to the player's eyes as assault rifles, carbines, 
-machine guns, laser-sighted firearms, bullet-fed weapons, magazines, 
-barrels, muzzles, tracers, ammo, and launchers dominate the frame, 
-with constant gun handling, recoil, muzzle flash, shell ejection, 
-and ballistic impacts. Continuous real-time FPS motion with no cuts, 
-weapon-centric framing, realistic gun physics, authentic firearm 
-materials, high-caliber ammunition, laser optics, iron sights, and 
-relentless gun-driven action, rendered in ultra-realistic 4K at 60fps.
-"""
+DEFAULT_PROMPT = "First-person shooter gameplay footage from a true POV perspective, "
+"the camera locked to the player's eyes as assault rifles, carbines, "
+"machine guns, laser-sighted firearms, bullet-fed weapons, magazines, "
+"barrels, muzzles, tracers, ammo, and launchers dominate the frame, "
+"with constant gun handling, recoil, muzzle flash, shell ejection, "
+"and ballistic impacts. Continuous real-time FPS motion with no cuts, "
+"weapon-centric framing, realistic gun physics, authentic firearm "
+"materials, high-caliber ammunition, laser optics, iron sights, and "
+"relentless gun-driven action, rendered in ultra-realistic 4K at 60fps."
+
 
 # ============================================================================
 # Engine Setup
@@ -386,9 +385,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     })
 
                     # Logging
-                    logger.info(f"[{client_host}] Received control (buttons={buttons}, mouse=({mouse_dx},{mouse_dy})) -> Sent frame {session.frame_count} (gen={gen_time:.1f}ms)")
                     if session.frame_count % 60 == 0:
-                        logger.info(f"[{client_host}] Frame {session.frame_count} (gen={gen_time:.1f}ms)")
+                        logger.info(f"[{client_host}] Received control (buttons={buttons}, mouse=({mouse_dx},{mouse_dy})) -> Sent frame {session.frame_count} (gen={gen_time:.1f}ms)")
 
     except Exception as e:
         logger.error(f"[{client_host}] Error: {e}", exc_info=True)
