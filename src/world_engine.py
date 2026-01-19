@@ -21,6 +21,7 @@ torch._dynamo.config.capture_scalar_outputs = True
 class CtrlInput:
     button: Set[int] = field(default_factory=set)  # pressed button IDs
     mouse: Tuple[float, float] = (0.0, 0.0)  # (x, y) velocity
+    scroll_wheel: int = 0  # bwd, stationary, or fwd -> (-1, 0, 1)
 
 
 class WorldEngine:
@@ -70,6 +71,7 @@ class WorldEngine:
         self._ctx = {
             "button": torch.zeros((1, 1, self.model_cfg.n_buttons), device=device, dtype=dtype),
             "mouse": torch.zeros((1, 1, 2), device=device, dtype=dtype),
+            "scroll": torch.zeros((1, 1, 1), device=device, dtype=dtype),
             "frame_timestamp": torch.empty((1, 1), device=device, dtype=torch.long),
         }
 
@@ -114,6 +116,7 @@ class WorldEngine:
 
         self._ctx["mouse"][0, 0, 0] = ctrl.mouse[0]
         self._ctx["mouse"][0, 0, 1] = ctrl.mouse[1]
+        self._ctx["scroll"][0, 0, 0] = ctrl.scroll_wheel
 
         self._ctx["frame_timestamp"].copy_(self.frame_ts)
         self.frame_ts.add_(1)
@@ -123,6 +126,7 @@ class WorldEngine:
     def prep_inputs(self, x, ctrl=None):
         ctrl = ctrl if ctrl is not None else CtrlInput()
         ctrl.mouse = torch.tensor(ctrl.mouse)
+        ctrl.scroll_wheel = torch.sign(torch.tensor(ctrl.scroll_wheel))
         ctx = self._prep_inputs(x, ctrl)
 
         # prepare prompt conditioning
