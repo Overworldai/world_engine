@@ -1,1 +1,13 @@
 scratch/
+
+# Sphinx documentation
+docs/build/
+docs/_build/
+
+# Symlink for local dev (don't push)
+/world_engine
+
+# Python
+*.pyc
+__pycache__/
+*.egg-info/

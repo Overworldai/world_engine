@@ -1,0 +1,92 @@
+# Configuration file for the Sphinx documentation builder.
+#
+# For the full list of built-in configuration values, see the documentation:
+# https://www.sphinx-doc.org/en/master/usage/configuration.html
+
+import os
+import sys
+# Add parent directory to path so we can import world_engine package
+sys.path.insert(0, os.path.abspath('../..'))
+
+# -- Project information -----------------------------------------------------
+# https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
+
+project = 'World Engine'
+copyright = '2026, World Engine Team'
+author = 'World Engine Team'
+
+version = '0.0.3'
+release = '0.0.3'
+
+# -- General configuration ---------------------------------------------------
+# https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
+
+extensions = [
+    'sphinx.ext.autodoc',
+    'sphinx.ext.viewcode',
+    'sphinx.ext.napoleon',
+    'sphinx_autodoc_typehints',
+]
+
+templates_path = ['_templates']
+exclude_patterns = []
+
+language = 'en'
+
+# -- Autodoc configuration ---------------------------------------------------
+# Mock heavy dependencies to avoid needing to install them for building docs
+autodoc_mock_imports = [
+    'torch',
+    'torchvision',
+    'torchaudio',
+    'transformers',
+    'diffusers',
+    'accelerate',
+    'tensordict',
+    'safetensors',
+]
+
+# Autodoc settings
+autodoc_default_options = {
+    'members': True,
+    'member-order': 'bysource',
+    'special-members': '__init__',
+    'undoc-members': True,
+    'exclude-members': '__weakref__'
+}
+
+# -- Options for HTML output -------------------------------------------------
+# https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output
+
+html_theme = 'sphinx_rtd_theme'
+html_static_path = ['_static']
+
+# RTD theme options for dark mode
+html_theme_options = {
+    'style_nav_header_background': '#000000',  # Black header
+    'navigation_depth': 4,
+    'collapse_navigation': False,
+    'sticky_navigation': True,
+    'includehidden': True,
+    'titles_only': False,
+    'display_version': True,
+    'prev_next_buttons_location': 'bottom',
+    'vcs_pageview_mode': '',
+}
+
+# Add GitHub link
+html_context = {
+    'display_github': True,
+    'github_user': 'Overworldai',
+    'github_repo': 'world_engine',
+    'github_version': 'main',
+    'conf_py_path': '/docs/source/',
+}
+
+# Logo configuration (update path when you add the logo)
+# html_logo = '_static/logo.png'
+
+# Custom CSS for dark theme
+html_css_files = [
+    'custom.css',
+]

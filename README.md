@@ -4,6 +4,10 @@
 
 <img src="./assets/diagram.svg" alt="Diagram" width="500" />
 
+[![Documentation Status](https://readthedocs.com/projects/overworld-world-engine/badge/?version=latest)](https://overworld-world-engine.readthedocs-hosted.com/en/latest/index.html)
+
+**[📖 Documentation](https://overworld-world-engine.readthedocs-hosted.com/en/latest/index.html)**
+
 </div>
 
 
@@ -24,7 +28,7 @@ Not a full client:
 - No reading controller/keyboard/mouse input
 - No FAL or other external integrations
 
-Reference client can be found in the [LocalWorld repo](https://github.com/Wayfarer-Labs/local_world)
+Reference client can be found in the [LocalWorld repo](https://github.com/Overworldai/local_world)
 
 Out-of-scope pieces can go in `examples/`, which is **not** part of the `world_engine.*` package.
 
@@ -44,7 +48,7 @@ pip install \
   --extra-index-url https://download.pytorch.org/whl/nightly/cu128 \
   --extra-index-url https://pypi.org/simple \
   --upgrade --ignore-installed \
-  "world_engine @ git+https://github.com/Wayfarer-Labs/world_engine.git"
+  "world_engine @ git+https://github.com/Overworldai/world_engine.git"
 ```
 
 ```
@@ -57,7 +61,7 @@ export HF_TOKEN=<your access token>
 from world_engine import WorldEngine, CtrlInput
 
 # Create inference engine
-engine = WorldEngine("OpenWorldLabs/CoDCtl-Causal-SelfForcing-UniformSigma", device="cuda")
+engine = WorldEngine("Overworld/Waypoint-1-Small", device="cuda")
 
 # Specify a prompt
 engine.set_prompt("A fun game")
@@ -90,7 +94,7 @@ class CtrlInput:
     mouse: Tuple[float, float] = (0.0, 0.0)  # (x, y) position
 ```
 
-- `button` keycodes are defined by [Owl-Control](https://github.com/Wayfarer-Labs/owl-control/blob/main/src/system/keycode.rs)
+- `button` keycodes are defined by [Owl-Control](https://github.com/Overworldai/owl-control/blob/main/src/system/keycode.rs)
 - `mouse` is the raw mouse velocity vector
 
 ## Usage
@@ -100,7 +104,7 @@ from world_engine import WorldEngine, CtrlInput
 
 Load model to GPU
 ```
-engine = WorldEngine("OpenWorldLabs/CoDCtl-Causal-SelfForcing-UniformSigma", device="cuda")
+engine = WorldEngine("Overworld/Waypoint-1-Small", device="cuda")
 ```
 
 Specify a prompt which will be used until this function is called again
