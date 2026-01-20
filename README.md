@@ -4,6 +4,10 @@
 
 <img src="./assets/diagram.svg" alt="Diagram" width="500" />
 
+[![Documentation Status](https://readthedocs.com/projects/overworld-world-engine/badge/?version=latest)](https://overworld-world-engine.readthedocs-hosted.com/en/latest/index.html)
+
+**[📖 Documentation](https://overworld-world-engine.readthedocs-hosted.com/en/latest/index.html)**
+
 </div>
 
 
