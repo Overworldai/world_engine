@@ -99,7 +99,7 @@ class ControllerInputEmbedding(nn.Module):
         )
 
     def forward(self, mouse: Tensor, button: Tensor, scroll: Tensor):
-        x = torch.cat((mouse, button, scroll), dim=-1)
+        x = torch.cat((mouse, button), dim=-1)
         return self.mlp(x)
 
 
