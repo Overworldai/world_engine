@@ -68,7 +68,19 @@ html_theme_options = {
     'collapse_navigation': False,
     'sticky_navigation': True,
     'includehidden': True,
-    'titles_only': False
+    'titles_only': False,
+    'display_version': True,
+    'prev_next_buttons_location': 'bottom',
+    'vcs_pageview_mode': '',
+}
+
+# Add GitHub link
+html_context = {
+    'display_github': True,
+    'github_user': 'Overworldai',
+    'github_repo': 'world_engine',
+    'github_version': 'main',
+    'conf_py_path': '/docs/source/',
 }
 
 # Logo configuration (update path when you add the logo)
