@@ -1,0 +1,315 @@
+/* Dark theme customization for World Engine docs */
+
+/* Main wrapper and body */
+body {
+    background: #1a1a1a !important;
+}
+
+.wy-nav-content-wrap {
+    background: #1a1a1a !important;
+}
+
+/* Main content area - dark background */
+.wy-nav-content {
+    background: #1a1a1a !important;
+    color: #e0e0e0 !important;
+    max-width: 100% !important;
+}
+
+.document {
+    background: #1a1a1a !important;
+}
+
+/* Sidebar - darker background */
+.wy-side-nav-search {
+    background: #000000 !important;
+}
+
+.wy-nav-side {
+    background: #0d0d0d;
+}
+
+/* Navigation items */
+.wy-menu-vertical a {
+    color: #b0b0b0;
+}
+
+.wy-menu-vertical a:hover {
+    background-color: #2a2a2a;
+    color: #ffffff;
+}
+
+.wy-menu-vertical li.current a {
+    color: #ffffff;
+    border-right: solid 1px #3a3a3a;
+}
+
+.wy-menu-vertical li.current {
+    background: #1a1a1a;
+}
+
+/* Top bar */
+.wy-nav-top {
+    background: #000000;
+}
+
+/* Text colors */
+.rst-content {
+    color: #e0e0e0 !important;
+}
+
+.rst-content p,
+.rst-content li,
+.rst-content td,
+.rst-content th,
+.rst-content dd,
+.rst-content dt {
+    color: #e0e0e0 !important;
+}
+
+h1, h2, h3, h4, h5, h6 {
+    color: #ffffff !important;
+}
+
+/* Remove white backgrounds from sections */
+.rst-content .section,
+.rst-content div,
+.rst-content blockquote {
+    background: transparent !important;
+}
+
+/* Links */
+a {
+    color: #6b9bd1;
+}
+
+a:hover {
+    color: #8fb3e0;
+}
+
+/* Code blocks */
+.rst-content pre.literal-block,
+.rst-content div[class^='highlight'],
+.rst-content div.highlight,
+.highlight {
+    background: #0d0d0d !important;
+    border: 1px solid #2a2a2a !important;
+}
+
+.rst-content pre,
+pre {
+    background: #0d0d0d !important;
+    color: #e0e0e0 !important;
+}
+
+.rst-content code.literal,
+.rst-content tt.literal,
+code,
+tt {
+    background: #0d0d0d !important;
+    border: 1px solid #2a2a2a !important;
+    color: #88c0d0 !important;
+}
+
+.rst-content code.xref,
+a code {
+    background: #0d0d0d !important;
+    color: #6b9bd1 !important;
+}
+
+/* Tables */
+.rst-content table.docutils {
+    border: 1px solid #2a2a2a !important;
+    background: #1a1a1a !important;
+}
+
+.rst-content table.docutils thead {
+    background: #0d0d0d !important;
+}
+
+.rst-content table.docutils thead th {
+    background: #0d0d0d !important;
+    color: #ffffff !important;
+    border-color: #2a2a2a !important;
+}
+
+.rst-content table.docutils tbody tr {
+    background: #1a1a1a !important;
+}
+
+.rst-content table.docutils tbody tr:nth-child(2n) {
+    background: #0d0d0d !important;
+}
+
+.rst-content table.docutils td {
+    background: transparent !important;
+    color: #e0e0e0 !important;
+    border-color: #2a2a2a !important;
+}
+
+/* Admonitions */
+.rst-content .note,
+.rst-content .warning,
+.rst-content .admonition {
+    background: #0d0d0d;
+    border-left: 3px solid #6b9bd1;
+}
+
+.rst-content .note .admonition-title,
+.rst-content .warning .admonition-title {
+    background: #1a1a1a;
+    color: #ffffff;
+}
+
+/* Search box */
+.wy-side-nav-search input[type=text] {
+    background-color: #1a1a1a;
+    border-color: #2a2a2a;
+    color: #e0e0e0;
+}
+
+/* Breadcrumbs */
+.wy-breadcrumbs {
+    color: #b0b0b0;
+}
+
+/* Footer */
+footer {
+    color: #808080;
+}
+
+footer span.commit code {
+    background: #0d0d0d;
+    border: 1px solid #2a2a2a;
+}
+
+/* Logo area styling */
+.wy-side-nav-search > a img.logo {
+    max-width: 100%;
+    height: auto;
+    margin: 0 auto;
+    display: block;
+    background: transparent;
+}
+
+/* API documentation specific */
+.rst-content dl:not(.docutils) dt {
+    background: #0d0d0d !important;
+    border-top: solid 3px #2a2a2a !important;
+    color: #6b9bd1 !important;
+}
+
+.rst-content dl:not(.docutils) dl dt {
+    background: #1a1a1a !important;
+    border: none !important;
+    color: #b0b0b0 !important;
+}
+
+.rst-content dl:not(.docutils) dd {
+    background: #1a1a1a !important;
+}
+
+/* Field lists (common in API docs) */
+.rst-content .field-list,
+.rst-content .field-list dt,
+.rst-content .field-list dd {
+    background: transparent !important;
+    color: #e0e0e0 !important;
+}
+
+/* Definition lists */
+.rst-content dl dt {
+    background: #0d0d0d !important;
+    color: #e0e0e0 !important;
+}
+
+.rst-content dl dd {
+    background: transparent !important;
+}
+
+/* Remove any remaining white backgrounds */
+.rst-content .class,
+.rst-content .function,
+.rst-content .method,
+.rst-content .attribute {
+    background: transparent !important;
+}
+
+/* Catch-all for any remaining light-colored elements */
+.rst-content .section::before,
+.rst-content .section::after {
+    background: transparent !important;
+}
+
+/* Version selector and other misc elements */
+.rst-versions {
+    background: #0d0d0d !important;
+    color: #e0e0e0 !important;
+}
+
+.rst-versions a {
+    color: #6b9bd1 !important;
+}
+
+/* Inline code in paragraphs */
+p code,
+li code,
+td code {
+    background: #0d0d0d !important;
+    color: #88c0d0 !important;
+}
+
+/* Module index and general index pages */
+.genindex-jumpbox,
+.modindex-jumpbox {
+    background: transparent !important;
+}
+
+/* Ensure all list items are properly colored */
+ul, ol {
+    color: #e0e0e0 !important;
+}
+
+/* Catch any black text and make it white/light */
+.rst-content * {
+    color: #e0e0e0;
+}
+
+/* Force specific common elements to be light colored */
+.rst-content span,
+.rst-content em,
+.rst-content strong,
+.rst-content b,
+.rst-content i {
+    color: inherit !important;
+}
+
+/* Signature elements in API docs */
+.rst-content .sig,
+.rst-content .sig-name,
+.rst-content .sig-param,
+.rst-content .sig-prename {
+    color: #e0e0e0 !important;
+}
+
+/* Property/attribute names */
+.rst-content .property,
+.rst-content em.property {
+    color: #88c0d0 !important;
+}
+
+/* Ensure headings are always visible */
+.rst-content h1,
+.rst-content h2,
+.rst-content h3,
+.rst-content h4,
+.rst-content h5,
+.rst-content h6 {
+    color: #ffffff !important;
+}
+
+/* Class/function names in signatures */
+.rst-content .descname,
+.rst-content .descclassname {
+    color: #6b9bd1 !important;
+}
