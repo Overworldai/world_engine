@@ -92,11 +92,14 @@ class MLP(nn.Module):
 class ControllerInputEmbedding(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.mlp = MLP(config.n_buttons + 2, config.d_model * config.mlp_ratio, config.d_model)
+        self.mlp = MLP(
+            config.n_buttons + 3,  # mouse velocity (x,y) + scroll sign
+            config.d_model * config.mlp_ratio,
+            config.d_model
+        )
 
-    def forward(self, mouse: Tensor, button: Tensor):
-        assert len(mouse.shape) == 3
-        x = torch.cat((mouse, button), dim=-1)
+    def forward(self, mouse: Tensor, button: Tensor, scroll: Tensor):
+        x = torch.cat((mouse, button, scroll), dim=-1)
         return self.mlp(x)
 
 
@@ -254,6 +257,7 @@ class WorldModel(BaseModel):
         prompt_pad_mask: Optional[Tensor] = None,
         mouse: Optional[Tensor] = None,
         button: Optional[Tensor] = None,
+        scroll: Optional[Tensor] = None,
         kv_cache=None,
         ctrl_cond: Optional[bool] = None,
         prompt_cond: Optional[bool] = None,
@@ -283,7 +287,7 @@ class WorldModel(BaseModel):
 
         assert button is not None
         ctx = {
-            "ctrl_emb": self.ctrl_emb(mouse, button),
+            "ctrl_emb": self.ctrl_emb(mouse, button, scroll),
             "prompt_emb": prompt_emb,
             "prompt_pad_mask": prompt_pad_mask,
         }
