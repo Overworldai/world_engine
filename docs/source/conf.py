@@ -60,3 +60,21 @@ autodoc_default_options = {
 
 html_theme = 'sphinx_rtd_theme'
 html_static_path = ['_static']
+
+# RTD theme options for dark mode
+html_theme_options = {
+    'style_nav_header_background': '#000000',  # Black header
+    'navigation_depth': 4,
+    'collapse_navigation': False,
+    'sticky_navigation': True,
+    'includehidden': True,
+    'titles_only': False
+}
+
+# Logo configuration (update path when you add the logo)
+# html_logo = '_static/logo.png'
+
+# Custom CSS for dark theme
+html_css_files = [
+    'custom.css',
+]
