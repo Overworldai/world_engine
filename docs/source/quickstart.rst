@@ -72,9 +72,11 @@ Create an engine instance by specifying a Waypoint model from HuggingFace:
    from world_engine import WorldEngine
 
    engine = WorldEngine(
-       "OpenWorldLabs/CoDCtl-Causal-SelfForcing-UniformSigma",
+       "Overworld/Waypoint-1-Small",
        device="cuda"
    )
+
+Browse all available Waypoint models at `Overworld on HuggingFace <https://huggingface.co/Overworld>`_.
 
 Setting the Prompt
 """"""""""""""""""
@@ -224,7 +226,7 @@ Here's a complete example using OpenCV to create an interactive world model expe
 
    async def main() -> None:
        uri = sys.argv[1] if len(sys.argv) > 1 else \
-             "OpenWorldLabs/CoDCtl-Causal-Flux-SelfForcing"
+             "Overworld/Waypoint-1-Small"
 
        # Create engine
        engine = WorldEngine(uri, device="cuda")
