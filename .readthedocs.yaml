@@ -7,6 +7,10 @@ build:
   os: ubuntu-22.04
   tools:
     python: "3.11"
+  jobs:
+    post_checkout:
+      # Create symlink to allow imports to work
+      - ln -s src world_engine
 
 sphinx:
   configuration: docs/source/conf.py
