@@ -12,6 +12,7 @@ import base64
 import io
 import json
 import logging
+import tempfile
 import time
 import urllib.request
 from contextlib import asynccontextmanager
@@ -93,9 +94,11 @@ engine_warmed_up = False
 def load_seed_frame(target_size: tuple[int, int] = (360, 640)) -> torch.Tensor:
     """Load and preprocess the seed frame."""
     logger.info("Downloading seed frame...")
-    urllib.request.urlretrieve(SEED_URL, "/tmp/seed.png")
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp_path = tmp.name
+    urllib.request.urlretrieve(SEED_URL, tmp_path)
     logger.info("Reading seed image...")
-    img = torchvision.io.read_image("/tmp/seed.png")
+    img = torchvision.io.read_image(tmp_path)
     img = img[:3].unsqueeze(0).float()
     frame = F.interpolate(img, size=target_size, mode="bilinear", align_corners=False)[0]
     result = frame.to(dtype=torch.uint8, device=DEVICE).permute(1, 2, 0).contiguous()
