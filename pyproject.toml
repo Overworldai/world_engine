@@ -34,10 +34,14 @@ packages = [
 [tool.setuptools.package-dir]
 world_engine = "src"
 
+[tool.uv]
+index-strategy = "unsafe-best-match"
+
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }
 torchvision = { index = "pytorch-cu128" }
 torchaudio = { index = "pytorch-cu128" }
+triton = { index = "pytorch-cu128" }
 
 [[tool.uv.index]]
 name = "pytorch-cu128"
