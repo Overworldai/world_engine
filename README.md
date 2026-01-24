@@ -131,7 +131,7 @@ class CtrlInput:
 
 - [Overworld.stream](https://overworld.stream)
 - [Overworld Biome](https://github.com/Overworldai/Biome/)
-- [World Engine Zero (HF Space)](https://huggingface.co/spaces/Overworld/world-engine-zero)
+- [World Engine Zero (HF Space)](https://huggingface.co/spaces/Overworld/waypoint-1-small)
 - [Daydream scope-overworld](https://github.com/daydreamlive/scope-overworld)
 - [LocalWorld](https://github.com/Overworldai/local_world)
 
