@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "world_engine"
-version = "0.0.3"
+version = "1.0.0"
 requires-python = ">=3.9"
 dependencies = [
-  "torch==2.10.0+cu128",
-  "torchvision==0.25.0+cu128",
-  "torchaudio==2.10.0+cu128",
+  "torch==2.10.0",
+  "torchvision==0.25.0",
+  "torchaudio==2.10.0",
   "einops",
   "rotary-embedding-torch>=0.8.8",
   "tensordict==0.10.0",
