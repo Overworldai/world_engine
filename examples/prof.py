@@ -5,7 +5,7 @@ from world_engine import WorldEngine
 
 
 def do_profile(n_frames=64, row_limit=20):
-    engine = WorldEngine("OpenWorldLabs/CoDCtl-Causal-Flux-SelfForcing", device="cuda")
+    engine = WorldEngine("Overworld/Waypoint-1-Small", device="cuda")
     # warmup
     for _ in range(4):
         engine.gen_frame()
