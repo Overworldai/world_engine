@@ -33,3 +33,10 @@ packages = [
 
 [tool.setuptools.package-dir]
 world_engine = "src"
+
+[project.optional-dependencies]
+examples = [
+  "opencv-python>=4.9",
+  "pytest>=8",
+  "pytest-benchmark>=4.0",
+]
