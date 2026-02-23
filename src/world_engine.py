@@ -93,6 +93,17 @@ class WorldEngine:
         for v in self._ctx.values():
             v.zero_()
 
+    @torch.inference_mode()
+    def get_state(self):
+        """Captures a world state to continue via load_state. Doesn't save model"""
+        return {"kv_cache": self.kv_cache.get_state(), "frame_ts": self.frame_ts.detach().clone()}
+
+    @torch.inference_mode()
+    def load_state(self, state):
+        """Loads a world state object saved via save_state. Doesn't load or change model"""
+        self.kv_cache.load_state(state["kv_cache"])
+        self.frame_ts.copy_(state["frame_ts"])
+
     def set_prompt(self, prompt: str):
         """Apply text conditioning for T2V"""
         if self.prompt_encoder is None:

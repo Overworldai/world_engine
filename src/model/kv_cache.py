@@ -185,6 +185,18 @@ class StaticKVCache(nn.Module):
             layer.reset()
         self._is_frozen = True
 
+    @torch.inference_mode()
+    def get_state(self):
+        layers = [(layer.kv.detach().clone(), layer.written.detach().clone()) for layer in self.layers]
+        return {"_is_frozen": self._is_frozen, "layers": layers}
+
+    @torch.inference_mode()
+    def load_state(self, state):
+        self._is_frozen = bool(state.get("_is_frozen", True))
+        for layer, (kv, written) in zip(self.layers, state["layers"]):
+            layer.kv.copy_(kv)
+            layer.written.copy_(written)
+
     def set_frozen(self, is_frozen: bool):
         self._is_frozen = is_frozen
 
