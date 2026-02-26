@@ -3,7 +3,7 @@ import torch
 from torch import Tensor
 from dataclasses import dataclass, field
 
-from .model import WorldModel, StaticKVCache, PromptEncoder
+from .model import WorldModel, CombatModel, StaticKVCache, PromptEncoder
 from .ae import InferenceAE
 from .patch_model import apply_inference_patches
 from .quantize import quantize_model
@@ -41,7 +41,8 @@ class WorldEngine:
         """
         self.device, self.dtype = device, dtype
 
-        self.model_cfg = WorldModel.load_config(model_uri)
+        # self.model_cfg = WorldModel.load_config(model_uri)
+        self.model_cfg = CombatModel.load_config(model_uri)
 
         if model_config_overrides:
             self.model_cfg.merge_with(model_config_overrides)
@@ -55,9 +56,11 @@ class WorldEngine:
             self.prompt_encoder = PromptEncoder(pe_uri, dtype=dtype).to(device).eval()
 
         if load_weights:
-            self.model = WorldModel.from_pretrained(model_uri, cfg=self.model_cfg)
+            # self.model = WorldModel.from_pretrained(model_uri, cfg=self.model_cfg)
+            self.model = CombatModel.from_pretrained(model_uri, cfg=self.model_cfg)
         else:
-            self.model = WorldModel(self.model_cfg)
+            # self.model = WorldModel(self.model_cfg)
+            self.model = CombatModel(self.model_cfg)    
         self.model = self.model.to(device=device, dtype=dtype).eval()
 
         apply_inference_patches(self.model)
