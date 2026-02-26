@@ -9,9 +9,10 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from .. import nn as owl_nn
+from . import nn as owl_nn
+from .attn import Attn
+from .checkpointing import maybe_ckpt
 from .base_model import BaseModel
-from .world_model import WorldDiT
 
 class ControllerInputEmbedding(nn.Module):
     def __init__(self, config):
@@ -101,7 +102,7 @@ class WorldDiTBlock(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.config = config
-        self.attn = owl_nn.Attn(config, layer_idx)
+        self.attn = Attn(config, layer_idx)
         self.mlp = owl_nn.MLP(config)
         self.cond_head = CondHead(config)
 
@@ -151,7 +152,7 @@ class WorldDiTBlock(nn.Module):
                     out = out.reshape(B, S, D)
                 return out + residual
 
-            x = owl_nn.maybe_ckpt(do_mlp_ckpt, prompt_xattn, x, ctx["prompt_emb"], ctx["prompt_pad_mask"])
+            x = maybe_ckpt(do_mlp_ckpt, prompt_xattn, x, ctx["prompt_emb"], ctx["prompt_pad_mask"])
 
         if self.ctrl_cross_attn is not None:
             inference_mode = kv_cache is not None
@@ -164,14 +165,14 @@ class WorldDiTBlock(nn.Module):
         if self.ctrl_mlpfusion is not None:
             def ctrl_mlpfusion(x_raw, ctrl_raw):
                 return self.ctrl_mlpfusion(owl_nn.rms_norm(x_raw), owl_nn.rms_norm(ctrl_raw)) + x_raw
-            x = owl_nn.maybe_ckpt(do_mlp_ckpt, ctrl_mlpfusion, x, ctx["ctrl_emb"])
+            x = maybe_ckpt(do_mlp_ckpt, ctrl_mlpfusion, x, ctx["ctrl_emb"])
 
         def cond_mlp(xm, sm, bm, gm):
             residual = xm
             xm = self.mlp(owl_nn.ada_rmsnorm(xm, sm, bm))
             return owl_nn.ada_gate(xm, gm) + residual
 
-        x = owl_nn.maybe_ckpt(do_mlp_ckpt, cond_mlp, x, s1, b1, g1)
+        x = maybe_ckpt(do_mlp_ckpt, cond_mlp, x, s1, b1, g1)
 
         return x, v
 
@@ -238,7 +239,7 @@ class CombatDiT(nn.Module):
                     bm=bm,
                     kv_cache=kv_cache,
                 )
-            x, v = owl_nn.maybe_ckpt(ckpt_mode, run_block, x, v, cond)
+            x, v = maybe_ckpt(ckpt_mode, run_block, x, v, cond)
 
         return x
 

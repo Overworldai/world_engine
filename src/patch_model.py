@@ -113,7 +113,7 @@ class MergedQKVAttn(Attn):
 
         del self.q_proj, self.k_proj, self.v_proj
 
-    def forward(self, x, pos_ids, v1, kv_cache):
+    def forward(self, x, pos_ids, v1, bm, kv_cache=None):
         q, k, v = self.qkv_proj(x).split((self.q_out, self.kv_out, self.kv_out), dim=-1)
 
         B, T = x.shape[:2]

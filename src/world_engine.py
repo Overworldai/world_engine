@@ -82,7 +82,7 @@ class WorldEngine:
         self._ctx = {
             "button": torch.zeros((1, 1, self.model_cfg.n_buttons), device=device, dtype=dtype),
             "mouse": torch.zeros((1, 1, 2), device=device, dtype=dtype),
-            "scroll": torch.zeros((1, 1, 1), device=device, dtype=dtype),
+            # "scroll": torch.zeros((1, 1, 1), device=device, dtype=dtype),
             "frame_timestamp": torch.empty((1, 1), device=device, dtype=torch.long),
         }
 
@@ -122,7 +122,7 @@ class WorldEngine:
     def _prep_inputs(self, x, ctrl=None):
         self._ctx["mouse"][0, 0, 0] = ctrl.mouse[0]
         self._ctx["mouse"][0, 0, 1] = ctrl.mouse[1]
-        self._ctx["scroll"][0, 0, 0] = ctrl.scroll_wheel
+        # self._ctx["scroll"][0, 0, 0] = ctrl.scroll_wheel
 
         self._ctx["frame_timestamp"].copy_(self.frame_ts)
         self.frame_ts.add_(1)
@@ -135,7 +135,7 @@ class WorldEngine:
         if ctrl.button:
             self._ctx["button"][..., list(ctrl.button)] = 1.0
         ctrl.mouse = torch.tensor(ctrl.mouse, device=x.device, dtype=self._ctx["mouse"].dtype)
-        ctrl.scroll_wheel = torch.sign(torch.tensor(ctrl.scroll_wheel, device=x.device, dtype=self._ctx["scroll"].dtype))
+        # ctrl.scroll_wheel = torch.sign(torch.tensor(ctrl.scroll_wheel, device=x.device, dtype=self._ctx["scroll"].dtype))
         ctx = self._prep_inputs(x, ctrl)
 
         # prepare prompt conditioning

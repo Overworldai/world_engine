@@ -1,3 +1,5 @@
+import math
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -56,14 +58,33 @@ def rms_norm(x: torch.Tensor) -> torch.Tensor:
     return F.rms_norm(x, (x.size(-1),))
 
 
-class MLP(nn.Module):
+class MLPCustom(nn.Module):
     def __init__(self, dim_in, dim_middle, dim_out):
         super().__init__()
+
         self.fc1 = nn.Linear(dim_in, dim_middle, bias=False)
         self.fc2 = nn.Linear(dim_middle, dim_out, bias=False)
 
+        nn.init.kaiming_normal_(self.fc1.weight)
+        nn.init.kaiming_normal_(self.fc2.weight)
+
+        self.fc1.weight.data *= dim_in ** -0.5
+        self.fc2.weight.data *= dim_middle ** -0.5
+
     def forward(self, x):
-        return self.fc2(F.silu(self.fc1(x)))
+        x = self.fc1(x)
+        x = F.silu(x)
+        x = self.fc2(x)
+        return x
+
+
+class MLP(MLPCustom):
+    def __init__(self, config):
+        super().__init__(
+            config.d_model,
+            config.d_model * getattr(config, "mlp_ratio", 4),
+            config.d_model
+        )
 
 
 class AdaLN(nn.Module):
@@ -106,7 +127,7 @@ class NoiseConditioner(NoCastModule):
         assert fourier_dim % 2 == 0
         half = fourier_dim // 2
         self.freq = nn.Buffer(torch.logspace(0, -1, steps=half, base=base, dtype=torch.float32), persistent=False)
-        self.mlp = MLP(fourier_dim, dim * 4, dim)
+        self.mlp = MLPCustom(fourier_dim, dim * 4, dim)
 
     def forward(self, s, eps=torch.finfo(torch.float32).eps):
         assert self.freq.dtype == torch.float32
@@ -119,7 +140,7 @@ class NoiseConditioner(NoCastModule):
             # calculate fourier features
             phase = s[:, None] * self.freq[None, :]
             emb = torch.cat((torch.sin(phase), torch.cos(phase)), dim=-1)
-            emb = emb * 2**0.5  # Ensure unit variance
+            emb = emb * math.sqrt(2)  # Ensure unit variance
             emb = self.mlp(emb)
 
         return emb.to(orig_dtype).view(*shape, -1)
