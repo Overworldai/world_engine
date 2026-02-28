@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebSocket Video Stream</title>
+  <style>
+    html, body { height: 100%; margin: 0; background: #111; color: #eee; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    header { padding: 8px 12px; display: flex; gap: 8px; align-items: center; background: #1b1b1b; position: sticky; top: 0; }
+    input, button, select { background: #222; color: #eee; border: 1px solid #333; border-radius: 6px; padding: 6px 10px; }
+    button { cursor: pointer; }
+    #status { margin-left: auto; opacity: 0.8; }
+    #container { position: relative; width: 100%; height: calc(100% - 48px); display: grid; place-items: center; }
+    canvas { max-width: 100%; max-height: 100%; background: #000; aspect-ratio: 46/28; image-rendering: auto; }
+    #fps { position: absolute; top: 10px; left: 10px; padding: 2px 6px; background: rgba(0,0,0,0.5); border-radius: 4px; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <header>
+    <label>WS URL</label>
+    <input id="wsUrl" size="40" value="ws://localhost:8765" />
+    <select id="scale">
+      <option value="fit" selected>Fit</option>
+      <option value="fill">Fill</option>
+      <option value="1">1x</option>
+      <option value="2">2x</option>
+    </select>
+    <button id="connectBtn">Connect</button>
+    <button id="fsBtn">Fullscreen</button>
+    <span id="status">Disconnected</span>
+  </header>
+  <div id="container">
+    <canvas id="canvas" width="736" height="448"></canvas>
+    <div id="fps">-- fps</div>
+  </div>
+  <script>
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const statusEl = document.getElementById('status');
+    const fpsEl = document.getElementById('fps');
+    const urlInput = document.getElementById('wsUrl');
+    const connectBtn = document.getElementById('connectBtn');
+    const scaleSel = document.getElementById('scale');
+    const fsBtn = document.getElementById('fsBtn');
+
+    let socket = null;
+    let mime = 'image/jpeg';
+    let lastDrawTs = performance.now();
+    let frames = 0;
+    let drawing = false;
+    let pendingBuffer = null; // latest ArrayBuffer to draw (drop older)
+    let reconnectAttempts = 0;
+  // Track pressed keys to support multi-key combos (WASD + UIJK)
+  const pressed = new Set();
+  const keyToBit = { 'w':128,'a':32,'s':64,'d':16,'u':8,'i':4,'j':2,'k':1 };
+  let lastAction = -1;
+
+    function setStatus(text) { statusEl.textContent = text; }
+
+    function applyScaleMode() {
+      const mode = scaleSel.value;
+      if (mode === 'fit') {
+        canvas.style.width = '100%';
+        canvas.style.height = 'auto';
+      } else if (mode === 'fill') {
+        canvas.style.width = '100%';
+        canvas.style.height = '100%';
+      } else if (mode === '1' || mode === '2') {
+        canvas.style.width = (canvas.width * Number(mode)) + 'px';
+        canvas.style.height = (canvas.height * Number(mode)) + 'px';
+      }
+    }
+
+    applyScaleMode();
+    scaleSel.addEventListener('change', applyScaleMode);
+
+    function connect() {
+      const url = urlInput.value.trim();
+      if (!url) return;
+      if (socket) try { socket.close(); } catch {}
+      socket = new WebSocket(url);
+      socket.binaryType = 'arraybuffer';
+      setStatus('Connecting…');
+
+      socket.onopen = () => {
+        setStatus('Connected');
+        reconnectAttempts = 0;
+      };
+      socket.onclose = () => {
+        setStatus('Disconnected');
+        // Light auto-reconnect with backoff (helps if server restarts)
+        const delay = Math.min(5000, 500 * Math.pow(2, reconnectAttempts++));
+        if (urlInput.value.trim()) {
+          setTimeout(() => {
+            // Only reconnect if user hasn't changed the URL
+            connect();
+          }, delay);
+        }
+      };
+
+      socket.onmessage = async (ev) => {
+        if (typeof ev.data === 'string') {
+          try {
+            const msg = JSON.parse(ev.data);
+            if (msg.type === 'meta' && msg.mime) {
+              mime = msg.mime;
+            }
+          } catch {}
+          return;
+        }
+        // Latest-wins rendering: keep only the most recent buffer; if drawing, replace pending and return
+        pendingBuffer = ev.data; // ArrayBuffer
+        if (!drawing) {
+          drawing = true;
+          requestAnimationFrame(drawNext);
+        }
+      };
+
+      async function drawNext() {
+        const buf = pendingBuffer; // snapshot latest
+        pendingBuffer = null;
+        if (!buf) { drawing = false; return; }
+        try {
+          const blob = new Blob([buf], { type: mime });
+          const bmp = await createImageBitmap(blob);
+          ctx.drawImage(bmp, 0, 0, canvas.width, canvas.height);
+          // Explicitly close ImageBitmap to avoid GPU memory leakage in long sessions
+          if (typeof bmp.close === 'function') bmp.close();
+          frames++;
+          const now = performance.now();
+          if (now - lastDrawTs > 1000) {
+            fpsEl.textContent = Math.round(frames * 1000 / (now - lastDrawTs)) + ' fps';
+            frames = 0;
+            lastDrawTs = now;
+          }
+        } catch (e) {
+          console.warn('draw error', e);
+        } finally {
+          if (pendingBuffer) {
+            // Draw the next pending frame immediately
+            requestAnimationFrame(drawNext);
+          } else {
+            drawing = false;
+          }
+        }
+      }
+
+      // Keyboard: maintain a set of pressed keys and send combined action id
+      function recomputeAndSendAction() {
+        if (!socket || socket.readyState !== WebSocket.OPEN) return;
+        let id = 0;
+        for (const k of pressed) id += keyToBit[k] || 0;
+        if (id !== lastAction) {
+          socket.send(JSON.stringify({ type:'action', id }));
+          lastAction = id;
+        }
+      }
+
+      window.addEventListener('keydown', (e) => {
+        const k = e.key?.toLowerCase();
+        if (k in keyToBit) {
+          if (!pressed.has(k)) {
+            pressed.add(k);
+            recomputeAndSendAction();
+          }
+          e.preventDefault();
+        }
+      });
+      window.addEventListener('keyup', (e) => {
+        const k = e.key?.toLowerCase();
+        if (k in keyToBit) {
+          if (pressed.delete(k)) {
+            recomputeAndSendAction();
+          }
+          e.preventDefault();
+        }
+      });
+    }
+
+    connectBtn.addEventListener('click', connect);
+
+    fsBtn.addEventListener('click', async () => {
+      const cont = document.getElementById('container');
+      if (!document.fullscreenElement) {
+        await cont.requestFullscreen().catch(()=>{});
+      } else {
+        await document.exitFullscreen().catch(()=>{});
+      }
+    });
+
+    // Auto-fill WS URL if served via http(s)
+    if (location.protocol.startsWith('http')) {
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      urlInput.value = `${proto}://${location.hostname}:${location.port||'8765'}`;
+    }
+  </script>
+</body>
+</html>
