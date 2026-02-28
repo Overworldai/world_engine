@@ -211,12 +211,13 @@ class StreamHub:
 async def tekken_producer_loop(hub: StreamHub, debug_overlay: bool = False) -> None:
     print("Initializing WorldEngine...")
     pipe = WorldEngine("/mnt/data/laplace/models/combat_sfpp/step_1408", model_config_overrides={"n_frames": 6400}, device="cuda")
-    print("WorldEngine initialized.")
 
     img = Image.open("assets/seed_Frames/seed_data_orig/round_968_frame_0000.jpeg").convert("RGB")
-    image_tensor = torch.from_numpy(np.array(img)).permute(2, 0, 1).unsqueeze(0).to(torch.uint8)
+    img = img.resize((640, 360))
+    image_tensor = torch.from_numpy(np.array(img)).to(torch.uint8)
     pipe.append_frame(image_tensor)
-    print("Initial frame appended. Starting producer loop...")
+    
+    print("WorldEngine initialized.")
 
     try:
         frame_interval = 1.0 / float(hub.cfg.fps) if hub.cfg.fps > 0 else 0.0

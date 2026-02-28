@@ -112,6 +112,7 @@ class WorldEngine:
 
     @torch.inference_mode()
     def append_frame(self, img: Tensor, ctrl: CtrlInput = None):
+        # img: (H, W, C) uint8 RGB
         assert img.dtype == torch.uint8, img.dtype
         x0 = self.vae.encode(img).unsqueeze(1)
         inputs = self.prep_inputs(x=x0, ctrl=ctrl)
@@ -156,9 +157,13 @@ class WorldEngine:
     def prep_inputs(self, x, ctrl=None):
         ctrl = ctrl if ctrl is not None else CtrlInput()
         self._ctx["button"].zero_()
-        self._ctx["button"] = actionid_to_multihot(ctrl.button, num_buttons=self.model_cfg.n_buttons).to(self._ctx["button"].device)
-        self._ctx["button"] = self._ctx["button"].to(self._ctx["mouse"].dtype)
+        print(f"Received ctrl: button={ctrl.button} mouse={ctrl.mouse}")
+        if isinstance(ctrl.button, int) or len(ctrl.button) > 0:
+            self._ctx["button"] = actionid_to_multihot(ctrl.button, num_buttons=self.model_cfg.n_buttons).to(self._ctx["button"].device)
+            self._ctx["button"] = self._ctx["button"].to(self._ctx["mouse"].dtype)
+        print(f"Converted action_id {ctrl.button} to multihot {self._ctx['button']}")
         ctrl.mouse = torch.tensor(ctrl.mouse, device=x.device, dtype=self._ctx["mouse"].dtype)
+        
         # ctrl.scroll_wheel = torch.sign(torch.tensor(ctrl.scroll_wheel, device=x.device, dtype=self._ctx["scroll"].dtype))
         ctx = self._prep_inputs(x, ctrl)
 
