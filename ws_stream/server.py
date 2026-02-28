@@ -10,9 +10,9 @@ Async WebSocket video streamer for real-time browser rendering (no X11).
 - Optional input channel: text messages like `{"type":"action","id":123}` update current action.
 
 Usage examples:
-  python -m inference.ws_stream.server --host 0.0.0.0 --port 8765 --codec jpeg --quality 80
+  python -m ws_stream.server --host 0.0.0.0 --port 8765 --codec jpeg --quality 80
   # With Tekken pipeline producing frames continuously
-  python -m inference.ws_stream.server --use-tekken --fps 30
+  python -m ws_stream.server --use-tekken --fps 30
 
 Then open index.html in your browser and connect to ws://<SERVER_IP>:8765
 
@@ -37,6 +37,7 @@ from typing import Optional, Set, Deque, Union
 import numpy as np
 import cv2
 
+# from src.world_engine import WorldEngine
 from world_engine import WorldEngine
 
 # Optional torch import (lazy-loaded only when actually needed)
@@ -256,8 +257,9 @@ async def tekken_producer_loop(
     model_path: Optional[str] = None,
     debug_overlay: bool = False,
 ) -> None:
-
-    pipe = WorldEngine(model_path=model_path, device="cuda")
+    
+    print("Initializing WorldEngine for Tekken pipeline...")
+    pipe = WorldEngine("/mnt/data/laplace/models/combat_sfpp/step_1408", model_config_overrides={"n_frames": 6400}, device="cuda")
     print("WorldEngine initialized.")
 
     try:
@@ -267,7 +269,9 @@ async def tekken_producer_loop(
             try:
                 action_id = hub.current_action
                 print(f"Generating frame for action {action_id}...")
-                frame = pipe.gen_frame(action_id)
+                frame = pipe.gen_frame()
+                frame = frame.cpu().numpy()[:, :, ::-1]  # RGB -> BGR for OpenCV
+
                 # Tekken returns BGR uint8 already; encoder can skip conversion if configured
                 if debug_overlay:
                     # Draw a small live overlay with time and action id
@@ -349,7 +353,7 @@ async def main_async(args: list[str]) -> int:
     parser.add_argument("--use-tekken", action="store_true", help="Use TekkenPipeline as frame source")
     parser.add_argument("--demo", action="store_true", help="Run with synthetic demo frames if no pipeline")
     parser.add_argument("--frame-format", choices=["rgb","bgr"], default=os.environ.get("WS_FRAME_FORMAT", "rgb"), help="Incoming frame format for encoder.")
-    parser.add_argument("--model-path", type=str, default=None, help="Optional TekkenPipeline model path")
+    parser.add_argument("--model-path", type=str, default=None, help="Optional model path")
     parser.add_argument("--debug-overlay", action="store_true", help="Draw LIVE timestamp and action id on frames (debug)")
     parser.add_argument("--log-actions", action="store_true", help="Log action id changes received from client")
     parser.add_argument("--exit-after", type=float, default=None, help="Optional seconds to run then exit (for quick tests)")
@@ -381,6 +385,7 @@ async def main_async(args: list[str]) -> int:
             asyncio.create_task(heartbeat_task(hub), name="heartbeat"),
             asyncio.create_task(hub.encode_worker(), name="encoder"),
         ]
+        print("WebSocket server started. Waiting for clients to connect...")
         model_path = ns.model_path if ns.model_path else ("/mnt/data/laplace/models/combat_sfpp/step_640" if ns.use_tekken else None)
         # Producer selection
         if ns.use_tekken:
