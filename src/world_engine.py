@@ -21,8 +21,16 @@ torch._dynamo.config.capture_scalar_outputs = True
 class CtrlInput:
     button: Set[int] = field(default_factory=set)  # pressed button IDs
     mouse: Tuple[float, float] = (0.0, 0.0)  # (x, y) velocity
-    scroll_wheel: int = 0  # bwd, stationary, or fwd -> (-1, 0, 1)
+    # scroll_wheel: int = 0  # bwd, stationary, or fwd -> (-1, 0, 1)
 
+def actionid_to_multihot(action_id: int, num_buttons=8) -> torch.Tensor:
+    # Convert integer action_id to a set of button IDs (multihot)
+    buttons = torch.zeros(num_buttons, dtype=bool)  # assume max 32 buttons for example
+    for i in range(num_buttons):  # assume max 32 buttons for example
+        if action_id & (1 << i):
+            buttons[i] = 1.0
+    buttons = buttons.unsqueeze(0).unsqueeze(0)  # shape (1, 1, num_buttons)
+    return buttons
 
 class WorldEngine:
     def __init__(
@@ -129,11 +137,27 @@ class WorldEngine:
 
         return self._ctx
 
+    # def prep_inputs(self, x, ctrl=None):
+    #     ctrl = ctrl if ctrl is not None else CtrlInput()
+    #     self._ctx["button"].zero_()
+    #     if ctrl.button:
+    #         self._ctx["button"][..., list(ctrl.button)] = 1.0
+    #     ctrl.mouse = torch.tensor(ctrl.mouse, device=x.device, dtype=self._ctx["mouse"].dtype)
+    #     ctrl.scroll_wheel = torch.sign(torch.tensor(ctrl.scroll_wheel, device=x.device, dtype=self._ctx["scroll"].dtype))
+    #     ctx = self._prep_inputs(x, ctrl)
+
+    #     # prepare prompt conditioning
+    #     if self.model_cfg.prompt_conditioning is None:
+    #         return ctx
+    #     if self._prompt_ctx["prompt_emb"] is None:
+    #         self.set_prompt("An explorable world")
+    #     return {**ctx, **self._prompt_ctx}
+    
     def prep_inputs(self, x, ctrl=None):
         ctrl = ctrl if ctrl is not None else CtrlInput()
         self._ctx["button"].zero_()
-        if ctrl.button:
-            self._ctx["button"][..., list(ctrl.button)] = 1.0
+        self._ctx["button"] = actionid_to_multihot(ctrl.button, num_buttons=self.model_cfg.n_buttons).to(self._ctx["button"].device)
+        self._ctx["button"] = self._ctx["button"].to(self._ctx["mouse"].dtype)
         ctrl.mouse = torch.tensor(ctrl.mouse, device=x.device, dtype=self._ctx["mouse"].dtype)
         # ctrl.scroll_wheel = torch.sign(torch.tensor(ctrl.scroll_wheel, device=x.device, dtype=self._ctx["scroll"].dtype))
         ctx = self._prep_inputs(x, ctrl)

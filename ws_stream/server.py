@@ -38,7 +38,7 @@ import numpy as np
 import cv2
 
 # from src.world_engine import WorldEngine
-from world_engine import WorldEngine
+from world_engine import WorldEngine, CtrlInput
 
 # Optional torch import (lazy-loaded only when actually needed)
 torch = None  # type: ignore
@@ -48,7 +48,15 @@ global frame_count
 frame_count = 0
 
 import websockets
+import numpy as np
 
+def actionid_to_multihot(action_id: int, num_buttons=8) -> np.ndarray[int]:
+    # Convert integer action_id to a set of button IDs (multihot)
+    buttons = np.zeros(num_buttons, dtype=bool)  # assume max 32 buttons for example
+    for i in range(num_buttons):  # assume max 32 buttons for example
+        if action_id & (1 << i):
+            buttons[i] = 1
+    return buttons
 
 @dataclass
 class StreamConfig:
@@ -269,7 +277,8 @@ async def tekken_producer_loop(
             try:
                 action_id = hub.current_action
                 print(f"Generating frame for action {action_id}...")
-                frame = pipe.gen_frame()
+                ctrl = CtrlInput(button=action_id, mouse=(0.0, 0.0))
+                frame = pipe.gen_frame(ctrl=ctrl)
                 frame = frame.cpu().numpy()[:, :, ::-1]  # RGB -> BGR for OpenCV
 
                 # Tekken returns BGR uint8 already; encoder can skip conversion if configured
@@ -298,7 +307,9 @@ async def tekken_producer_loop(
                     hub.publish_frame(frame)
             except Exception as e:
                 # Log and continue; do not kill the producer loop on transient errors
+                import traceback
                 print(f"[tekken] frame error: {e}")
+                traceback.print_exc()
                 await asyncio.sleep(0.01)
             # Pace the producer to roughly match target FPS so simulation time is real-time
             if frame_interval > 0.0:
@@ -350,7 +361,7 @@ async def main_async(args: list[str]) -> int:
     parser.add_argument("--fps", type=int, default=int(os.environ.get("WS_FPS", 30)))
     parser.add_argument("--codec", choices=["jpeg", "webp"], default=os.environ.get("WS_CODEC", "jpeg"))
     parser.add_argument("--quality", type=int, default=int(os.environ.get("WS_QUALITY", 80)))
-    parser.add_argument("--use-tekken", action="store_true", help="Use TekkenPipeline as frame source")
+    parser.add_argument("--use-combat", action="store_true", help="Use TekkenPipeline as frame source")
     parser.add_argument("--demo", action="store_true", help="Run with synthetic demo frames if no pipeline")
     parser.add_argument("--frame-format", choices=["rgb","bgr"], default=os.environ.get("WS_FRAME_FORMAT", "rgb"), help="Incoming frame format for encoder.")
     parser.add_argument("--model-path", type=str, default=None, help="Optional model path")
@@ -361,8 +372,9 @@ async def main_async(args: list[str]) -> int:
 
     cfg = StreamConfig(host=ns.host, port=ns.port, fps=ns.fps, codec=ns.codec, quality=ns.quality, frame_format=ns.frame_format)
     # If using Tekken, default to BGR frames for faster path (skip color convert)
-    if ns.use_tekken:
-        cfg.frame_format = "bgr"
+    # if ns.use_tekken:
+    #     cfg.frame_format = "bgr"
+    cfg.frame_format = "bgr" if ns.use_combat else cfg.frame_format
     encoder = FrameEncoder(cfg.codec, cfg.quality, frame_format=cfg.frame_format)
     hub = StreamHub(cfg, encoder)
     hub.log_actions = bool(ns.log_actions)
@@ -386,14 +398,14 @@ async def main_async(args: list[str]) -> int:
             asyncio.create_task(hub.encode_worker(), name="encoder"),
         ]
         print("WebSocket server started. Waiting for clients to connect...")
-        model_path = ns.model_path if ns.model_path else ("/mnt/data/laplace/models/combat_sfpp/step_640" if ns.use_tekken else None)
+        model_path = None
         # Producer selection
-        if ns.use_tekken:
+        if ns.use_combat:
             tasks.append(asyncio.create_task(tekken_producer_loop(hub, model_path, debug_overlay=ns.debug_overlay), name="tekken"))
         elif ns.demo:
             tasks.append(asyncio.create_task(demo_producer(hub), name="demo"))
         else:
-            print("No producer started. Call hub.publish_frame(frame) from your code or run with --demo/--use-tekken.")
+            print("No producer started. Call hub.publish_frame(frame) from your code or run with --demo/--use-combat.")
 
         # Graceful shutdown
         stop = asyncio.Future()
