@@ -8,6 +8,9 @@ class InferenceAE:
         self.dtype = dtype
         self.ae_model = ae_model.eval().to(device=device, dtype=dtype)
 
+    def reset(self):
+        pass
+
     @classmethod
     def from_pretrained(cls, model_uri: str, **kwargs):
         import pathlib

@@ -105,6 +105,7 @@ class WorldEngine:
         self.frame_ts.zero_()
         for v in self._ctx.values():
             v.zero_()
+        self.vae.reset()
 
     @torch.inference_mode()
     def get_state(self):
