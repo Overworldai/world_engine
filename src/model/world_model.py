@@ -359,6 +359,7 @@ class WorldModel(BaseModel):
         x: Tensor,
         sigma: Tensor,
         frame_timestamp: Tensor,
+        frame_idx: Optional[Tensor] = None,
         prompt_emb: Optional[Tensor] = None,
         prompt_pad_mask: Optional[Tensor] = None,
         mouse: Optional[Tensor] = None,
@@ -385,7 +386,12 @@ class WorldModel(BaseModel):
         torch._assert(B == 1 and N == 1, "WorldModel.forward currently supports B==1, N==1")
         self._t_pos_1f.copy_(frame_timestamp[0, 0].expand_as(self._t_pos_1f))
         pos_ids = TensorDict(
-            {"t_pos": self._t_pos_1f[None], "y_pos": self._y_pos_1f[None], "x_pos": self._x_pos_1f[None]},
+            {
+                "f_pos": (frame_timestamp if frame_idx is None else frame_idx)[0, 0].expand_as(self._t_pos_1f)[None],
+                "t_pos": self._t_pos_1f[None],
+                "y_pos": self._y_pos_1f[None],
+                "x_pos": self._x_pos_1f[None],
+            },
             batch_size=[1, self._t_pos_1f.numel()],
         )
 

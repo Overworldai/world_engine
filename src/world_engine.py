@@ -83,12 +83,17 @@ class WorldEngine:
         self.kv_cache = StaticKVCache(self.model_cfg, batch_size=1, dtype=dtype).to(device)
         self.frame_ts = torch.tensor([[0]], dtype=torch.long, device=device)
 
+        inference_fps = getattr(self.model_cfg, "inference_fps", self.model_cfg.base_fps)
+        latent_fps = inference_fps / getattr(self.model_cfg, "temporal_compression", 1)
+        self.ts_mult = int(self.model_cfg.base_fps) // latent_fps
+
         # Static input context tensors
         self._ctx = {
             "button": torch.zeros((1, 1, self.model_cfg.n_buttons), device=device, dtype=dtype),
             "mouse": torch.zeros((1, 1, 2), device=device, dtype=dtype),
             "scroll": torch.zeros((1, 1, 1), device=device, dtype=dtype),
             "frame_timestamp": torch.empty((1, 1), device=device, dtype=torch.long),
+            "frame_idx": torch.empty((1, 1), device=device, dtype=torch.long),
         }
 
         self._prompt_ctx = {"prompt_emb": None, "prompt_pad_mask": None}
@@ -140,7 +145,8 @@ class WorldEngine:
         self._ctx["mouse"][0, 0, 1] = ctrl.mouse[1]
         self._ctx["scroll"][0, 0, 0] = ctrl.scroll_wheel
 
-        self._ctx["frame_timestamp"].copy_(self.frame_ts)
+        self._ctx["frame_idx"].copy_(self.frame_ts)
+        self._ctx["frame_timestamp"].copy_(self.frame_ts).mul_(self.ts_mult)
         self.frame_ts.add_(1)
 
         return self._ctx

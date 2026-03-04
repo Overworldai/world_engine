@@ -107,26 +107,21 @@ class LayerKVCache(nn.Module):
         t_pos: [B, T], all equal per frame (ignoring -1)
         """
         T = self.tpf
-        t_pos = pos_ids["t_pos"]
+        f_pos = pos_ids["f_pos"]
 
         if not torch.compiler.is_compiling():
             torch._check(kv.size(3) == self.tpf, "KV cache expects exactly one frame per upsert")
-            torch._check(t_pos.shape == (kv.size(1), T), "t_pos must be [B, T]")
+            torch._check(f_pos.shape == (kv.size(1), T), "t_pos must be [B, T]")
             torch._check(self.tpf <= self.L, "frame longer than KV ring capacity")
-            torch._check(self.L % self.tpf == 0,
-                         f"L ({self.L}) must be a multiple of tokens_per_frame ({self.tpf})")
-            torch._check(self.kv.size(3) == self.capacity,
-                         "KV buffer has unexpected length (expected L + tokens_per_frame)")
-            torch._check(
-                (t_pos >= 0).all().item(),
-                "t_pos must be non-negative during inference",
-            )
-            torch._check(((t_pos == t_pos[:, :1]).all()).item(), "t_pos must be constant within frame")
+            torch._check(self.L % self.tpf == 0, f"L ({self.L}) must be a multiple of tokens_per_frame ({self.tpf})")
+            torch._check(self.kv.size(3) == self.capacity, "KV buffer too long (expected L + tokens_per_frame)")
+            torch._check((f_pos >= 0).all().item(), "t_pos must be non-negative during inference")
+            torch._check(((f_pos == f_pos[:, :1]).all()).item(), "t_pos must be constant within frame")
 
-        frame_t = t_pos[0, 0]
+        frame_idx = f_pos[0, 0]
 
         # map frame_t to a bucket, each bucket owns T contiguous slots
-        bucket = (frame_t + (self.pinned_dilation - 1)) // self.pinned_dilation
+        bucket = (frame_idx + (self.pinned_dilation - 1)) // self.pinned_dilation
         slot = bucket % self.num_buckets
         base = slot * T
 
@@ -137,7 +132,7 @@ class LayerKVCache(nn.Module):
         # this is the "self-attention component" for the current frame.
         self.kv.index_copy_(3, self.current_idx, kv)
 
-        write_step = (frame_t.remainder(self.pinned_dilation) == 0)
+        write_step = (frame_idx.remainder(self.pinned_dilation) == 0)
         mask_written = self._mask_written
         mask_written.copy_(self.written)
         mask_written[ring_idx] = mask_written[ring_idx] & ~write_step
@@ -158,7 +153,7 @@ class StaticKVCache(nn.Module):
     def __init__(self, config, batch_size, dtype):
         super().__init__()
 
-        self.tpf = config.tokens_per_frame
+        self.tpf = config.height * config.width
 
         local_L = config.local_window * self.tpf
         global_L = config.global_window * self.tpf
