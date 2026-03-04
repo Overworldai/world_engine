@@ -4,7 +4,7 @@ from torch import Tensor
 from dataclasses import dataclass, field
 
 from .model import WorldModel, StaticKVCache, PromptEncoder
-from .ae import InferenceAE
+from .ae import get_ae
 from .patch_model import apply_inference_patches
 from .quantize import quantize_model
 
@@ -15,6 +15,14 @@ torch.set_float32_matmul_precision("medium")  # low: bf16, medium: tf32, high: f
 
 # fix graph break:
 torch._dynamo.config.capture_scalar_outputs = True
+
+COMPILE_OPTIONS = {
+    "max_autotune": True,
+    "coordinate_descent_tuning": True,
+    "triton.cudagraphs": True,   # set False to mimic *-no-cudagraphs
+    "epilogue_fusion": True,     # requires max_autotune
+    "shape_padding": True,
+}
 
 
 @dataclass
@@ -47,7 +55,7 @@ class WorldEngine:
             self.model_cfg.merge_with(model_config_overrides)
 
         # Model
-        self.vae = InferenceAE.from_pretrained(self.model_cfg.ae_uri, device=device, dtype=dtype)
+        self.vae = get_ae(self.model_cfg.ae_uri, getattr(self.model_cfg, "taehv_ae", False), device=device, dtype=dtype)
 
         self.prompt_encoder = None
         if self.model_cfg.prompt_conditioning is not None:
@@ -153,7 +161,7 @@ class WorldEngine:
             self.set_prompt("An explorable world")
         return {**ctx, **self._prompt_ctx}
 
-    @torch.compile(fullgraph=True, mode="max-autotune", dynamic=False)
+    @torch.compile(fullgraph=True, dynamic=False, options=COMPILE_OPTIONS)
     def _denoise_pass(self, x, ctx: Dict[str, Tensor], kv_cache):
         kv_cache.set_frozen(True)
         sigma = x.new_empty((x.size(0), x.size(1)))
@@ -162,7 +170,7 @@ class WorldEngine:
             x = x + step_dsig * v
         return x
 
-    @torch.compile(fullgraph=True, mode="max-autotune", dynamic=False)
+    @torch.compile(fullgraph=True, dynamic=False, options=COMPILE_OPTIONS)
     def _cache_pass(self, x, ctx: Dict[str, Tensor], kv_cache):
         """Side effect: updates kv cache"""
         kv_cache.set_frozen(False)

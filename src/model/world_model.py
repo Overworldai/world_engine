@@ -340,7 +340,7 @@ class WorldModel(BaseModel):
 
         self.transformer = WorldDiT(config)
 
-        self.patch = tuple(getattr(config, "patch", (1, 1)))
+        self.patch = tuple(config.patch)
 
         C, D = config.channels, config.d_model
         self.patchify = nn.Conv2d(C, D, kernel_size=self.patch, stride=self.patch, bias=False)
@@ -419,3 +419,75 @@ class WorldModel(BaseModel):
             hidden, top_k = int(c.d_model * moe_mlp_ratio), min(c.moe_top_k, c.moe_n_experts)
             total -= (c.moe_n_experts - top_k) * c.n_layers * c.d_model * hidden * (3 if c.gated_linear else 2)
         return total
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        if getattr(self.config, "model_type", "waypoint-1") != "waypoint-1.5":
+            return super().load_state_dict(state_dict, strict=strict, assign=assign)
+
+        state_dict = dict(state_dict)
+
+        if "unpatchify.weight" in state_dict and state_dict["unpatchify.weight"].ndim == 4:
+            w = state_dict["unpatchify.weight"]  # [D, C, ph, pw]
+            state_dict["unpatchify.weight"] = w.permute(1, 2, 3, 0).reshape(-1, w.shape[0])
+        if "unpatchify.bias" in state_dict and state_dict["unpatchify.bias"].numel() != self.unpatchify.bias.numel():
+            ph, pw = self.patch
+            state_dict["unpatchify.bias"] = state_dict["unpatchify.bias"][:, None, None].expand(-1, ph, pw).reshape(-1)
+
+        for i in range(self.config.n_layers):
+            p = f"transformer.blocks.{i}."
+
+            for name in ("fc1.weight", "fc2.weight"):
+                old = p + "dit_mlp." + name
+                if old in state_dict:
+                    state_dict.setdefault(p + "mlp." + name, state_dict.pop(old))
+
+            attn_bias = state_dict.pop(p + "attn_cond_head.bias_in", None)
+            mlp_bias = state_dict.pop(p + "mlp_cond_head.bias_in", None)
+            if attn_bias is not None or mlp_bias is not None:
+                state_dict.setdefault(p + "cond_head.bias_in", mlp_bias if mlp_bias is not None else attn_bias)
+
+            for j in range(3):
+                attn = state_dict.pop(p + f"attn_cond_head.cond_proj.{j}.weight", None)
+                mlp = state_dict.pop(p + f"mlp_cond_head.cond_proj.{j}.weight", None)
+                if attn is not None:
+                    state_dict.setdefault(p + f"cond_head.cond_proj.{j}.weight", attn)
+                if mlp is not None:
+                    state_dict.setdefault(p + f"cond_head.cond_proj.{j + 3}.weight", mlp)
+
+            x = state_dict.pop(p + "ctrl_mlpfusion.fc1_x.weight", None)
+            c = state_dict.pop(p + "ctrl_mlpfusion.fc1_c.weight", None)
+            if x is not None and c is not None:
+                state_dict.setdefault(p + "ctrl_mlpfusion.mlp.fc1.weight", torch.cat((x, c), dim=1))
+            old = state_dict.pop(p + "ctrl_mlpfusion.fc2.weight", None)
+            if old is not None:
+                state_dict.setdefault(p + "ctrl_mlpfusion.mlp.fc2.weight", old)
+
+        ref = "transformer.blocks.0.cond_head.cond_proj."
+        for i in range(1, self.config.n_layers):
+            p = f"transformer.blocks.{i}.cond_head.cond_proj."
+            for j in range(6):
+                k, rk = p + f"{j}.weight", ref + f"{j}.weight"
+                if k not in state_dict and rk in state_dict:
+                    state_dict[k] = state_dict[rk]
+        state_dict = {k: v for k, v in state_dict.items() if ".cond_heads." not in k}
+
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
+
+"""
+TODO: use the below for quantization
+import torch.nn as nn
+
+
+class BufferLinear(nn.Linear):
+    capture = True
+
+    def _load_from_state_dict(self, sd, prefix, *args):
+        if self.capture:
+            keep = {prefix + "weight", prefix + "bias"}
+            for k in list(sd):
+                if k.startswith(prefix) and k not in keep and "." not in k[len(prefix):]:
+                    n = k[len(prefix):]
+                    self.register_buffer(n, sd.pop(k).to(self.weight.device),
+                                         persistent=False)
+        super()._load_from_state_dict(sd, prefix, *args)
+"""
