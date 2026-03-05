@@ -18,7 +18,7 @@ class BaseModel(nn.Module):
         OmegaConf.save(self.config, os.path.join(path, "config.yaml"))
 
     @classmethod
-    def from_pretrained(cls, path: str, cfg=None, device=None):
+    def from_pretrained(cls, path: str, cfg=None, device=None, dtype=None):
         """Load weights and OmegaConf YAML."""
         device = device or "cpu"
 
@@ -31,8 +31,8 @@ class BaseModel(nn.Module):
             cfg = cls.load_config(path)
         model = cls(cfg)
 
-        if device != "cpu":
-            model = model.to(device)
+        if dtype is not None:
+            model = model.to(dtype=dtype, device=device)
 
         # Stream weights straight into `model` (no CPU state_dict first)
         safetensors_path = os.path.join(path, "model.safetensors")

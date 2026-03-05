@@ -63,12 +63,11 @@ class WorldEngine:
             self.prompt_encoder = PromptEncoder(pe_uri, dtype=dtype).to(device).eval()
 
         if load_weights:
-            self.model = WorldModel.from_pretrained(model_uri, cfg=self.model_cfg)
+            self.model = WorldModel.from_pretrained(model_uri, cfg=self.model_cfg, dtype=dtype)
         else:
-            self.model = WorldModel(self.model_cfg)
-        self.model = self.model.to(device=device, dtype=dtype).eval()
-
+            self.model = WorldModel(self.model_cfg).to(dtype=dtype)
         apply_inference_patches(self.model)
+        self.model = self.model.to(device=device).eval()
 
         if quant is not None:
             quantize_model(self.model, quant)

@@ -84,7 +84,6 @@ class InferenceAE:
         return decoded.squeeze(0).permute(1, 2, 0)[..., :3]
 
 
-
 class ChunkedStreamingTAEHV:
     def __init__(self, ae_model, device=None, dtype=torch.bfloat16):
         from taehv import StreamingTAEHV
