@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "world_engine"
 version = "1.5.0"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
   "taehv @ git+https://github.com/madebyollin/taehv.git@7dc60ec6601af2e668e31bc70acc4cb3665e4c22",
   "torch==2.10.0",
