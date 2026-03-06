@@ -10,8 +10,12 @@ from torch import nn
 import torch.nn.functional as F
 
 
-from fbgemm_gpu.experimental.gen_ai.moe import index_shuffling
-import fbgemm_gpu.experimental.gen_ai.moe.gather_scatter  # noqa
+try:
+    from fbgemm_gpu.experimental.gen_ai.moe import index_shuffling
+    import fbgemm_gpu.experimental.gen_ai.moe.gather_scatter  # noqa
+    HAS_FBGEMM = True
+except ImportError:
+    HAS_FBGEMM = False
 
 
 from .attn import Attn, CrossAttention
@@ -257,7 +261,7 @@ class WorldDiTBlock(nn.Module):
         self.config = config
         self.attn = Attn(config, layer_idx)
         if getattr(config, "moe", False):
-            self.mlp = MoE(config)
+            self.mlp = MoE(config) if HAS_FBGEMM else MoEWithoutFBGEMM(config)
         else:
             self.mlp = MLP(config.d_model, config.d_model * config.mlp_ratio, config.d_model)
         self.cond_head = CondHead(config)
