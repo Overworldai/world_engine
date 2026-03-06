@@ -23,8 +23,10 @@ dependencies = [
   "accelerate==1.12.0",
 
   # Triton (platform-specific)
-  "triton; sys_platform == 'linux'",
-  "triton-windows; sys_platform == 'win32'",
+  "triton==3.6.0; sys_platform == 'linux'",
+  # TODO: move back to mainline triton-windows once long-path fix is merged
+  # (see https://github.com/triton-lang/triton-windows/pull/11#issuecomment-4014081904)
+  "triton-windows @ https://github.com/Overworldai/triton-windows/releases/download/v3.6.0-windows-longpath/triton_windows-3.6.0+git7df5604d-cp313-cp313-win_amd64.whl ; sys_platform == 'win32'",
 ]
 
 [tool.setuptools]
