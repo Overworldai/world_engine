@@ -20,6 +20,8 @@ class InferenceAE:
         from safetensors.torch import load_file
         from .ae_nn import AutoEncoder
 
+        device = kwargs.get("device") or "cpu"
+
         try:
             base = pathlib.Path(huggingface_hub.snapshot_download(model_uri))
         except Exception:
@@ -29,8 +31,12 @@ class InferenceAE:
         dec_cfg = OmegaConf.load(base / "decoder_conf.yml").model
         model = AutoEncoder(enc_cfg, dec_cfg)
 
-        enc_sd = load_file(base / "encoder.safetensors", device="cpu")
-        dec_sd = load_file(base / "decoder.safetensors", device="cpu")
+        # probably could be more efficient if we subclass'd all the way down AE to pass device but it's fine...
+        if str(device) != "cpu":
+            model = model.to(device=device)
+
+        enc_sd = load_file(base / "encoder.safetensors", device=device)
+        dec_sd = load_file(base / "decoder.safetensors", device=device)
         model.encoder.load_state_dict(enc_sd, strict=True)
         model.decoder.load_state_dict(dec_sd, strict=True)
 
