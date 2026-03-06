@@ -92,6 +92,9 @@ def patch_cached_noise_conditioning(model) -> None:
 class MergedQKVAttn(Attn):
     def __init__(self, src: Attn, config):
         super().__init__(config, src.layer_idx)          # makes fresh q/k/v/out/etc
+        # Reuse the original shared RoPE module. Creating a new RoPE per patched
+        # layer explodes VRAM because its precomputed cos/sin tables are large.
+        self.rope = src.rope
         self.to(device=src.q_proj.weight.device, dtype=src.q_proj.weight.dtype)
         self.load_state_dict(src.state_dict(), strict=False)  # copies trained weights/buffers
         self.train(src.training)                          # preserve train/eval mode
