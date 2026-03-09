@@ -48,55 +48,54 @@ class WorldEngine:
         quant: None | w8a8 | nvfp4
         model_config_overrides: Dict to override model config values
         """
-        self.device, self.dtype = device, dtype
+        self.device = torch.get_default_device() if device is None else device
+        self.dtype = torch.get_default_dtype() if dtype is None else dtype
 
         self.model_cfg = WorldModel.load_config(model_uri)
 
         if model_config_overrides:
             self.model_cfg.merge_with(model_config_overrides)
 
-        # Model
-        self.vae = get_ae(self.model_cfg.ae_uri, getattr(self.model_cfg, "taehv_ae", False), device=device, dtype=dtype)
+        with torch.device(self.device):
+            # Load Model / Modules
+            self.vae = get_ae(self.model_cfg.ae_uri, getattr(self.model_cfg, "taehv_ae", False), dtype=dtype)
 
-        self.prompt_encoder = None
-        if self.model_cfg.prompt_conditioning is not None:
-            pe_uri = getattr(self.model_cfg, "prompt_encoder_uri", "google/umt5-xl")
-            self.prompt_encoder = PromptEncoder(pe_uri, dtype=dtype).to(device).eval()
+            self.prompt_encoder = None
+            if self.model_cfg.prompt_conditioning is not None:
+                pe_uri = getattr(self.model_cfg, "prompt_encoder_uri", "google/umt5-xl")
+                self.prompt_encoder = PromptEncoder(pe_uri, dtype=dtype).eval()
 
-        if load_weights:
-            self.model = WorldModel.from_pretrained(model_uri, cfg=self.model_cfg, dtype=dtype).eval()
-        else:
-            self.model = WorldModel(self.model_cfg).to(dtype=dtype).eval()
-        apply_inference_patches(self.model)
-        self.model = self.model.to(device=device)
+            self.model = WorldModel.from_pretrained(
+                model_uri, cfg=self.model_cfg, dtype=dtype, load_weights=load_weights
+            ).eval()
+            apply_inference_patches(self.model)
+            if quant is not None:
+                quantize_model(self.model, quant)
 
-        if quant is not None:
-            quantize_model(self.model, quant)
+            self.kv_cache = StaticKVCache(self.model_cfg, batch_size=1, dtype=dtype)
 
-        # Inference Scheduler
-        self.scheduler_sigmas = torch.tensor(self.model_cfg.scheduler_sigmas, device=device, dtype=dtype)
+            # Inference Scheduler
+            self.scheduler_sigmas = torch.tensor(self.model_cfg.scheduler_sigmas, dtype=dtype)
 
-        pH, pW = getattr(self.model_cfg, "patch", [1, 1])
-        self.frm_shape = 1, 1, self.model_cfg.channels, self.model_cfg.height * pH, self.model_cfg.width * pW
+            pH, pW = getattr(self.model_cfg, "patch", [1, 1])
+            self.frm_shape = 1, 1, self.model_cfg.channels, self.model_cfg.height * pH, self.model_cfg.width * pW
 
-        # State
-        self.kv_cache = StaticKVCache(self.model_cfg, batch_size=1, dtype=dtype).to(device)
-        self.frame_ts = torch.tensor([[0]], dtype=torch.long, device=device)
+            # State
+            inference_fps = getattr(self.model_cfg, "inference_fps", self.model_cfg.base_fps)
+            latent_fps = inference_fps / getattr(self.model_cfg, "temporal_compression", 1)
+            self.ts_mult = int(self.model_cfg.base_fps) // latent_fps
+            self.frame_ts = torch.tensor([[0]], dtype=torch.long)
 
-        inference_fps = getattr(self.model_cfg, "inference_fps", self.model_cfg.base_fps)
-        latent_fps = inference_fps / getattr(self.model_cfg, "temporal_compression", 1)
-        self.ts_mult = int(self.model_cfg.base_fps) // latent_fps
+            # Static input context tensors
+            self._ctx = {
+                "button": torch.zeros((1, 1, self.model_cfg.n_buttons), dtype=dtype),
+                "mouse": torch.zeros((1, 1, 2), dtype=dtype),
+                "scroll": torch.zeros((1, 1, 1), dtype=dtype),
+                "frame_timestamp": torch.empty((1, 1), dtype=torch.long),
+                "frame_idx": torch.empty((1, 1), dtype=torch.long),
+            }
 
-        # Static input context tensors
-        self._ctx = {
-            "button": torch.zeros((1, 1, self.model_cfg.n_buttons), device=device, dtype=dtype),
-            "mouse": torch.zeros((1, 1, 2), device=device, dtype=dtype),
-            "scroll": torch.zeros((1, 1, 1), device=device, dtype=dtype),
-            "frame_timestamp": torch.empty((1, 1), device=device, dtype=torch.long),
-            "frame_idx": torch.empty((1, 1), device=device, dtype=torch.long),
-        }
-
-        self._prompt_ctx = {"prompt_emb": None, "prompt_pad_mask": None}
+            self._prompt_ctx = {"prompt_emb": None, "prompt_pad_mask": None}
 
     @torch.inference_mode()
     def reset(self):

@@ -4,13 +4,15 @@ import os
 from omegaconf import OmegaConf
 from safetensors.torch import load_file
 from torch import nn
+import torch
 
 
 class BaseModel(nn.Module):
     @classmethod
-    def from_pretrained(cls, path: str, cfg=None, device=None, dtype=None):
+    def from_pretrained(cls, path: str, cfg=None, device=None, dtype=None, load_weights: bool = True):
         """Load weights and OmegaConf YAML."""
-        device = device or "cpu"
+        device = torch.get_default_device() if device is None else device
+        dtype = torch.get_default_dtype() if dtype is None else dtype
 
         try:
             path = huggingface_hub.snapshot_download(path)
@@ -19,11 +21,11 @@ class BaseModel(nn.Module):
 
         if cfg is None:
             cfg = cls.load_config(path)
-        model = cls(cfg).to(device=device, dtype=dtype)
+        model = cls(cfg).to(dtype=dtype, device=device)
 
-        # Stream weights straight into `model` (no CPU state_dict first)
-        safetensors_path = os.path.join(path, "model.safetensors")
-        model.load_state_dict(load_file(safetensors_path, device=device), strict=True)
+        if load_weights:
+            safetensors_path = os.path.join(path, "model.safetensors")
+            model.load_state_dict(load_file(safetensors_path, device=device), strict=True)
 
         return model
 
