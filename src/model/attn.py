@@ -59,7 +59,7 @@ class OrthoRoPE(NoCastModule):
         assert not getattr(self.config, "has_audio", False)
 
     @torch.autocast("cuda", enabled=False)
-    def forward(self, x, pos_ids, rope_angles):
+    def forward(self, x, rope_angles):
         cos, sin = rope_angles
         x0, x1 = x.float().unfold(-1, 2, 2).unbind(-1)
         y0 = x0 * cos - x1 * sin
@@ -107,7 +107,7 @@ class Attn(nn.Module):
             v = torch.lerp(v, v1.view_as(v), self.v_lamb)
 
         q, k = rms_norm(q), rms_norm(k)
-        q, k = self.rope(q, pos_ids, rope_angles), self.rope(k, pos_ids, rope_angles)
+        q, k = self.rope(q, rope_angles), self.rope(k, rope_angles)
 
         # Update KV-cache in-place
         k, v, bm = kv_cache.upsert(k, v, pos_ids, self.layer_idx)
