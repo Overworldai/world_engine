@@ -28,21 +28,12 @@ class PromptEncoder(nn.Module):
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
     """Callable for text -> UMT5 embedding"""
-    def __init__(self, model_id="google/umt5-xl", dtype=torch.bfloat16, device=None):
+    def __init__(self, model_id="google/umt5-xl", dtype=torch.bfloat16):
         from transformers import AutoTokenizer, UMT5EncoderModel
         super().__init__()
         self.dtype = dtype
         self.tok = AutoTokenizer.from_pretrained(model_id)
-        encoder_kwargs = {"torch_dtype": dtype}
-        if device is not None and str(device) != "cpu":
-            encoder_kwargs["device_map"] = {"": str(device)}
-            encoder_kwargs["low_cpu_mem_usage"] = True
-
-        try:
-            self.encoder = UMT5EncoderModel.from_pretrained(model_id, **encoder_kwargs).eval()
-        except Exception:
-            # Fallback when accelerate/device_map path is unavailable.
-            self.encoder = UMT5EncoderModel.from_pretrained(model_id, torch_dtype=dtype).eval()
+        self.encoder = UMT5EncoderModel.from_pretrained(model_id, torch_dtype=dtype).eval()
 
     @torch.compile
     def encode(self, inputs):
