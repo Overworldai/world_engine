@@ -9,7 +9,7 @@ from rotary_embedding_torch import RotaryEmbedding
 from .nn import rms_norm, NoCastModule
 
 
-class OrthoRoPEAngles(nn.Module):
+class OrthoRoPEAngles(NoCastModule):
     """Functions as a on the fly RoPE angle computer called every fwd pass. Should be setup
     as a module under WordDiT, then each forward pass it computes a shared tuple of (rope_cos, rope_sin) 
     tensors that get passed to every block for their underlying RoPE computations."""
@@ -49,7 +49,7 @@ class OrthoRoPEAngles(nn.Module):
             (x.unsqueeze(-1) * self.xy, y.unsqueeze(-1) * self.xy, t.unsqueeze(-1) * self.inv_t),
             dim=-1,  # [B,T,d_head//2]
         )
-        # Match RoPE.get_angles() output layout: [B, 1, T, D/2]
+        # Returns rope_cos, rope_sin angles of shape [B, 1, T, D/2]
         return freqs.cos()[:, None], freqs.sin()[:, None]
 
 class OrthoRoPE(NoCastModule):
