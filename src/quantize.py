@@ -151,7 +151,7 @@ class FP8Linear(nn.Module):
             if lin.bias is not None
             else None
         )
-        w_amax = lin.weight.data.clone().amax().float().squeeze()
+        w_amax = lin.weight.data.abs().amax()
         w = lin.weight.data.clone().div(w_amax).to(torch.float8_e4m3fn)
         self.register_buffer("w_amax", w_amax)
         self.register_buffer("weightT", w.t())
