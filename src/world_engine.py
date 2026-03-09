@@ -156,8 +156,8 @@ class WorldEngine:
         self._ctx["button"].zero_()
         if ctrl.button:
             self._ctx["button"][..., list(ctrl.button)] = 1.0
-        ctrl.mouse = torch.tensor(ctrl.mouse, device=x.device, dtype=self._ctx["mouse"].dtype)
-        ctrl.scroll_wheel = torch.sign(torch.tensor(ctrl.scroll_wheel, device=x.device, dtype=self._ctx["scroll"].dtype))
+        ctrl.mouse = torch.as_tensor(ctrl.mouse, device=x.device, dtype=self.dtype)
+        ctrl.scroll_wheel = torch.sign(torch.as_tensor(ctrl.scroll_wheel, device=x.device, dtype=self.dtype))
         ctx = self._prep_inputs(x, ctrl)
 
         # prepare prompt conditioning
