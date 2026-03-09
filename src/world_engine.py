@@ -63,7 +63,7 @@ class WorldEngine:
             self.prompt_encoder = PromptEncoder(pe_uri, dtype=dtype).to(device).eval()
 
         if load_weights:
-            self.model = WorldModel.from_pretrained(model_uri, cfg=self.model_cfg)
+            self.model = WorldModel.from_pretrained(model_uri, cfg=self.model_cfg, device=device)
         else:
             self.model = WorldModel(self.model_cfg)
         self.model = self.model.to(device=device, dtype=dtype).eval()

@@ -10,11 +10,15 @@ from torch import nn
 import torch.nn.functional as F
 
 
-from fbgemm_gpu.experimental.gen_ai.moe import index_shuffling
-import fbgemm_gpu.experimental.gen_ai.moe.gather_scatter  # noqa
+try:
+    from fbgemm_gpu.experimental.gen_ai.moe import index_shuffling
+    import fbgemm_gpu.experimental.gen_ai.moe.gather_scatter  # noqa
+    HAS_FBGEMM = True
+except ImportError:
+    HAS_FBGEMM = False
 
 
-from .attn import Attn, CrossAttention
+from .attn import Attn, CrossAttention, OrthoRoPEAngles
 from .nn import AdaLN, ada_gate, ada_rmsnorm, NoiseConditioner
 from .base_model import BaseModel
 
@@ -248,7 +252,7 @@ class WorldDiTBlock(nn.Module):
         self.config = config
         self.attn = Attn(config, layer_idx)
         if getattr(config, "moe", False):
-            self.mlp = MoE(config)
+            self.mlp = MoE(config) if HAS_FBGEMM else MoEWithoutFBGEMM(config)
         else:
             self.mlp = MLP(config.d_model, config.d_model * config.mlp_ratio, config.d_model)
         self.cond_head = CondHead(config)
@@ -258,7 +262,7 @@ class WorldDiTBlock(nn.Module):
         do_ctrl_cond = config.ctrl_conditioning_period is not None and layer_idx % config.ctrl_conditioning_period == 0
         self.ctrl_mlpfusion = MLPFusion(config) if do_ctrl_cond else None
 
-    def forward(self, x, pos_ids, cond, ctx, v, kv_cache=None):
+    def forward(self, x, pos_ids, rope_angles, cond, ctx, v, kv_cache=None):
         """
         0) Causal Frame Attention
         1) Frame->CTX Cross Attention
@@ -269,7 +273,7 @@ class WorldDiTBlock(nn.Module):
         # Self / Causal Attention
         residual = x
         x = ada_rmsnorm(x, s0, b0)
-        x, v = self.attn(x, pos_ids, v, kv_cache=kv_cache)
+        x, v = self.attn(x, pos_ids, rope_angles, v, kv_cache=kv_cache)
         x = ada_gate(x, g0) + residual
 
         # Cross Attention Prompt Conditioning
@@ -295,6 +299,7 @@ class WorldDiT(nn.Module):
         super().__init__()
         self.config = config
         self.blocks = nn.ModuleList([WorldDiTBlock(config, idx) for idx in range(config.n_layers)])
+        self.rope_angles = OrthoRoPEAngles(config)
 
         if self.config.noise_conditioning in ("dit_air", "wan"):
             ref_proj = self.blocks[0].cond_head.cond_proj
@@ -302,15 +307,11 @@ class WorldDiT(nn.Module):
                 for blk_mod, ref_mod in zip(blk.cond_head.cond_proj, ref_proj):
                     blk_mod.weight = ref_mod.weight
 
-        # Shared RoPE buffers
-        ref_rope = self.blocks[0].attn.rope
-        for blk in self.blocks[1:]:
-            blk.attn.rope = ref_rope
-
     def forward(self, x, pos_ids, cond, ctx, kv_cache=None):
+        rope_angles = self.rope_angles(pos_ids)
         v = None
         for i, block in enumerate(self.blocks):
-            x, v = block(x, pos_ids, cond, ctx, v, kv_cache=kv_cache)
+            x, v = block(x, pos_ids, rope_angles, cond, ctx, v, kv_cache=kv_cache)
         return x
 
 
