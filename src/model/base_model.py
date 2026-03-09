@@ -29,10 +29,7 @@ class BaseModel(nn.Module):
 
         if cfg is None:
             cfg = cls.load_config(path)
-        model = cls(cfg)
-
-        if dtype is not None:
-            model = model.to(dtype=dtype, device=device)
+        model = cls(cfg).to(device=device, dtype=dtype)
 
         # Stream weights straight into `model` (no CPU state_dict first)
         safetensors_path = os.path.join(path, "model.safetensors")
