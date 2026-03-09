@@ -37,12 +37,6 @@ class BaseModel(nn.Module):
 
         return model
 
-    def push_to_hub(self, uri: str, **kwargs):
-        huggingface_hub.create_repo(uri, repo_type="model", exist_ok=True, private=True)
-        with tempfile.TemporaryDirectory() as d:
-            self.save_pretrained(d)
-            huggingface_hub.upload_folder(folder_path=d, repo_id=uri, **kwargs)
-
     @staticmethod
     def load_config(path):
         if os.path.isdir(path):
