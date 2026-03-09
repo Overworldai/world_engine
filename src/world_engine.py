@@ -19,9 +19,10 @@ torch._dynamo.config.capture_scalar_outputs = True
 COMPILE_OPTIONS = {
     "max_autotune": True,
     "coordinate_descent_tuning": True,
-    "triton.cudagraphs": True,   # set False to mimic *-no-cudagraphs
-    "epilogue_fusion": True,     # requires max_autotune
-    "shape_padding": True,
+    "triton.cudagraphs": True,
+    # Negligible improvement in throughput:
+    # "epilogue_fusion": True,
+    # "shape_padding": True,
 }
 
 
