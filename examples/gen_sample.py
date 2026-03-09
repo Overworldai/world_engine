@@ -1,22 +1,53 @@
+# python3 examples/gen_sample.py <model_uri>
+# e.g. python3 examples/gen_sample.py Overworld-Models/Lapp0-WP-Mini-1.4.5-BL-Distill
+
 import cv2
-from world_engine import WorldEngine
+import imageio.v3 as iio
+import random
+import sys
+import urllib.request
+import numpy as np
+import torch
+
+from world_engine import WorldEngine, CtrlInput
 
 
-def gen_vid():
-    engine = WorldEngine("OpenWorldLabs/CoDCtl-Causal-Flux-SelfForcing", device="cuda")
-    writer = None
-    for _ in range(240):
-        frame = engine.gen_frame().cpu().numpy()[:, :, ::-1]  # RGB -> BGR for OpenCV
-        writer = writer or cv2.VideoWriter(
-            "out.mp4",
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            60,
-            (frame.shape[1], frame.shape[0])
-        )
-        writer.write(frame)
-
-    writer.release()
+# Create inference engine
+engine = WorldEngine(sys.argv[1], device="cuda")
 
 
-if __name__ == "__main__":
-    gen_vid()
+# Set seed frame
+url = random.choice([
+    "https://gist.github.com/user-attachments/assets/d81c6d26-a838-4afe-9d13-fd67677043c3",
+    "https://gist.github.com/user-attachments/assets/b6d18c38-098e-43b0-8e61-66a16e5d8946",
+    "https://gist.github.com/user-attachments/assets/0734a8c1-3eb4-4ffe-8c37-5665c45ab559",
+    "https://gist.github.com/user-attachments/assets/f9c20d4d-7565-452d-8b02-42a85ea175ed",
+    "https://gist.github.com/user-attachments/assets/68c943a4-008a-4c25-948c-c81ab4c47d21",
+])
+frame = cv2.imdecode(np.frombuffer(urllib.request.urlopen(url).read(), np.uint8), cv2.IMREAD_COLOR)
+frame = cv2.resize(frame, (1024, 512))[:, :, ::-1]
+engine.append_frame(torch.from_numpy(np.repeat(frame[None], 4, axis=0)))
+
+
+# Define sequence of controller inputs applied
+controller_sequence = [
+    # move mouse, jump, do nothing, trigger, do nothing, trigger+jump, do nothing
+    CtrlInput(mouse=[0.2, 0.2]), CtrlInput(button={32}), CtrlInput(), CtrlInput(), CtrlInput(),
+    CtrlInput(button={1}), CtrlInput(), CtrlInput(), CtrlInput(button={1, 32}),
+    CtrlInput(), CtrlInput(), CtrlInput(), CtrlInput(), CtrlInput(), CtrlInput(),
+] * 4
+controller_sequence += [CtrlInput()] * 8
+controller_sequence += (
+    [CtrlInput(button={32})] * 10 +  # forward
+    [CtrlInput(button={65})] * 10 +  # left
+    [CtrlInput(button={68})] * 10 +  # right
+    [CtrlInput(button={83})] * 10   # backwards
+)
+controller_sequence += [CtrlInput()] * 10
+
+
+# Generate frames conditioned on controller inputs
+with iio.imopen("out.mp4", "w", plugin="pyav") as out:
+    out.write(engine.gen_frame().cpu().numpy(), fps=60, codec="libx264")
+    for ctrl in controller_sequence:
+        out.write(engine.gen_frame(ctrl=ctrl).cpu().numpy())
