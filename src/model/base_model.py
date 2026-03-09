@@ -1,22 +1,12 @@
 import huggingface_hub
 import os
-import tempfile
 
 from omegaconf import OmegaConf
-from safetensors.torch import save_file, load_file
+from safetensors.torch import load_file
 from torch import nn
 
 
 class BaseModel(nn.Module):
-    def save_pretrained(self, path: str) -> None:
-        """Save weights (.safetensors) and OmegaConf YAML."""
-        os.makedirs(path, exist_ok=True)
-        save_file(
-            {k: v.detach().cpu() for k, v in self.state_dict().items()},
-            os.path.join(path, "model.safetensors"),
-        )
-        OmegaConf.save(self.config, os.path.join(path, "config.yaml"))
-
     @classmethod
     def from_pretrained(cls, path: str, cfg=None, device=None, dtype=None):
         """Load weights and OmegaConf YAML."""
