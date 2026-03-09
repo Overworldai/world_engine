@@ -5,13 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "world_engine"
 version = "1.5.0"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
   "taehv @ git+https://github.com/madebyollin/taehv.git@7dc60ec6601af2e668e31bc70acc4cb3665e4c22",
   "torch==2.10.0",
   "torchvision==0.25.0",
   "torchaudio==2.10.0",
-  "fbgemm-gpu-genai==1.5.0",
+  "fbgemm-gpu-genai==1.5.0; sys_platform == 'linux'",
   "einops",
   "rotary-embedding-torch>=0.8.8",
   "tensordict==0.10.0",
