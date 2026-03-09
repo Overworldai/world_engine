@@ -126,7 +126,7 @@ class MergedQKVAttn(Attn):
             v = torch.lerp(v, v1.view_as(v), self.v_lamb)
 
         q, k = rms_norm(q), rms_norm(k)
-        q, k = self.rope(q, pos_ids, rope_angles), self.rope(k, pos_ids, rope_angles)
+        q, k = self.rope(q, rope_angles), self.rope(k, rope_angles)
 
         k, v, bm = kv_cache.upsert(k, v, pos_ids, self.layer_idx)
 
