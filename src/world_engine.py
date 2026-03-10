@@ -66,7 +66,7 @@ class WorldEngine:
                 self.prompt_encoder = PromptEncoder(pe_uri, dtype=dtype).eval()
 
             self.model = WorldModel.from_pretrained(
-                model_uri, cfg=self.model_cfg, dtype=dtype, load_weights=load_weights
+                model_uri, cfg=self.model_cfg, device=self.device, dtype=dtype, load_weights=load_weights
             ).eval()
             apply_inference_patches(self.model)
             if quant is not None:
