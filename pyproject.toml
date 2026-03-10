@@ -33,6 +33,7 @@ dependencies = [
 packages = [
   "world_engine",
   "world_engine.model",
+  "world_engine.kernels",
 ]
 
 [tool.setuptools.package-dir]
