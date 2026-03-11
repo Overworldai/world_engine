@@ -11,18 +11,28 @@ import torch.nn.functional as F
 
 
 
-try:
-    # raise ImportError("test custom kernels")
-    from fbgemm_gpu.experimental.gen_ai.moe import index_shuffling
-    import fbgemm_gpu.experimental.gen_ai.moe.gather_scatter  # noqa
-    print("FBGEMM found for MoE kernels! :)")
-    HAS_FBGEMM = True
-except ImportError:
-    from ..kernels import index_shuffling as index_shuffling
-    from ..kernels import grouped_gemm as grouped_gemm
-    from ..kernels import scatter_add_dense_tokens as custom_scatter_add_dense_tokens
-    print("FBGEMM not found, using custom kernel implementations :3")
-    HAS_FBGEMM = False
+# try:
+#     # raise ImportError("test custom kernels")
+#     from fbgemm_gpu.experimental.gen_ai.moe import index_shuffling as fbgemm_index_shuffling
+#     import fbgemm_gpu.experimental.gen_ai.moe.gather_scatter  # noqa
+#     print("FBGEMM found for MoE kernels! :)")
+#     HAS_FBGEMM = True
+# except ImportError:
+#     from ..kernels import index_shuffling as custom_index_shuffling
+#     from ..kernels import grouped_gemm as custom_grouped_gemm
+#     from ..kernels import scatter_add_dense_tokens as custom_scatter_add_dense_tokens
+#     print("FBGEMM not found, using custom kernel implementations :3")
+#     HAS_FBGEMM = False
+
+from fbgemm_gpu.experimental.gen_ai.moe import index_shuffling as fbgemm_index_shuffling
+import fbgemm_gpu.experimental.gen_ai.moe.gather_scatter  # noqa
+print("FBGEMM found for MoE kernels! :)")
+HAS_FBGEMM = True
+from ..kernels import index_shuffling as custom_index_shuffling
+from ..kernels import grouped_gemm as custom_grouped_gemm
+from ..kernels import scatter_add_dense_tokens as custom_scatter_add_dense_tokens
+print("FBGEMM not found, using custom kernel implementations :3")
+HAS_FBGEMM = False
 
 
 from .attn import Attn, CrossAttention, OrthoRoPEAngles
@@ -117,7 +127,7 @@ class MoEWithoutFBGEMM(nn.Module):
         logits = self.router(x) if gate is None else gate.reshape(-1, gate.size(-1))
 
         logits_fp32 = logits.float()
-        token_counts, expert_sorted, src = index_shuffling(logits_fp32, top_k=self.top_k)
+        token_counts, expert_sorted, src = custom_index_shuffling(logits_fp32, top_k=self.top_k)
 
         E = self.expert_in_proj.size(0)
         m_sizes = token_counts[:E].to(torch.int32).contiguous()
@@ -128,7 +138,7 @@ class MoEWithoutFBGEMM(nn.Module):
         weights = (logits_fp32[src, expert_sorted] - logZ[src]).exp().to(x.dtype)
 
         x_grouped = x.index_select(0, torch.cat((src, src[:1]), dim=0))
-        h = grouped_gemm(
+        h = custom_grouped_gemm(
             x_grouped,
             self.expert_in_proj.reshape(-1, self.expert_in_proj.shape[-1]).contiguous(),
             m_sizes,
@@ -140,7 +150,7 @@ class MoEWithoutFBGEMM(nn.Module):
         else:
             h = F.silu(h)
 
-        y_grouped = grouped_gemm(
+        y_grouped = custom_grouped_gemm(
             h,
             self.expert_out_proj.reshape(-1, self.expert_out_proj.shape[-1]).contiguous(),
             m_sizes,
@@ -210,7 +220,7 @@ class MoE(nn.Module):
         logits = self.router(x) if gate is None else gate.reshape(-1, gate.size(-1))
 
         logits32 = logits.float()
-        token_counts, expert_sorted, src = index_shuffling(logits32, top_k=self.top_k)
+        token_counts, expert_sorted, src = fbgemm_index_shuffling(logits32, top_k=self.top_k)
 
         E = self.expert_in_proj.size(0)
         offs = token_counts[:E].cumsum(0).to(torch.int32)
