@@ -3,9 +3,9 @@ from world_engine import WorldEngine
 
 
 def gen_vid():
-    engine = WorldEngine("OpenWorldLabs/CoDCtl-Causal-Flux-SelfForcing", device="cuda")
+    engine = WorldEngine("Overworld/Waypoint-1-Small", device="cuda")
     writer = None
-    for _ in range(240):
+    for _ in range(8):
         frame = engine.gen_frame().cpu().numpy()[:, :, ::-1]  # RGB -> BGR for OpenCV
         writer = writer or cv2.VideoWriter(
             "out.mp4",
