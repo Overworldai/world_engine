@@ -1,9 +1,10 @@
 from typing import Dict, Optional, Set, Tuple
+from networkx import sigma
 import torch
 from torch import Tensor
 from dataclasses import dataclass, field
 
-from .model import WorldModel, StaticKVCache, PromptEncoder
+from .model import HAS_FBGEMM, WorldModel, StaticKVCache, PromptEncoder
 from .ae import get_ae
 from .patch_model import apply_inference_patches
 from .quantize import quantize_model
@@ -167,14 +168,18 @@ class WorldEngine:
             self.set_prompt("An explorable world")
         return {**ctx, **self._prompt_ctx}
 
-    @torch.compile(fullgraph=True, dynamic=False, options=COMPILE_OPTIONS)
     def _denoise_pass(self, x, ctx: Dict[str, Tensor], kv_cache):
         kv_cache.set_frozen(True)
-        sigma = x.new_empty((x.size(0), x.size(1)))
         for step_sig, step_dsig in zip(self.scheduler_sigmas, self.scheduler_sigmas.diff()):
-            v = self.model(x, sigma.fill_(step_sig), **ctx, kv_cache=kv_cache)
+            v = self._denoise_step(x, step_sig, step_dsig, ctx, kv_cache)
             x = x + step_dsig * v
         return x
+
+    @torch.compile(fullgraph=True, dynamic=False, options=COMPILE_OPTIONS)
+    def _denoise_step(self, x, step_sig, step_dsig, ctx: Dict[str, Tensor], kv_cache):
+        sigma = x.new_empty((x.size(0), x.size(1)))
+        sigma.fill_(step_sig)
+        return self.model(x, sigma, **ctx, kv_cache=kv_cache)
 
     @torch.compile(fullgraph=True, dynamic=False, options=COMPILE_OPTIONS)
     def _cache_pass(self, x, ctx: Dict[str, Tensor], kv_cache):

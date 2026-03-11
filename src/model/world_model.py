@@ -10,13 +10,16 @@ from torch import nn
 import torch.nn.functional as F
 
 
+
 try:
+    # raise ImportError("test custom kernels")
     from fbgemm_gpu.experimental.gen_ai.moe import index_shuffling
     import fbgemm_gpu.experimental.gen_ai.moe.gather_scatter  # noqa
     print("FBGEMM found for MoE kernels! :)")
     HAS_FBGEMM = True
 except ImportError:
-    from ..kernels import index_shuffling as custom_index_shuffling
+    from ..kernels import index_shuffling as index_shuffling
+    from ..kernels import grouped_gemm as grouped_gemm
     from ..kernels import scatter_add_dense_tokens as custom_scatter_add_dense_tokens
     print("FBGEMM not found, using custom kernel implementations :3")
     HAS_FBGEMM = False
@@ -114,10 +117,10 @@ class MoEWithoutFBGEMM(nn.Module):
         logits = self.router(x) if gate is None else gate.reshape(-1, gate.size(-1))
 
         logits_fp32 = logits.float()
-        token_counts, expert_sorted, src = custom_index_shuffling(logits_fp32, top_k=self.top_k)
+        token_counts, expert_sorted, src = index_shuffling(logits_fp32, top_k=self.top_k)
 
         E = self.expert_in_proj.size(0)
-        offsets = token_counts[:E].cumsum(0).to(torch.int32)
+        m_sizes = token_counts[:E].to(torch.int32).contiguous()
 
         src = src.to(torch.long)
         expert_sorted = expert_sorted.to(torch.long)
@@ -125,10 +128,10 @@ class MoEWithoutFBGEMM(nn.Module):
         weights = (logits_fp32[src, expert_sorted] - logZ[src]).exp().to(x.dtype)
 
         x_grouped = x.index_select(0, torch.cat((src, src[:1]), dim=0))
-        h = F.grouped_mm(
+        h = grouped_gemm(
             x_grouped,
-            self.expert_in_proj.transpose(-2, -1),
-            offs=offsets
+            self.expert_in_proj.reshape(-1, self.expert_in_proj.shape[-1]).contiguous(),
+            m_sizes,
         )
 
         if self.config.gated_linear:
@@ -137,10 +140,51 @@ class MoEWithoutFBGEMM(nn.Module):
         else:
             h = F.silu(h)
 
-        y_grouped = F.grouped_mm(h, self.expert_out_proj.transpose(-2, -1), offs=offsets)[:-1]
+        y_grouped = grouped_gemm(
+            h,
+            self.expert_out_proj.reshape(-1, self.expert_out_proj.shape[-1]).contiguous(),
+            m_sizes,
+        )[:-1]
         out = torch.zeros_like(x)
         custom_scatter_add_dense_tokens(out, (y_grouped * weights.unsqueeze(-1)).contiguous(), src)
         return out.reshape(orig_shape)
+    
+    # def forward(self, x: torch.Tensor, gate: torch.Tensor | None = None) -> torch.Tensor:
+    #     if self.training or torch.is_grad_enabled():
+    #         raise NotImplementedError("inference only")
+
+    #     orig_shape = x.shape
+    #     x = x.reshape(-1, orig_shape[-1])
+    #     logits = self.router(x) if gate is None else gate.reshape(-1, gate.size(-1))
+
+    #     logits_fp32 = logits.float()
+    #     scores, expert = logits.topk(self.top_k, dim=-1, sorted=False)
+    #     weights = (scores.float() - logits_fp32.logsumexp(dim=-1, keepdim=True)).exp().to(x.dtype)
+
+    #     expert = expert.flatten()
+    #     expert_sorted, sort_idx = expert.sort()
+    #     expert_ids = torch.arange(self.expert_in_proj.size(0), device=expert.device, dtype=expert_sorted.dtype)
+    #     offsets = torch.searchsorted(expert_sorted, expert_ids, right=True).to(torch.int32)
+
+    #     # (1) Pad the *indices* instead of cat-copying x_grouped
+    #     src = sort_idx // self.top_k
+    #     x_grouped = x.index_select(0, torch.cat((src, src[:1]), dim=0))
+    #     h = F.grouped_mm(
+    #         x_grouped,
+    #         self.expert_in_proj.transpose(-2, -1),
+    #         offs=offsets
+    #     )
+    #     h[-1].zero_()  # ensure last row initialized
+
+    #     if self.config.gated_linear:
+    #         gate_act, up = h.chunk(2, dim=-1)
+    #         h = F.silu(gate_act) * up
+    #     else:
+    #         h = F.silu(h)
+
+    #     y_grouped = F.grouped_mm(h, self.expert_out_proj.transpose(-2, -1), offs=offsets)[:-1]
+    #     y = torch.empty_like(y_grouped).index_copy_(0, sort_idx, y_grouped).view(x.size(0), self.top_k, -1)
+    #     return (y * weights.unsqueeze(-1)).sum(dim=1).reshape(orig_shape)
 
 
 class MoE(nn.Module):
