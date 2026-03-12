@@ -6,6 +6,7 @@ Code here all yoinked from https://github.com/pytorch/FBGEMM
 from __future__ import annotations
 
 import torch
+from torch.library import custom_op
 import triton
 import triton.language as tl
 
@@ -184,7 +185,21 @@ def _fbgemm_scatter_add_dense_tokens(
         )
         feature_offset += BLOCK_D_INNER
 
-
+# You might notice several things wrong with this function over here but I assure you these are all intentional and have been double checked.
+# First is that the schema here is intentionally wrong, in that the out_tokens is not marked as mutated in-place as is normally required.
+# https://github.com/pytorch/FBGEMM/blob/e8a65d91591033850537c0ff5e5d2bd78685efed/fbgemm_gpu/experimental/gen_ai/gen_ai/moe/gather_scatter.py#L370
+# It might be unintentional, but the registered schema for FBGEMM's `torch.ops.fbgemm.scatter_add_dense_tokens` omits this mutation annotation, and a side
+# effect of doing so is that the final torch.compiled MoE path is about 3x faster. Why? Best guess is that the mutation annotation is causing the 
+# compiler to be more conservative about optimisation around the out_tokens, which inhibits some optimizations. 
+# Secondly, is that it's a torch.library.custom_op instead of a triton_op, which is also intentional because custom_op prevents torch.compile from tracing
+# into the function. If torch.compile traces into the function instead of treating it as an opaque callable, it ends up "optimising" it in a way that regresses performance.
+# In any case, this means that it's a performance loss to be correct, and that this should definitely be tested for regression depending on future torch package changes.
+@custom_op(
+    "world_engine::scatter_add_dense_tokens",
+    schema="(Tensor out_tokens, Tensor in_tokens, Tensor token_indices, Tensor? valid_token_count=None) -> None",
+    mutates_args=(), 
+    device_types="cuda",
+)
 def scatter_add_dense_tokens(
     out_tokens: torch.Tensor,
     in_tokens: torch.Tensor,
@@ -232,3 +247,13 @@ def scatter_add_dense_tokens(
         BLOCK_D_OUTER,  # pyre-ignore
         BLOCK_D_INNER,  # pyre-ignore
     )
+    return None
+
+@scatter_add_dense_tokens.register_fake
+def _scatter_add_dense_tokens_fake(
+    out_tokens: torch.Tensor,
+    in_tokens: torch.Tensor,
+    token_indices: torch.Tensor,
+    valid_token_count: torch.Tensor | None = None,
+):
+    return None

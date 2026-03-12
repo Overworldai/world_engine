@@ -11,28 +11,17 @@ import torch.nn.functional as F
 
 
 
-# try:
-#     # raise ImportError("test custom kernels")
-#     from fbgemm_gpu.experimental.gen_ai.moe import index_shuffling as fbgemm_index_shuffling
-#     import fbgemm_gpu.experimental.gen_ai.moe.gather_scatter  # noqa
-#     print("FBGEMM found for MoE kernels! :)")
-#     HAS_FBGEMM = True
-# except ImportError:
-#     from ..kernels import index_shuffling as custom_index_shuffling
-#     from ..kernels import grouped_gemm as custom_grouped_gemm
-#     from ..kernels import scatter_add_dense_tokens as custom_scatter_add_dense_tokens
-#     print("FBGEMM not found, using custom kernel implementations :3")
-#     HAS_FBGEMM = False
-
-from fbgemm_gpu.experimental.gen_ai.moe import index_shuffling as fbgemm_index_shuffling
-import fbgemm_gpu.experimental.gen_ai.moe.gather_scatter  # noqa
-print("FBGEMM found for MoE kernels! :)")
-HAS_FBGEMM = True
-from ..kernels import index_shuffling as custom_index_shuffling
-from ..kernels import grouped_gemm as custom_grouped_gemm
-from ..kernels import scatter_add_dense_tokens as custom_scatter_add_dense_tokens
-print("FBGEMM not found, using custom kernel implementations :3")
-HAS_FBGEMM = False
+try:
+    from fbgemm_gpu.experimental.gen_ai.moe import index_shuffling as fbgemm_index_shuffling
+    import fbgemm_gpu.experimental.gen_ai.moe.gather_scatter  # noqa
+    print("FBGEMM found for MoE kernels! :)")
+    HAS_FBGEMM = True
+except ImportError:
+    from ..kernels import index_shuffling as custom_index_shuffling
+    from ..kernels import grouped_gemm as custom_grouped_gemm
+    from ..kernels import scatter_add_dense_tokens as custom_scatter_add_dense_tokens
+    print("FBGEMM not found, using custom kernel implementations :3")
+    HAS_FBGEMM = False
 
 
 from .attn import Attn, CrossAttention, OrthoRoPEAngles
@@ -158,43 +147,6 @@ class MoEWithoutFBGEMM(nn.Module):
         out = torch.zeros_like(x)
         custom_scatter_add_dense_tokens(out, (y_grouped * weights.unsqueeze(-1)).contiguous(), src)
         return out.reshape(orig_shape)
-    
-    # def forward(self, x: torch.Tensor, gate: torch.Tensor | None = None) -> torch.Tensor:
-    #     if self.training or torch.is_grad_enabled():
-    #         raise NotImplementedError("inference only")
-
-    #     orig_shape = x.shape
-    #     x = x.reshape(-1, orig_shape[-1])
-    #     logits = self.router(x) if gate is None else gate.reshape(-1, gate.size(-1))
-
-    #     logits_fp32 = logits.float()
-    #     scores, expert = logits.topk(self.top_k, dim=-1, sorted=False)
-    #     weights = (scores.float() - logits_fp32.logsumexp(dim=-1, keepdim=True)).exp().to(x.dtype)
-
-    #     expert = expert.flatten()
-    #     expert_sorted, sort_idx = expert.sort()
-    #     expert_ids = torch.arange(self.expert_in_proj.size(0), device=expert.device, dtype=expert_sorted.dtype)
-    #     offsets = torch.searchsorted(expert_sorted, expert_ids, right=True).to(torch.int32)
-
-    #     # (1) Pad the *indices* instead of cat-copying x_grouped
-    #     src = sort_idx // self.top_k
-    #     x_grouped = x.index_select(0, torch.cat((src, src[:1]), dim=0))
-    #     h = F.grouped_mm(
-    #         x_grouped,
-    #         self.expert_in_proj.transpose(-2, -1),
-    #         offs=offsets
-    #     )
-    #     h[-1].zero_()  # ensure last row initialized
-
-    #     if self.config.gated_linear:
-    #         gate_act, up = h.chunk(2, dim=-1)
-    #         h = F.silu(gate_act) * up
-    #     else:
-    #         h = F.silu(h)
-
-    #     y_grouped = F.grouped_mm(h, self.expert_out_proj.transpose(-2, -1), offs=offsets)[:-1]
-    #     y = torch.empty_like(y_grouped).index_copy_(0, sort_idx, y_grouped).view(x.size(0), self.top_k, -1)
-    #     return (y * weights.unsqueeze(-1)).sum(dim=1).reshape(orig_shape)
 
 
 class MoE(nn.Module):
