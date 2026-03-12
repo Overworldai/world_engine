@@ -305,7 +305,17 @@ def _run_moe_module_compiled(moe: MoE, x: torch.Tensor) -> torch.Tensor:
 
 def _run_moe_module_compiled_inference(moe: MoE, x: torch.Tensor) -> torch.Tensor:
     with torch.inference_mode():
-        return _run_moe_module_compiled(moe, x)
+        return _run_moe_module_compiled(moe, x).clone()
+
+
+@torch.compile(fullgraph=True, dynamic=False, options=COMPILE_OPTIONS)
+def _run_moe_fallback_module_compiled(moe: MoEWithoutFBGEMM, x: torch.Tensor) -> torch.Tensor:
+    return moe(x)
+
+
+def _run_moe_fallback_module_compiled_inference(moe: MoEWithoutFBGEMM, x: torch.Tensor) -> torch.Tensor:
+    with torch.inference_mode():
+        return _run_moe_fallback_module_compiled(moe, x).clone()
 
 def _require_benchmark_flag(request) -> None:
     if not request.config.getoption("--run-kernel-benchmarks"):
@@ -665,6 +675,55 @@ def test_fbgemm_moe_module_eager_matches_handwritten_eager(
 
 
 @CUDA_ONLY
+@pytest.mark.skipif(not has_fbgemm_moe_kernels(), reason="fbgemm MoE kernels are not available")
+@pytest.mark.parametrize(("n_experts", "top_k", "d_model", "d_hidden"), [(16, 8, 2048, 1024)])
+def test_fbgemm_moe_repeated_run_heads(
+    n_experts: int,
+    top_k: int,
+    d_model: int,
+    d_hidden: int,
+):
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+    moe_fbgemm, _ = _make_moe_modules(
+        n_experts=n_experts,
+        top_k=top_k,
+        d_model=d_model,
+        d_hidden=d_hidden,
+    )
+    x, logits, expert_in_proj, expert_out_proj = _make_moe_inputs(
+        n_experts=n_experts,
+        top_k=top_k,
+        d_model=d_model,
+        d_hidden=d_hidden,
+    )
+    with torch.no_grad():
+        moe_fbgemm.expert_in_proj.copy_(expert_in_proj)
+        moe_fbgemm.expert_out_proj.copy_(expert_out_proj)
+
+    module_1 = _run_moe_module_eager(moe_fbgemm, x.unsqueeze(0), gate=logits.unsqueeze(0)).squeeze(0)
+    module_2 = _run_moe_module_eager(moe_fbgemm, x.unsqueeze(0), gate=logits.unsqueeze(0)).squeeze(0)
+    loaded_1 = _run_loaded_moe_eager(x, logits, expert_in_proj, expert_out_proj, top_k)
+    loaded_2 = _run_loaded_moe_eager(x, logits, expert_in_proj, expert_out_proj, top_k)
+    fbgemm_1 = _run_fbgemm_moe_eager(x, logits, expert_in_proj, expert_out_proj, top_k)
+    fbgemm_2 = _run_fbgemm_moe_eager(x, logits, expert_in_proj, expert_out_proj, top_k)
+
+    for name, lhs, rhs in [
+        ("module", module_1, module_2),
+        ("loaded", loaded_1, loaded_2),
+        ("old_fbgemm", fbgemm_1, fbgemm_2),
+    ]:
+        diff = (lhs.float() - rhs.float()).abs()
+        print(f"\n[{name}] run1 head: {lhs[0, :16].float().cpu().tolist()}")
+        print(f"[{name}] run2 head: {rhs[0, :16].float().cpu().tolist()}")
+        print(f"[{name}] abs diff head: {diff[0, :16].cpu().tolist()}")
+        print(
+            f"[{name}] max_abs_diff={float(diff.max().item()):.6f} "
+            f"mean_abs_diff={float(diff.mean().item()):.6f}"
+        )
+
+
+@CUDA_ONLY
 # @pytest.mark.skipif(not has_fbgemm_moe_kernels(), reason="fbgemm MoE kernels are not available")
 @pytest.mark.parametrize(("n_experts", "top_k", "d_model", "d_hidden"), [(16, 8, 2048, 1024)])
 def test_fbgemm_moe_eager_vs_compiled_timing(
@@ -782,3 +841,41 @@ def test_moe_module_timing_vs_fbgemm_eager_and_compiled(
 
     record_property("moe_module_timing_vs_fbgemm_eager_and_compiled", result)
     print(f"\nmoe module timing vs fbgemm eager and compiled: {result}")
+
+
+@CUDA_ONLY
+@pytest.mark.skipif(not has_fbgemm_moe_kernels(), reason="fbgemm MoE kernels are not available")
+@pytest.mark.parametrize(("n_experts", "top_k", "d_model", "d_hidden"), [(16, 8, 2048, 1024)])
+def test_moe_module_compiled_timing_vs_fbgemm_compiled(
+    n_experts: int,
+    top_k: int,
+    d_model: int,
+    d_hidden: int,
+    record_property,
+    request,
+):
+    _require_benchmark_flag(request)
+    moe_fbgemm, moe_fallback = _make_moe_modules(
+        n_experts=n_experts,
+        top_k=top_k,
+        d_model=d_model,
+        d_hidden=d_hidden,
+    )
+    x = torch.randn((1, 512, d_model), device="cuda", dtype=torch.bfloat16)
+
+    compiled_fbgemm = _run_moe_module_compiled_inference(moe_fbgemm, x)
+    compiled_fallback = _run_moe_fallback_module_compiled_inference(moe_fallback, x)
+    compiled_diff = (compiled_fallback.float() - compiled_fbgemm.float()).abs()
+
+    compiled_fallback_ms = _time_cuda_ms(lambda: _run_moe_fallback_module_compiled_inference(moe_fallback, x))
+    compiled_fbgemm_ms = _time_cuda_ms(lambda: _run_moe_module_compiled_inference(moe_fbgemm, x))
+    result = {
+        "compiled_fallback_ms": round(compiled_fallback_ms, 4),
+        "compiled_fbgemm_ms": round(compiled_fbgemm_ms, 4),
+        "fallback_slowdown_vs_compiled_fbgemm": round(compiled_fallback_ms / compiled_fbgemm_ms, 4),
+        "compiled_max_abs_diff": round(float(compiled_diff.max().item()), 6),
+        "compiled_mean_abs_diff": round(float(compiled_diff.mean().item()), 6),
+    }
+
+    record_property("moe_module_compiled_timing_vs_fbgemm_compiled", result)
+    print(f"\nmoe module compiled timing vs fbgemm compiled: {result}")
