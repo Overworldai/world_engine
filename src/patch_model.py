@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from .model.nn import rms_norm
 from .model.attn import Attn
 from .model.world_model import MLPFusion
-from torch.nn.attention.flex_attention import flex_attention
+from .model.attn_backend import AttnConfig, AttnMeta, world_flex_attn_forward
 
 
 def _bf16_u16(x: Tensor) -> Tensor:
@@ -128,9 +128,18 @@ class MergedQKVAttn(Attn):
         q, k = rms_norm(q), rms_norm(k)
         q, k = self.rope(q, rope_angles), self.rope(k, rope_angles)
 
-        k, v, bm = kv_cache.upsert(k, v, pos_ids, self.layer_idx)
+        k, v, bm, block_written, active_blocks, block_size = kv_cache.upsert(k, v, pos_ids, self.layer_idx)
 
-        y = flex_attention(q, k, v, block_mask=bm, enable_gqa=self.enable_gqa)
+        meta = AttnMeta(
+            flex_block_mask=bm,
+            q_len=q.size(2),
+            kv_len=k.size(2),
+            block_written=block_written,
+            active_blocks=active_blocks,
+            block_size=block_size,
+        )
+        cfg = AttnConfig(causal=True, enable_gqa=self.enable_gqa)
+        y = world_flex_attn_forward(q, k, v, meta, cfg)
 
         if self.gated_attn:
             gates = torch.sigmoid(self.gate_proj(x[..., : self.n_heads]))
@@ -183,3 +192,4 @@ def apply_inference_patches(model) -> None:
     patch_cached_noise_conditioning(model)
     patch_Attn_merge_qkv(model)
     patch_MLPFusion_split(model)
+

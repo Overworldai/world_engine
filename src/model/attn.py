@@ -2,11 +2,10 @@ import torch
 import einops as eo
 from torch import nn
 
-from torch.nn.attention.flex_attention import flex_attention
-
 from rotary_embedding_torch import RotaryEmbedding
 
 from .nn import rms_norm, NoCastModule
+from .attn_backend import AttnConfig, AttnMeta, world_flex_attn_forward
 
 
 class OrthoRoPEAngles(NoCastModule):
@@ -110,10 +109,19 @@ class Attn(nn.Module):
         q, k = self.rope(q, rope_angles), self.rope(k, rope_angles)
 
         # Update KV-cache in-place
-        k, v, bm = kv_cache.upsert(k, v, pos_ids, self.layer_idx)
+        k, v, bm, block_written, active_blocks, block_size = kv_cache.upsert(k, v, pos_ids, self.layer_idx)
 
-        # SDPA -> Attention Gate -> Out Proj
-        y = flex_attention(q, k, v, block_mask=bm, enable_gqa=self.enable_gqa)
+        # SDPA/Flex/Metal attention -> Attention Gate -> Out Proj
+        meta = AttnMeta(
+            flex_block_mask=bm,
+            q_len=q.size(2),
+            kv_len=k.size(2),
+            block_written=block_written,
+            active_blocks=active_blocks,
+            block_size=block_size,
+        )
+        cfg = AttnConfig(causal=True, enable_gqa=self.enable_gqa)
+        y = world_flex_attn_forward(q, k, v, meta, cfg)
         if self.gated_attn:
             gates = torch.sigmoid(self.gate_proj(x[..., :self.n_heads]))
             y = y * gates.permute(0, 2, 1).unsqueeze(-1)
@@ -143,6 +151,12 @@ class CrossAttention(nn.Module):
         k = eo.rearrange(self.k_proj(context), "b t (h d) -> b h t d", h=self.n_heads)
         v = eo.rearrange(self.v_proj(context), "b t (h d) -> b h t d", h=self.n_heads)
         q, k = rms_norm(q), rms_norm(k)
-        out = flex_attention(q, k, v)
+        meta = AttnMeta(
+            flex_block_mask=None,
+            q_len=q.size(2),
+            kv_len=k.size(2),
+        )
+        cfg = AttnConfig(causal=False, enable_gqa=False)
+        out = world_flex_attn_forward(q, k, v, meta, cfg)
         out = out.transpose(1, 2).contiguous().reshape(x.size(0), x.size(1), -1)
         return self.out_proj(out)

@@ -2,6 +2,7 @@ from torch import Tensor
 import torch
 from torch import nn
 from tensordict import TensorDict
+import os
 
 from torch.nn.attention.flex_attention import (
     _DEFAULT_SPARSE_BLOCK_SIZE,
@@ -9,7 +10,7 @@ from torch.nn.attention.flex_attention import (
 )
 
 
-def make_block_mask(T: int, L: int, written: torch.Tensor) -> BlockMask:
+def make_block_mask(T: int, L: int, written: torch.Tensor):
     """
     T: Q length for this frame
     L: KV capacity == written.numel()
@@ -58,7 +59,24 @@ def make_block_mask(T: int, L: int, written: torch.Tensor) -> BlockMask:
         compute_q_blocks=False,  # no backward, avoids the transpose/_ordered_to_dense path
     )
 
-    return bm
+    return bm, block_any.contiguous()
+
+
+def _block_any_for_size(written: torch.Tensor, block_size: int) -> torch.Tensor:
+    kv_blocks = (written.numel() + block_size - 1) // block_size
+    padded = torch.nn.functional.pad(written, (0, kv_blocks * block_size - written.numel()))
+    return padded.view(kv_blocks, block_size).any(-1).contiguous()
+
+
+def _metal_block_size() -> int:
+    env = os.environ.get("WORLD_METAL_BLOCK_SIZE")
+    if env is None:
+        return 4
+    try:
+        parsed = int(env)
+        return parsed if parsed > 0 else 4
+    except ValueError:
+        return 4
 
 
 class LayerKVCache(nn.Module):
@@ -136,7 +154,10 @@ class LayerKVCache(nn.Module):
         mask_written = self._mask_written
         mask_written.copy_(self.written)
         mask_written[ring_idx] = mask_written[ring_idx] & ~write_step
-        bm = make_block_mask(T, self.capacity, mask_written)
+        bm, _ = make_block_mask(T, self.capacity, mask_written)
+        metal_bs = _metal_block_size()
+        block_any = _block_any_for_size(mask_written, metal_bs)
+        active_blocks = torch.nonzero(block_any, as_tuple=False).flatten().to(torch.int32).contiguous()
 
         # Persist current frame into the ring for future queries when unfrozen.
         if not is_frozen:
@@ -146,7 +167,7 @@ class LayerKVCache(nn.Module):
             self.written[dst] = True
 
         k, v = self.kv.unbind(0)
-        return k, v, bm
+        return k, v, bm, block_any.to(torch.uint8), active_blocks, metal_bs
 
 
 class StaticKVCache(nn.Module):

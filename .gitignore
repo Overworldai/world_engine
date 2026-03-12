@@ -11,3 +11,4 @@ docs/_build/
 *.pyc
 __pycache__/
 *.egg-info/
+.build/
