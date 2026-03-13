@@ -32,7 +32,7 @@ url = random.choice([
 ])
 frame = cv2.imdecode(np.frombuffer(urllib.request.urlopen(url).read(), np.uint8), cv2.IMREAD_COLOR)
 frame = cv2.resize(frame, (1024, 512))[:, :, ::-1]
-engine.append_frame(torch.from_numpy(np.repeat(frame[None], 4, axis=0)))
+engine.append_frame(torch.from_numpy(np.repeat(frame[None], 4, axis=0)).to("cuda"))
 
 
 # Define sequence of controller inputs applied
