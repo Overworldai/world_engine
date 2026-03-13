@@ -12,7 +12,7 @@ from world_engine import WorldEngine, CtrlInput
 
 
 # Create inference engine
-engine = WorldEngine(sys.argv[1], device="cuda")
+engine = WorldEngine(sys.argv[1], quant="int4_weights", device="cuda")
 
 
 # Define sequence of controller inputs applied
