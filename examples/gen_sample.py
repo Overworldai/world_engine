@@ -13,7 +13,12 @@ from world_engine import WorldEngine, CtrlInput
 
 
 # Create inference engine
-engine = WorldEngine(sys.argv[1], quant="int4_weights", device="cuda")
+model_config_overrides = {"ae_uri": "Overworld-Models/taehv1_5"}
+model_config_overrides.update({})
+engine = WorldEngine(sys.argv[1], 
+                     model_config_overrides=model_config_overrides,
+                     quant="int4_weights",
+                     device="cuda")
 
 
 # Define sequence of controller inputs applied
