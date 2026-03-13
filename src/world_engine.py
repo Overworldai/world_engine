@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from .model import WorldModel, StaticKVCache, PromptEncoder
 from .ae import get_ae
 from .patch_model import apply_inference_patches
-from .quantize import quantize_model
+from .quantize import quantize_model, quantize_qat_model
 
 
 # Global torch optimizations
@@ -45,7 +45,7 @@ class WorldEngine:
     ):
         """
         model_uri: HF URI or local folder containing model.safetensors and config.yaml
-        quant: None | w8a8 | nvfp4
+        quant: None | fp8_weights | int8_weights | int4_weights 
         model_config_overrides: Dict to override model config values
         """
         self.device = torch.get_default_device() if device is None else device
@@ -70,7 +70,7 @@ class WorldEngine:
             ).eval()
             apply_inference_patches(self.model)
             if quant is not None:
-                quantize_model(self.model, quant)
+                quantize_qat_model(self.model, quant, layers="mlp")
 
             self.kv_cache = StaticKVCache(self.model_cfg, batch_size=1, dtype=dtype)
 

@@ -182,7 +182,7 @@ class FP8Linear(nn.Module):
         )
 
         return result.reshape(x.shape[:-1] + (-1,))
-
+    
 
 def quantize_model(model: nn.Module, quant: str):
     if quant is None:
@@ -208,3 +208,23 @@ def quantize_model(model: nn.Module, quant: str):
             child, quant
         )
     return model
+
+from torchao.quantization import quantize_, Int4WeightOnlyConfig, Int8WeightOnlyConfig, Float8WeightOnlyConfig
+_LAYER_FILTERS = {
+    "mlp":       lambda mod, fqn: isinstance(mod, torch.nn.Linear) and "dit_mlp" in fqn,
+    "attention": lambda mod, fqn: isinstance(mod, torch.nn.Linear) and ".attn." in fqn,
+}
+
+
+def quantize_qat_model(model, config: str, layers: str = None):
+    """Apply QAT in-place. layers: 'mlp', 'attention', or None for all Linear layers."""
+    filter_fn = _LAYER_FILTERS.get(layers) if layers else None
+
+    if config == "int4_weights":
+        qconfig = Int4WeightOnlyConfig(group_size=32)
+    elif config == "int8_weights":
+        qconfig = Int8WeightOnlyConfig()
+    elif config == "fp8_weights":
+        qconfig = Float8WeightOnlyConfig()
+
+    quantize_(model, qconfig, filter_fn=filter_fn)
