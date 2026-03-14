@@ -6,6 +6,7 @@ from safetensors.torch import load_file
 from torch import nn
 import torch
 
+from quantize import apply_qat
 
 class BaseModel(nn.Module):
     @classmethod
@@ -22,6 +23,9 @@ class BaseModel(nn.Module):
         if cfg is None:
             cfg = cls.load_config(path)
         model = cls(cfg).to(dtype=dtype, device=device)
+
+        if cfg.quant is not None:
+            apply_qat(model, quant_config=cfg.quant, layers="mlp", step="prepare")
 
         if load_weights:
             safetensors_path = os.path.join(path, "model.safetensors")
