@@ -209,8 +209,8 @@ def quantize_model(model: nn.Module, quant: str):
         )
     return model
 
-from torchao.quantization import quantize_, Int4WeightOnlyConfig, Int8WeightOnlyConfig, Float8WeightOnlyConfig
-from torchao.quantization.qat import QATConfig, IntxFakeQuantizeConfig, Float8FakeQuantizeConfig, PerTensor
+from torchao.quantization import quantize_, Int4WeightOnlyConfig, Int8WeightOnlyConfig, Float8WeightOnlyConfig, PerTensor
+from torchao.quantization.qat import QATConfig, IntxFakeQuantizeConfig, Float8FakeQuantizeConfig
 
 _LAYER_FILTERS = {
     "mlp":       lambda mod, fqn: isinstance(mod, torch.nn.Linear) and "dit_mlp" in fqn,
