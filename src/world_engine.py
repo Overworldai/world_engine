@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from .model import WorldModel, StaticKVCache, PromptEncoder
 from .ae import get_ae
 from .patch_model import apply_inference_patches
-from .quantize import quantize_model, quantize_qat_model
+from .quantize import quantize_model, apply_ptq_model, apply_qat
 
 
 # Global torch optimizations
@@ -76,7 +76,9 @@ class WorldEngine:
             ).eval()
             apply_inference_patches(self.model)
             if quant is not None:
-                quantize_qat_model(self.model, quant, layers="mlp")
+                # apply_ptq_model(self.model, quant, layers="mlp")
+                apply_qat(self.model, quant_config=quant, layers="mlp", step="convert")
+
 
             self.kv_cache = StaticKVCache(self.model_cfg, batch_size=1, dtype=dtype).to(device=device)
 
