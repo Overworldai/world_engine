@@ -6,7 +6,7 @@ from safetensors.torch import load_file
 from torch import nn
 import torch
 
-from quantize import apply_qat
+from ..quantize import apply_qat
 
 class BaseModel(nn.Module):
     @classmethod
