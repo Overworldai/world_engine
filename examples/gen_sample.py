@@ -13,7 +13,8 @@ from world_engine import WorldEngine, CtrlInput
 
 # Create inference engine
 model_config_overrides = {"ae_uri": "Overworld-Models/taehv1_5",
-                          "taehv_ae": True}
+                          "taehv_ae": True,
+                          "quant": "int4_weights"}
 model_config_overrides.update({})
 engine = WorldEngine(sys.argv[1], 
                      model_config_overrides=model_config_overrides,
