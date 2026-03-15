@@ -1,3 +1,7 @@
+# MoE summary test commands:
+# `uv run pytest -q tests/test_moe_kernels.py -k 'test_moe_implementation_matrix' -s`
+# `uv run pytest -q tests/test_moe_kernels.py -k 'test_moe_implementation_matrix' --run-kernel-benchmarks -s`
+
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -6,6 +10,7 @@ from types import SimpleNamespace
 import statistics
 import sys
 import time
+import traceback
 
 import pytest
 import torch
@@ -25,8 +30,8 @@ except ImportError:
     index_shuffling = None
     scatter_add_dense_tokens = None
     HAS_LOCAL_KERNELS = False
-import src.model.world_model as world_model_module
-from src.model.world_model import MoE, MoEWithoutFBGEMM
+import src.model.moe as moe_module
+from src.model.moe import MoECustomKernels, MoEFBGEMM, MoETorchBaseline
 
 
 CUDA_ONLY = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for MoE kernel tests")
@@ -37,6 +42,11 @@ COMPILE_OPTIONS = {
     "coordinate_descent_tuning": True,
     "triton.cudagraphs": True,
 }
+
+MOE_TEST_BATCH = 4
+FBGEMM_MOE_COMPILE_DISABLED_REASON = (
+    "compiled FBGEMM MoE disabled"
+)
 
 # fbgemm kernels
 def _load_fbgemm_index_shuffling() -> Callable | None:
@@ -86,11 +96,21 @@ def fbgemm_grouped_gemm(
     w: torch.Tensor,
     m_sizes: torch.Tensor,
     use_fast_accum: bool = True,
+    *,
+    _output_tensor: torch.Tensor | None = None,
+    _scatter_add_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     op = _load_fbgemm_grouped_gemm()
     if op is None:
         raise RuntimeError("fbgemm grouped_gemm is not available in this environment")
-    return op(x, w, m_sizes, use_fast_accum=use_fast_accum)
+    return op(
+        x,
+        w,
+        m_sizes,
+        use_fast_accum=use_fast_accum,
+        _output_tensor=_output_tensor,
+        _scatter_add_indices=_scatter_add_indices,
+    )
 
 
 def _canonical_pairs(expert_indices: torch.Tensor, token_indices: torch.Tensor, n_tokens: int) -> torch.Tensor:
@@ -169,6 +189,20 @@ def _make_moe_inputs(
     return x, logits, expert_in_proj, expert_out_proj
 
 
+def _make_moe_scatter_inputs(
+    *,
+    n_tokens: int = 512,
+    n_experts: int = 16,
+    top_k: int = 8,
+    d_model: int = 2048,
+    dtype: torch.dtype = torch.bfloat16,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    scores = torch.randn((n_tokens, n_experts), device="cuda", dtype=torch.float32).contiguous()
+    _token_counts, _expert_sorted, src = index_shuffling(scores, top_k=top_k)
+    in_tokens = torch.randn((n_tokens * top_k, d_model), device="cuda", dtype=dtype).contiguous()
+    return in_tokens, src.to(torch.int64).contiguous()
+
+
 def _make_moe_config(
     *,
     n_experts: int = 16,
@@ -196,6 +230,9 @@ def _make_moe_modules(
     gated_linear: bool = False,
     dtype: torch.dtype = torch.bfloat16,
 ):
+    op = _load_fbgemm_index_shuffling()
+    if op is not None:
+        moe_module.fbgemm_index_shuffling = op
     cfg = _make_moe_config(
         n_experts=n_experts,
         top_k=top_k,
@@ -203,10 +240,65 @@ def _make_moe_modules(
         d_hidden=d_hidden,
         gated_linear=gated_linear,
     )
-    moe_fbgemm = MoE(cfg).eval().to(device="cuda", dtype=dtype)
-    moe_fallback = MoEWithoutFBGEMM(cfg).eval().to(device="cuda", dtype=dtype)
-    moe_fallback.load_state_dict(moe_fbgemm.state_dict())
-    return moe_fbgemm, moe_fallback
+    moe_fbgemm_impl = MoEFBGEMM(cfg).eval().to(device="cuda", dtype=dtype)
+    moe_custom_bf16_impl = MoECustomKernels(cfg, accumulate_in_fp32=False).eval().to(device="cuda", dtype=dtype)
+    moe_custom_fp32_impl = MoECustomKernels(cfg, accumulate_in_fp32=True).eval().to(device="cuda", dtype=dtype)
+    state = moe_fbgemm_impl.state_dict()
+    moe_custom_bf16_impl.load_state_dict(state)
+    moe_custom_fp32_impl.load_state_dict(state)
+    return moe_fbgemm_impl, moe_custom_bf16_impl, moe_custom_fp32_impl
+
+
+def _make_moe_modules_with_baseline(
+    *,
+    n_experts: int = 16,
+    top_k: int = 8,
+    d_model: int = 2048,
+    d_hidden: int = 1024,
+    gated_linear: bool = False,
+    dtype: torch.dtype = torch.bfloat16,
+):
+    op = _load_fbgemm_index_shuffling()
+    if op is not None:
+        moe_module.fbgemm_index_shuffling = op
+    cfg = _make_moe_config(
+        n_experts=n_experts,
+        top_k=top_k,
+        d_model=d_model,
+        d_hidden=d_hidden,
+        gated_linear=gated_linear,
+    )
+    moe_fbgemm_impl = MoEFBGEMM(cfg).eval().to(device="cuda", dtype=dtype)
+    moe_custom_bf16_impl = MoECustomKernels(cfg, accumulate_in_fp32=False).eval().to(device="cuda", dtype=dtype)
+    moe_custom_fp32_impl = MoECustomKernels(cfg, accumulate_in_fp32=True).eval().to(device="cuda", dtype=dtype)
+    moe_baseline = MoETorchBaseline(cfg).eval().to(device="cuda", dtype=dtype)
+    state = moe_fbgemm_impl.state_dict()
+    moe_custom_bf16_impl.load_state_dict(state)
+    moe_custom_fp32_impl.load_state_dict(state)
+    moe_baseline.load_state_dict(state)
+    return moe_fbgemm_impl, moe_custom_bf16_impl, moe_custom_fp32_impl, moe_baseline
+
+
+def _make_forced_moe_case(
+    *,
+    n_experts: int,
+    top_k: int,
+    d_model: int,
+    d_hidden: int,
+    batch: int = MOE_TEST_BATCH,
+):
+    torch.manual_seed(1337)
+    torch.cuda.manual_seed_all(1337)
+
+    x, logits, expert_in_proj, expert_out_proj = _make_moe_inputs(
+        n_experts=n_experts,
+        top_k=top_k,
+        d_model=d_model,
+        d_hidden=d_hidden,
+    )
+    x = x.unsqueeze(0).expand(batch, -1, -1).contiguous()
+    gate = logits.unsqueeze(0).expand(batch, -1, -1).contiguous()
+    return x, gate, expert_in_proj, expert_out_proj
 
 
 def _run_moe_module_eager(
@@ -245,9 +337,11 @@ def _run_custom_moe_eager(
         expert_out_proj.reshape(-1, expert_out_proj.shape[-1]).contiguous(),
         m_sizes,
     )[:-1]
-    out = torch.zeros_like(x)
-    scatter_add_dense_tokens(out, (y_grouped * weights.unsqueeze(-1)).contiguous(), src)
-    return out
+    return scatter_add_dense_tokens(
+        (y_grouped * weights.unsqueeze(-1)).contiguous(),
+        src,
+        n_tokens=x.shape[0],
+    )
 
 
 def _run_fbgemm_moe_eager(
@@ -269,57 +363,126 @@ def _run_fbgemm_moe_eager(
     h = F.grouped_mm(x_grouped, expert_in_proj.transpose(-2, -1), offs=offs)
     h = F.silu(h)
     y_grouped = F.grouped_mm(h, expert_out_proj.transpose(-2, -1), offs=offs)[:-1]
-    out = torch.zeros_like(x)
+    out = torch.zeros((x.shape[0], x.shape[1]), device=x.device, dtype=torch.float32)
     fbgemm_scatter_add_dense_tokens(out, (y_grouped * weights.unsqueeze(-1)).contiguous(), src)
     return out
 
 
-def _run_loaded_moe_eager(
+def _make_real_moe_grouped_state(
     x: torch.Tensor,
     logits: torch.Tensor,
     expert_in_proj: torch.Tensor,
     expert_out_proj: torch.Tensor,
     top_k: int,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     logits_fp32 = logits.float()
-    token_counts, expert_sorted, src = world_model_module.fbgemm_index_shuffling(logits_fp32, top_k=top_k)
-    offs = token_counts[: expert_in_proj.shape[0]].cumsum(0).to(torch.int32)
-    src = src.to(torch.long)
-    expert_sorted = expert_sorted.to(torch.long)
-    log_z = logits_fp32.logsumexp(-1)
-    weights = (logits_fp32[src, expert_sorted] - log_z[src]).exp().to(x.dtype)
+    scores, expert = logits.topk(top_k, dim=-1, sorted=False)
+    weights = (scores.float() - logits_fp32.logsumexp(dim=-1, keepdim=True)).exp().to(x.dtype)
 
+    expert = expert.flatten()
+    expert_sorted, sort_idx = expert.sort()
+    expert_ids = torch.arange(expert_in_proj.shape[0], device=expert.device, dtype=expert_sorted.dtype)
+    offsets = torch.searchsorted(expert_sorted, expert_ids, right=True).to(torch.int32)
+    m_sizes = torch.diff(torch.cat((offsets.new_zeros(1), offsets)), dim=0).to(torch.int32).contiguous()
+    src = (sort_idx // top_k).to(torch.long)
+    weights_sorted = weights.reshape(-1).index_select(0, sort_idx.to(torch.long))
     x_grouped = x.index_select(0, torch.cat((src, src[:1]), dim=0))
-    h = F.grouped_mm(x_grouped, expert_in_proj.transpose(-2, -1), offs=offs)
-    h = F.silu(h)
-    y_grouped = F.grouped_mm(h, expert_out_proj.transpose(-2, -1), offs=offs)[:-1]
-    out = torch.zeros_like(x)
-    torch.ops.fbgemm.scatter_add_dense_tokens(out, (y_grouped * weights.unsqueeze(-1)).contiguous(), src)
+    return x_grouped, offsets, m_sizes, src, weights_sorted, expert_out_proj
+
+
+def _baseline_index_shuffling(
+    logits: torch.Tensor,
+    top_k: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    logits_fp32 = logits.float()
+    _scores, expert = logits_fp32.topk(top_k, dim=-1, sorted=False)
+    expert = expert.flatten()
+    expert_sorted, sort_idx = expert.sort()
+    expert_ids = torch.arange(
+        logits.shape[-1],
+        device=expert.device,
+        dtype=expert_sorted.dtype,
+    )
+    offsets = torch.searchsorted(expert_sorted, expert_ids, right=True).to(torch.int32)
+    token_counts = torch.diff(torch.cat((offsets.new_zeros(1), offsets)), dim=0).to(torch.int32).contiguous()
+    src = (sort_idx // top_k).to(torch.int32)
+    return token_counts, expert_sorted.to(torch.int32), src
+
+
+def _torch_moe_combine_deterministic(
+    weighted_grouped: torch.Tensor,
+    src: torch.Tensor,
+    n_tokens: int,
+) -> torch.Tensor:
+    out = torch.zeros((n_tokens, weighted_grouped.shape[-1]), device=weighted_grouped.device, dtype=weighted_grouped.dtype)
+    for i in range(weighted_grouped.shape[0]):
+        out[src[i]] = out[src[i]] + weighted_grouped[i]
+    return out
+
+
+def _slow_grouped_mm_reference(mat_a: torch.Tensor, mat_b: torch.Tensor, offs: torch.Tensor) -> torch.Tensor:
+    out = torch.zeros((mat_a.shape[0], mat_b.shape[1]), device=mat_a.device, dtype=torch.float32)
+    start = 0
+    for expert_idx, end_tensor in enumerate(offs):
+        end = int(end_tensor.item())
+        if end > start:
+            out[start:end] = mat_a[start:end].float() @ mat_b[expert_idx].transpose(-2, -1).float()
+        start = end
     return out
 
 
 @torch.compile(fullgraph=True, dynamic=False, options=COMPILE_OPTIONS)
-def _run_moe_module_compiled(moe: MoE, x: torch.Tensor) -> torch.Tensor:
-    return moe(x)
+def _run_moe_module_compiled(moe: MoEFBGEMM, x: torch.Tensor, gate: torch.Tensor | None = None) -> torch.Tensor:
+    return moe(x, gate=gate)
 
 
-def _run_moe_module_compiled_inference(moe: MoE, x: torch.Tensor) -> torch.Tensor:
+def _run_moe_module_compiled_inference(moe: MoEFBGEMM, x: torch.Tensor, gate: torch.Tensor | None = None) -> torch.Tensor:
     with torch.inference_mode():
-        return _run_moe_module_compiled(moe, x).clone()
+        return _run_moe_module_compiled(moe, x, gate=gate).clone()
 
 
 @torch.compile(fullgraph=True, dynamic=False, options=COMPILE_OPTIONS)
-def _run_moe_fallback_module_compiled(moe: MoEWithoutFBGEMM, x: torch.Tensor) -> torch.Tensor:
-    return moe(x)
+def _run_moe_custom_module_compiled(
+    moe: MoECustomKernels,
+    x: torch.Tensor,
+    gate: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return moe(x, gate=gate)
 
 
-def _run_moe_fallback_module_compiled_inference(moe: MoEWithoutFBGEMM, x: torch.Tensor) -> torch.Tensor:
+def _run_moe_custom_module_compiled_inference(
+    moe: MoECustomKernels,
+    x: torch.Tensor,
+    gate: torch.Tensor | None = None,
+) -> torch.Tensor:
     with torch.inference_mode():
-        return _run_moe_fallback_module_compiled(moe, x).clone()
+        return _run_moe_custom_module_compiled(moe, x, gate=gate).clone()
+
+
+@torch.compile(fullgraph=True, dynamic=False, options=COMPILE_OPTIONS)
+def _run_moe_baseline_module_compiled(
+    moe: MoETorchBaseline,
+    x: torch.Tensor,
+    gate: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return moe(x, gate=gate)
+
+
+def _run_moe_baseline_module_compiled_inference(
+    moe: MoETorchBaseline,
+    x: torch.Tensor,
+    gate: torch.Tensor | None = None,
+) -> torch.Tensor:
+    with torch.inference_mode():
+        return _run_moe_baseline_module_compiled(moe, x, gate=gate).clone()
 
 def _require_benchmark_flag(request) -> None:
     if not request.config.getoption("--run-kernel-benchmarks"):
         pytest.skip("pass --run-kernel-benchmarks to run kernel timing tests")
+
+
+def _skip_if_fbgemm_module_compile_disabled() -> None:
+    pytest.skip(FBGEMM_MOE_COMPILE_DISABLED_REASON)
 
 
 @CUDA_ONLY
@@ -371,16 +534,68 @@ def test_index_shuffling_matches_fbgemm_groups(n_tokens: int, n_experts: int, to
 
 @CUDA_ONLY
 @LOCAL_KERNELS_ONLY
-@pytest.mark.parametrize(("n_out", "n_in", "width"), [(1024, 2048, 256), (2048, 4096, 512)])
-def test_scatter_add_dense_tokens_matches_reference(n_out: int, n_in: int, width: int):
-    in_tokens = torch.randn(n_in, width, device="cuda", dtype=torch.bfloat16)
-    token_indices = torch.randint(0, n_out, (n_in,), device="cuda", dtype=torch.int64)
+@pytest.mark.parametrize(("n_experts", "top_k", "d_model", "d_hidden"), [(16, 8, 2048, 1024)])
+def test_custom_index_shuffling_matches_baseline_real_moe_case(
+    n_experts: int,
+    top_k: int,
+    d_model: int,
+    d_hidden: int,
+):
+    torch.manual_seed(1337)
+    torch.cuda.manual_seed_all(1337)
 
-    expected = torch.zeros(n_out, width, device="cuda", dtype=torch.float32)
-    actual = torch.zeros(n_out, width, device="cuda", dtype=in_tokens.dtype)
+    _x, logits, _expert_in_proj, _expert_out_proj = _make_moe_inputs(
+        n_experts=n_experts,
+        top_k=top_k,
+        d_model=d_model,
+        d_hidden=d_hidden,
+    )
 
+    baseline_counts, baseline_experts, baseline_src = _baseline_index_shuffling(logits, top_k)
+    custom_counts, custom_experts, custom_src = index_shuffling(logits.float(), top_k=top_k)
+
+    counts_diff = (custom_counts[:n_experts].to(torch.int64) - baseline_counts.to(torch.int64)).abs()
+    expert_diff = (custom_experts.to(torch.int64) - baseline_experts.to(torch.int64)).abs()
+    src_diff = (custom_src.to(torch.int64) - baseline_src.to(torch.int64)).abs()
+    baseline_pairs = torch.stack((baseline_experts, baseline_src), dim=1)
+    custom_pairs = torch.stack((custom_experts, custom_src), dim=1)
+    baseline_pair_key = baseline_pairs[:, 0].to(torch.int64) * logits.shape[0] + baseline_pairs[:, 1].to(torch.int64)
+    custom_pair_key = custom_pairs[:, 0].to(torch.int64) * logits.shape[0] + custom_pairs[:, 1].to(torch.int64)
+    baseline_pairs_sorted = baseline_pairs.index_select(0, torch.argsort(baseline_pair_key))
+    custom_pairs_sorted = custom_pairs.index_select(0, torch.argsort(custom_pair_key))
+
+    print(
+        "\ncustom index_shuffling vs baseline real moe case diffs: "
+        f"max_count_diff={int(counts_diff.max().item())} "
+        f"max_expert_diff={int(expert_diff.max().item())} "
+        f"max_src_diff={int(src_diff.max().item())}"
+    )
+    print(f"baseline experts head: {baseline_experts[:16].cpu().tolist()}")
+    print(f"custom experts head: {custom_experts[:16].cpu().tolist()}")
+    print(f"baseline src head: {baseline_src[:16].cpu().tolist()}")
+    print(f"custom src head: {custom_src[:16].cpu().tolist()}")
+    print(f"baseline sorted pair head: {baseline_pairs_sorted[:16].cpu().tolist()}")
+    print(f"custom sorted pair head: {custom_pairs_sorted[:16].cpu().tolist()}")
+
+    assert torch.equal(custom_counts[:n_experts].cpu(), baseline_counts.cpu())
+    assert torch.equal(custom_experts.cpu(), baseline_experts.cpu())
+    assert torch.equal(custom_pairs_sorted.cpu(), baseline_pairs_sorted.cpu())
+
+
+@CUDA_ONLY
+@LOCAL_KERNELS_ONLY
+@pytest.mark.parametrize(("n_tokens", "n_experts", "top_k", "d_model"), [(512, 16, 8, 256), (1024, 32, 8, 512)])
+def test_scatter_add_dense_tokens_matches_reference(n_tokens: int, n_experts: int, top_k: int, d_model: int):
+    in_tokens, token_indices = _make_moe_scatter_inputs(
+        n_tokens=n_tokens,
+        n_experts=n_experts,
+        top_k=top_k,
+        d_model=d_model,
+    )
+
+    expected = torch.zeros(n_tokens, d_model, device="cuda", dtype=torch.float32)
     expected.index_add_(0, token_indices, in_tokens.float())
-    scatter_add_dense_tokens(actual, in_tokens, token_indices)
+    actual = scatter_add_dense_tokens(in_tokens, token_indices, n_tokens=n_tokens)
 
     torch.testing.assert_close(actual.float(), expected, atol=5e-2, rtol=5e-2)
 
@@ -388,16 +603,18 @@ def test_scatter_add_dense_tokens_matches_reference(n_out: int, n_in: int, width
 @CUDA_ONLY
 @LOCAL_KERNELS_ONLY
 @pytest.mark.skipif(not has_fbgemm_moe_kernels(), reason="fbgemm MoE kernels are not available")
-@pytest.mark.parametrize(("n_out", "n_in", "width"), [(1024, 2048, 256), (2048, 4096, 512)])
-def test_scatter_add_dense_tokens_matches_fbgemm(n_out: int, n_in: int, width: int):
-    in_tokens = torch.randn(n_in, width, device="cuda", dtype=torch.bfloat16)
-    token_indices = torch.randint(0, n_out, (n_in,), device="cuda", dtype=torch.int64)
+@pytest.mark.parametrize(("n_tokens", "n_experts", "top_k", "d_model"), [(512, 16, 8, 256), (1024, 32, 8, 512)])
+def test_scatter_add_dense_tokens_matches_fbgemm(n_tokens: int, n_experts: int, top_k: int, d_model: int):
+    in_tokens, token_indices = _make_moe_scatter_inputs(
+        n_tokens=n_tokens,
+        n_experts=n_experts,
+        top_k=top_k,
+        d_model=d_model,
+    )
 
-    ref = torch.zeros(n_out, width, device="cuda", dtype=in_tokens.dtype)
-    actual = torch.zeros_like(ref)
-
+    ref = torch.zeros(n_tokens, d_model, device="cuda", dtype=torch.float32)
     fbgemm_scatter_add_dense_tokens(ref, in_tokens.contiguous(), token_indices.contiguous())
-    scatter_add_dense_tokens(actual, in_tokens, token_indices)
+    actual = scatter_add_dense_tokens(in_tokens, token_indices, n_tokens=n_tokens)
     diff = (actual.float() - ref.float()).abs()
     max_abs_diff = float(diff.max().item())
     mean_abs_diff = float(diff.mean().item())
@@ -459,6 +676,302 @@ def test_grouped_gemm_eager_vs_torch_grouped_mm(n_experts: int, d_model: int, d_
 
 
 @CUDA_ONLY
+@pytest.mark.skipif(_load_fbgemm_grouped_gemm() is None, reason="fbgemm grouped_gemm is not available")
+@pytest.mark.parametrize(("n_experts", "top_k", "d_model", "d_hidden"), [(16, 8, 2048, 1024)])
+def test_fbgemm_grouped_gemm_vs_torch_grouped_mm_repro(
+    n_experts: int,
+    top_k: int,
+    d_model: int,
+    d_hidden: int,
+):
+    torch.manual_seed(1337)
+    torch.cuda.manual_seed_all(1337)
+
+    x_grouped, w, m_sizes = _make_grouped_gemm_inputs(
+        n_experts,
+        d_model,
+        d_hidden,
+        top_k=top_k,
+    )
+    torch_w = _grouped_gemm_weight_for_torch(w, n_experts, d_hidden)
+    offs = _grouped_gemm_offs(m_sizes)
+    active = int(m_sizes.sum().item())
+
+    torch_out = F.grouped_mm(x_grouped, torch_w, offs=offs)[:active]
+    fbgemm_out = fbgemm_grouped_gemm(x_grouped, w, m_sizes)[:active]
+    diff = (fbgemm_out.float() - torch_out.float()).abs()
+
+    print(f"\nF.grouped_mm head: {torch_out[0, :16].float().cpu().tolist()}")
+    print(f"FBGEMM grouped_gemm head: {fbgemm_out[0, :16].float().cpu().tolist()}")
+    print(
+        "FBGEMM grouped_gemm vs F.grouped_mm diffs: "
+        f"max_abs_diff={float(diff.max().item()):.6f} "
+        f"mean_abs_diff={float(diff.mean().item()):.6f}"
+    )
+
+    assert torch.isfinite(torch_out).all()
+    assert torch.isfinite(fbgemm_out).all()
+
+
+@CUDA_ONLY
+@pytest.mark.skipif(_load_fbgemm_grouped_gemm() is None, reason="fbgemm grouped_gemm is not available")
+@pytest.mark.parametrize("use_fast_accum", [True, False], ids=["fast_accum", "precise_accum"])
+@pytest.mark.parametrize(("n_experts", "top_k", "d_model", "d_hidden"), [(16, 8, 2048, 1024)])
+def test_fbgemm_grouped_gemm_vs_torch_grouped_mm_real_moe_repro(
+    n_experts: int,
+    top_k: int,
+    d_model: int,
+    d_hidden: int,
+    use_fast_accum: bool,
+):
+    torch.manual_seed(1337)
+    torch.cuda.manual_seed_all(1337)
+
+    x, logits, expert_in_proj, expert_out_proj = _make_moe_inputs(
+        n_experts=n_experts,
+        top_k=top_k,
+        d_model=d_model,
+        d_hidden=d_hidden,
+    )
+    x_grouped, offsets, m_sizes, src, weights_sorted, expert_out_proj = _make_real_moe_grouped_state(
+        x,
+        logits,
+        expert_in_proj,
+        expert_out_proj,
+        top_k,
+    )
+    expert_in_proj_flat = expert_in_proj.reshape(-1, expert_in_proj.shape[-1]).contiguous()
+    expert_out_proj_flat = expert_out_proj.reshape(-1, expert_out_proj.shape[-1]).contiguous()
+    expert_out_proj_flat_fp32 = expert_out_proj_flat.float().contiguous()
+
+    torch_h = F.grouped_mm(x_grouped, expert_in_proj.transpose(-2, -1), offs=offsets)
+    torch_h[-1].zero_()
+    fbgemm_h = fbgemm_grouped_gemm(
+        x_grouped,
+        expert_in_proj_flat,
+        m_sizes,
+        use_fast_accum=use_fast_accum,
+    )
+    custom_h = grouped_gemm(
+        x_grouped,
+        expert_in_proj_flat,
+        m_sizes,
+        use_fast_accum=use_fast_accum,
+    )
+    custom_h_fp32 = grouped_gemm(
+        x_grouped,
+        expert_in_proj_flat,
+        m_sizes,
+        use_fast_accum=use_fast_accum,
+        fp32_output=True,
+    )
+    slow_h = _slow_grouped_mm_reference(x_grouped, expert_in_proj, offsets)
+    slow_h[-1].zero_()
+    h_diff = (fbgemm_h.float() - slow_h.float()).abs()
+    custom_h_diff = (custom_h.float() - slow_h.float()).abs()
+    custom_h_fp32_diff = (custom_h_fp32.float() - slow_h.float()).abs()
+
+    fbgemm_h[-1].zero_()
+    custom_h[-1].zero_()
+    custom_h_fp32[-1].zero_()
+    torch_h_act = F.silu(torch_h)
+    fbgemm_h_act = F.silu(fbgemm_h)
+    custom_h_act = F.silu(custom_h)
+    custom_h_fp32_act = F.silu(custom_h_fp32)
+    slow_h_act = F.silu(slow_h)
+    torch_y = F.grouped_mm(torch_h_act, expert_out_proj.transpose(-2, -1), offs=offsets)[:-1]
+    slow_y = _slow_grouped_mm_reference(slow_h_act, expert_out_proj, offsets)[:-1]
+    fbgemm_y = fbgemm_grouped_gemm(
+        fbgemm_h_act,
+        expert_out_proj_flat,
+        m_sizes,
+        use_fast_accum=use_fast_accum,
+    )[:-1]
+    custom_y = grouped_gemm(
+        custom_h_act,
+        expert_out_proj_flat,
+        m_sizes,
+        use_fast_accum=use_fast_accum,
+    )[:-1]
+    custom_y_fp32 = grouped_gemm(
+        custom_h_fp32_act,
+        expert_out_proj_flat_fp32,
+        m_sizes,
+        use_fast_accum=use_fast_accum,
+        fp32_output=True,
+    )[:-1]
+    y_diff = (fbgemm_y.float() - slow_y.float()).abs()
+    custom_y_diff = (custom_y.float() - slow_y.float()).abs()
+    custom_y_fp32_diff = (custom_y_fp32.float() - slow_y.float()).abs()
+
+    torch_out = _torch_moe_combine_deterministic(
+        (torch_y * weights_sorted.unsqueeze(-1)).contiguous(),
+        src,
+        x.shape[0],
+    )
+    fbgemm_out = _torch_moe_combine_deterministic(
+        (fbgemm_y * weights_sorted.unsqueeze(-1)).contiguous(),
+        src,
+        x.shape[0],
+    )
+    custom_out = _torch_moe_combine_deterministic(
+        (custom_y * weights_sorted.unsqueeze(-1)).contiguous(),
+        src,
+        x.shape[0],
+    )
+    slow_out = _torch_moe_combine_deterministic(
+        (slow_y * weights_sorted.unsqueeze(-1).float()).contiguous(),
+        src,
+        x.shape[0],
+    )
+    custom_out_fp32 = _torch_moe_combine_deterministic(
+        (custom_y_fp32 * weights_sorted.unsqueeze(-1).float()).contiguous(),
+        src,
+        x.shape[0],
+    )
+    out_diff = (fbgemm_out.float() - slow_out.float()).abs()
+    custom_out_diff = (custom_out.float() - slow_out.float()).abs()
+    custom_out_fp32_diff = (custom_out_fp32.float() - slow_out.float()).abs()
+    custom_out_fp32_bf16_diff = (
+        custom_out_fp32.to(torch.bfloat16).float() - slow_out.to(torch.bfloat16).float()
+    ).abs()
+
+    print(f"\nreal moe grouped_gemm repro use_fast_accum={use_fast_accum}")
+    print(f"real moe slow reference h head: {slow_h[0, :16].float().cpu().tolist()}")
+    print(f"real moe F.grouped_mm h head: {torch_h[0, :16].float().cpu().tolist()}")
+    print(f"real moe FBGEMM grouped_gemm h head: {fbgemm_h[0, :16].float().cpu().tolist()}")
+    print(f"real moe custom grouped_gemm h head: {custom_h[0, :16].float().cpu().tolist()}")
+    print(f"real moe custom grouped_gemm fp32-output h head: {custom_h_fp32[0, :16].float().cpu().tolist()}")
+    print(
+        "real moe FBGEMM grouped_gemm first-stage diffs vs slow reference: "
+        f"max_abs_diff={float(h_diff.max().item()):.6f} "
+        f"mean_abs_diff={float(h_diff.mean().item()):.6f}"
+    )
+    print(
+        "real moe custom grouped_gemm first-stage diffs vs slow reference: "
+        f"max_abs_diff={float(custom_h_diff.max().item()):.6f} "
+        f"mean_abs_diff={float(custom_h_diff.mean().item()):.6f}"
+    )
+    print(
+        "real moe custom grouped_gemm fp32-output first-stage diffs vs slow reference: "
+        f"max_abs_diff={float(custom_h_fp32_diff.max().item()):.6f} "
+        f"mean_abs_diff={float(custom_h_fp32_diff.mean().item()):.6f}"
+    )
+    print(
+        "real moe FBGEMM grouped_gemm second-stage diffs vs slow reference: "
+        f"max_abs_diff={float(y_diff.max().item()):.6f} "
+        f"mean_abs_diff={float(y_diff.mean().item()):.6f}"
+    )
+    print(
+        "real moe custom grouped_gemm second-stage diffs vs slow reference: "
+        f"max_abs_diff={float(custom_y_diff.max().item()):.6f} "
+        f"mean_abs_diff={float(custom_y_diff.mean().item()):.6f}"
+    )
+    print(
+        "real moe custom grouped_gemm fp32-output second-stage diffs vs slow reference: "
+        f"max_abs_diff={float(custom_y_fp32_diff.max().item()):.6f} "
+        f"mean_abs_diff={float(custom_y_fp32_diff.mean().item()):.6f}"
+    )
+    print(
+        "real moe FBGEMM grouped_gemm final combined diffs vs slow reference: "
+        f"max_abs_diff={float(out_diff.max().item()):.6f} "
+        f"mean_abs_diff={float(out_diff.mean().item()):.6f}"
+    )
+    print(
+        "real moe custom grouped_gemm final combined diffs vs slow reference: "
+        f"max_abs_diff={float(custom_out_diff.max().item()):.6f} "
+        f"mean_abs_diff={float(custom_out_diff.mean().item()):.6f}"
+    )
+    print(
+        "real moe custom grouped_gemm fp32-output final combined diffs vs slow reference: "
+        f"max_abs_diff={float(custom_out_fp32_diff.max().item()):.6f} "
+        f"mean_abs_diff={float(custom_out_fp32_diff.mean().item()):.6f}"
+    )
+    print(
+        "real moe custom grouped_gemm fp32-output final combined diffs vs slow reference after bf16 cast: "
+        f"max_abs_diff={float(custom_out_fp32_bf16_diff.max().item()):.6f} "
+        f"mean_abs_diff={float(custom_out_fp32_bf16_diff.mean().item()):.6f}"
+    )
+
+    assert torch.isfinite(torch_out).all()
+    assert torch.isfinite(fbgemm_out).all()
+    assert torch.isfinite(custom_out).all()
+    assert torch.isfinite(custom_out_fp32).all()
+
+
+@CUDA_ONLY
+@pytest.mark.parametrize(("n_experts", "top_k", "d_model", "d_hidden"), [(16, 8, 2048, 1024)])
+def test_torch_grouped_mm_vs_slow_reference_real_moe_repro(
+    n_experts: int,
+    top_k: int,
+    d_model: int,
+    d_hidden: int,
+):
+    torch.manual_seed(1337)
+    torch.cuda.manual_seed_all(1337)
+
+    x, logits, expert_in_proj, expert_out_proj = _make_moe_inputs(
+        n_experts=n_experts,
+        top_k=top_k,
+        d_model=d_model,
+        d_hidden=d_hidden,
+    )
+    x_grouped, offsets, _m_sizes, src, weights_sorted, expert_out_proj = _make_real_moe_grouped_state(
+        x,
+        logits,
+        expert_in_proj,
+        expert_out_proj,
+        top_k,
+    )
+
+    torch_h = F.grouped_mm(x_grouped, expert_in_proj.transpose(-2, -1), offs=offsets)
+    torch_h[-1].zero_()
+    slow_h = _slow_grouped_mm_reference(x_grouped, expert_in_proj, offsets)
+    slow_h[-1].zero_()
+    h_diff = (torch_h.float() - slow_h.float()).abs()
+
+    torch_h_act = F.silu(torch_h)
+    slow_h_act = F.silu(slow_h)
+    torch_y = F.grouped_mm(torch_h_act, expert_out_proj.transpose(-2, -1), offs=offsets)[:-1]
+    slow_y = _slow_grouped_mm_reference(slow_h_act, expert_out_proj, offsets)[:-1]
+    y_diff = (torch_y.float() - slow_y.float()).abs()
+
+    torch_out = _torch_moe_combine_deterministic(
+        (torch_y * weights_sorted.unsqueeze(-1)).contiguous(),
+        src,
+        x.shape[0],
+    )
+    slow_out = _torch_moe_combine_deterministic(
+        (slow_y * weights_sorted.unsqueeze(-1).float()).contiguous(),
+        src,
+        x.shape[0],
+    )
+    out_diff = (torch_out.float() - slow_out.float()).abs()
+
+    print(f"\nreal moe F.grouped_mm vs slow reference")
+    print(f"F.grouped_mm h head: {torch_h[0, :16].float().cpu().tolist()}")
+    print(f"slow reference h head: {slow_h[0, :16].float().cpu().tolist()}")
+    print(
+        "F.grouped_mm first-stage diffs vs slow reference: "
+        f"max_abs_diff={float(h_diff.max().item()):.6f} "
+        f"mean_abs_diff={float(h_diff.mean().item()):.6f}"
+    )
+    print(
+        "F.grouped_mm second-stage diffs vs slow reference: "
+        f"max_abs_diff={float(y_diff.max().item()):.6f} "
+        f"mean_abs_diff={float(y_diff.mean().item()):.6f}"
+    )
+    print(
+        "F.grouped_mm final combined diffs vs slow reference: "
+        f"max_abs_diff={float(out_diff.max().item()):.6f} "
+        f"mean_abs_diff={float(out_diff.mean().item()):.6f}"
+    )
+
+    assert torch.isfinite(torch_out).all()
+    assert torch.isfinite(slow_out).all()
+
+
+@CUDA_ONLY
 @LOCAL_KERNELS_ONLY
 @pytest.mark.parametrize(("n_tokens", "n_experts", "top_k"), [(4096, 32, 4), (16384, 128, 4)])
 def test_index_shuffling_timing(n_tokens: int, n_experts: int, top_k: int, record_property, request):
@@ -478,22 +991,32 @@ def test_index_shuffling_timing(n_tokens: int, n_experts: int, top_k: int, recor
 
 @CUDA_ONLY
 @LOCAL_KERNELS_ONLY
-@pytest.mark.parametrize(("n_out", "n_in", "width"), [(4096, 16384, 512), (8192, 32768, 1024)])
-def test_scatter_add_dense_tokens_timing(n_out: int, n_in: int, width: int, record_property, request):
+@pytest.mark.parametrize(("n_tokens", "n_experts", "top_k", "d_model"), [(4096, 32, 4, 512), (8192, 128, 4, 1024)])
+def test_scatter_add_dense_tokens_timing(
+    n_tokens: int,
+    n_experts: int,
+    top_k: int,
+    d_model: int,
+    record_property,
+    request,
+):
     _require_benchmark_flag(request)
-    in_tokens = torch.randn(n_in, width, device="cuda", dtype=torch.bfloat16).contiguous()
-    token_indices = torch.randint(0, n_out, (n_in,), device="cuda", dtype=torch.int64).contiguous()
+    in_tokens, token_indices = _make_moe_scatter_inputs(
+        n_tokens=n_tokens,
+        n_experts=n_experts,
+        top_k=top_k,
+        d_model=d_model,
+    )
 
     def run_custom():
-        out = torch.zeros(n_out, width, device="cuda", dtype=in_tokens.dtype)
-        scatter_add_dense_tokens(out, in_tokens, token_indices)
+        scatter_add_dense_tokens(in_tokens, token_indices, n_tokens=n_tokens)
 
     custom_ms = _time_cuda_ms(run_custom)
     result = {"custom_ms": round(custom_ms, 4)}
 
     if has_fbgemm_moe_kernels():
         def run_fbgemm():
-            out = torch.zeros(n_out, width, device="cuda", dtype=in_tokens.dtype)
+            out = torch.zeros(n_tokens, d_model, device="cuda", dtype=torch.float32)
             fbgemm_scatter_add_dense_tokens(out, in_tokens, token_indices)
 
         fbgemm_ms = _time_cuda_ms(run_fbgemm)
@@ -552,10 +1075,9 @@ def test_grouped_gemm_eager_vs_torch_grouped_mm_timing(
 
 
 @CUDA_ONLY
-@LOCAL_KERNELS_ONLY
 @pytest.mark.skipif(not has_fbgemm_moe_kernels(), reason="fbgemm MoE kernels are not available")
 @pytest.mark.parametrize(("n_experts", "top_k", "d_model", "d_hidden"), [(16, 8, 2048, 1024)])
-def test_moe_eager_timing_vs_fbgemm(
+def test_moe_implementation_matrix(
     n_experts: int,
     top_k: int,
     d_model: int,
@@ -563,319 +1085,155 @@ def test_moe_eager_timing_vs_fbgemm(
     record_property,
     request,
 ):
-    _require_benchmark_flag(request)
-    x, logits, expert_in_proj, expert_out_proj = _make_moe_inputs(
+    x, gate, expert_in_proj, expert_out_proj = _make_forced_moe_case(
         n_experts=n_experts,
         top_k=top_k,
         d_model=d_model,
         d_hidden=d_hidden,
     )
-
-    custom_out = _run_custom_moe_eager(x, logits, expert_in_proj, expert_out_proj, top_k)
-    moe_fbgemm, moe_fallback = _make_moe_modules(
-        n_experts=n_experts,
-        top_k=top_k,
-        d_model=d_model,
-        d_hidden=d_hidden,
-    )
-    with torch.no_grad():
-        moe_fbgemm.expert_in_proj.copy_(expert_in_proj)
-        moe_fbgemm.expert_out_proj.copy_(expert_out_proj)
-        moe_fallback.expert_in_proj.copy_(expert_in_proj)
-        moe_fallback.expert_out_proj.copy_(expert_out_proj)
-    fbgemm_out = _run_moe_module_eager(moe_fbgemm, x.unsqueeze(0), gate=logits.unsqueeze(0)).squeeze(0)
-    diff = (custom_out.float() - fbgemm_out.float()).abs()
-
-    custom_ms = _time_cuda_ms(lambda: _run_custom_moe_eager(x, logits, expert_in_proj, expert_out_proj, top_k))
-    fbgemm_ms = _time_cuda_ms(lambda: _run_moe_module_eager(moe_fbgemm, x.unsqueeze(0), gate=logits.unsqueeze(0)))
-    result = {
-        "custom_ms": round(custom_ms, 4),
-        "fbgemm_ms": round(fbgemm_ms, 4),
-        "slowdown_vs_fbgemm": round(custom_ms / fbgemm_ms, 4),
-        "max_abs_diff": round(float(diff.max().item()), 6),
-        "mean_abs_diff": round(float(diff.mean().item()), 6),
-    }
-
-    record_property("moe_eager_timing_vs_fbgemm", result)
-    print(f"\nmoe eager timing vs fbgemm: {result}")
-
-
-@CUDA_ONLY
-@pytest.mark.skipif(not has_fbgemm_moe_kernels(), reason="fbgemm MoE kernels are not available")
-@pytest.mark.parametrize(("n_experts", "top_k", "d_model", "d_hidden"), [(16, 8, 2048, 1024)])
-def test_fbgemm_moe_module_eager_matches_handwritten_eager(
-    n_experts: int,
-    top_k: int,
-    d_model: int,
-    d_hidden: int,
-):
-    moe_fbgemm, _ = _make_moe_modules(
-        n_experts=n_experts,
-        top_k=top_k,
-        d_model=d_model,
-        d_hidden=d_hidden,
-    )
-    x, logits, expert_in_proj, expert_out_proj = _make_moe_inputs(
+    moe_fbgemm_impl, moe_custom_bf16_impl, moe_custom_fp32_impl, moe_baseline = _make_moe_modules_with_baseline(
         n_experts=n_experts,
         top_k=top_k,
         d_model=d_model,
         d_hidden=d_hidden,
     )
     with torch.no_grad():
-        moe_fbgemm.expert_in_proj.copy_(expert_in_proj)
-        moe_fbgemm.expert_out_proj.copy_(expert_out_proj)
+        moe_fbgemm_impl.expert_in_proj.copy_(expert_in_proj)
+        moe_fbgemm_impl.expert_out_proj.copy_(expert_out_proj)
+        moe_custom_bf16_impl.expert_in_proj.copy_(expert_in_proj)
+        moe_custom_bf16_impl.expert_out_proj.copy_(expert_out_proj)
+        moe_custom_fp32_impl.expert_in_proj.copy_(expert_in_proj)
+        moe_custom_fp32_impl.expert_out_proj.copy_(expert_out_proj)
+        moe_baseline.expert_in_proj.copy_(expert_in_proj)
+        moe_baseline.expert_out_proj.copy_(expert_out_proj)
 
-    module_out = _run_moe_module_eager(moe_fbgemm, x.unsqueeze(0), gate=logits.unsqueeze(0)).squeeze(0)
-    module_out_repeat = _run_moe_module_eager(moe_fbgemm, x.unsqueeze(0), gate=logits.unsqueeze(0)).squeeze(0)
-    loaded_out = _run_loaded_moe_eager(x, logits, expert_in_proj, expert_out_proj, top_k)
-    loaded_out_repeat = _run_loaded_moe_eager(x, logits, expert_in_proj, expert_out_proj, top_k)
-    fbgemm_out = _run_fbgemm_moe_eager(x, logits, expert_in_proj, expert_out_proj, top_k)
-    module_self_diff = (module_out.float() - module_out_repeat.float()).abs()
-    loaded_self_diff = (loaded_out.float() - loaded_out_repeat.float()).abs()
-    loaded_diff = (module_out.float() - loaded_out.float()).abs()
-    fbgemm_diff = (module_out.float() - fbgemm_out.float()).abs()
+    implementations = [
+        ("fbgemm", moe_fbgemm_impl, _run_moe_module_compiled_inference),
+        ("custom_bf16", moe_custom_bf16_impl, _run_moe_custom_module_compiled_inference),
+        ("custom_fp32", moe_custom_fp32_impl, _run_moe_custom_module_compiled_inference),
+        ("baseline", moe_baseline, _run_moe_baseline_module_compiled_inference),
+    ]
+    eager_baseline = _run_moe_module_eager(moe_baseline, x, gate=gate)
+    run_timing = request.config.getoption("--run-kernel-benchmarks")
+    result = {}
+    rows: list[tuple[str, str, str, str, str, str, str, str, str, str, str, str]] = []
+    compiled_failures: list[tuple[str, str]] = []
 
-    print(
-        f"\nworld_model symbols: "
-        f"fbgemm_index_shuffling={world_model_module.fbgemm_index_shuffling!r} "
-        f"custom_index_shuffling={world_model_module.custom_index_shuffling!r} "
-        f"scatter_add={torch.ops.fbgemm.scatter_add_dense_tokens!r}"
-    )
-    print(
-        f"module self diffs: "
-        f"max_abs_diff={float(module_self_diff.max().item()):.6f} "
-        f"mean_abs_diff={float(module_self_diff.mean().item()):.6f}"
-    )
-    print(
-        f"loaded handwritten self diffs: "
-        f"max_abs_diff={float(loaded_self_diff.max().item()):.6f} "
-        f"mean_abs_diff={float(loaded_self_diff.mean().item()):.6f}"
-    )
-    print(
-        f"module vs loaded handwritten diffs: "
-        f"max_abs_diff={float(loaded_diff.max().item()):.6f} "
-        f"mean_abs_diff={float(loaded_diff.mean().item()):.6f}"
-    )
-    print(
-        f"module vs old fbgemm handwritten diffs: "
-        f"max_abs_diff={float(fbgemm_diff.max().item()):.6f} "
-        f"mean_abs_diff={float(fbgemm_diff.mean().item()):.6f}"
-    )
+    for name, module, compiled_runner in implementations:
+        eager_out = _run_moe_module_eager(module, x, gate=gate)
+        eager_repeat = _run_moe_module_eager(module, x, gate=gate)
+        eager_self_diff = (eager_out.float() - eager_repeat.float()).abs()
+        eager_vs_baseline = (eager_out.float() - eager_baseline.float()).abs()
+        eager_ms_str = "n/a"
+        compiled_ms_str = "n/a"
+        speedup_str = "n/a"
 
-    max_self_max = max(
-        float(module_self_diff.max().item()),
-        float(loaded_self_diff.max().item()),
-    )
-    max_self_mean = max(
-        float(module_self_diff.mean().item()),
-        float(loaded_self_diff.mean().item()),
-    )
-    assert float(loaded_diff.max().item()) <= max_self_max + 8.0
-    assert float(loaded_diff.mean().item()) <= max_self_mean + 0.05
+        entry = {
+            "eager_self_max_abs_diff": round(float(eager_self_diff.max().item()), 6),
+            "eager_self_mean_abs_diff": round(float(eager_self_diff.mean().item()), 6),
+            "eager_max_abs_diff_vs_baseline": round(float(eager_vs_baseline.max().item()), 6),
+            "eager_mean_abs_diff_vs_baseline": round(float(eager_vs_baseline.mean().item()), 6),
+        }
+        if run_timing:
+            eager_ms = _time_cuda_ms(lambda m=module: _run_moe_module_eager(m, x, gate=gate))
+            entry["eager_ms"] = round(eager_ms, 4)
+            eager_ms_str = f"{entry['eager_ms']:.4f}"
 
+        compiled_vs_baseline_max_str = "n/a"
+        compiled_vs_baseline_mean_str = "n/a"
+        compiled_vs_eager_max_str = "n/a"
+        compiled_vs_eager_mean_str = "n/a"
+        compiled_status = "ok"
+        try:
+            compiled_out = compiled_runner(module, x, gate=gate)
+            compiled_vs_baseline = (compiled_out.float() - eager_baseline.float()).abs()
+            compiled_vs_eager = (compiled_out.float() - eager_out.float()).abs()
+            entry.update(
+                {
+                    "compiled_max_abs_diff_vs_baseline": round(float(compiled_vs_baseline.max().item()), 6),
+                    "compiled_mean_abs_diff_vs_baseline": round(float(compiled_vs_baseline.mean().item()), 6),
+                    "compiled_max_abs_diff_vs_eager": round(float(compiled_vs_eager.max().item()), 6),
+                    "compiled_mean_abs_diff_vs_eager": round(float(compiled_vs_eager.mean().item()), 6),
+                }
+            )
+            if run_timing:
+                compiled_ms = _time_cuda_ms(lambda m=module, r=compiled_runner: r(m, x, gate=gate))
+                entry["compiled_ms"] = round(compiled_ms, 4)
+                entry["compiled_speedup_vs_eager"] = round(eager_ms / compiled_ms, 4)
+                compiled_ms_str = f"{entry['compiled_ms']:.4f}"
+                speedup_str = f"{entry['compiled_speedup_vs_eager']:.3f}x"
+            compiled_vs_baseline_max_str = f"{entry['compiled_max_abs_diff_vs_baseline']:.6f}"
+            compiled_vs_baseline_mean_str = f"{entry['compiled_mean_abs_diff_vs_baseline']:.6f}"
+            compiled_vs_eager_max_str = f"{entry['compiled_max_abs_diff_vs_eager']:.6f}"
+            compiled_vs_eager_mean_str = f"{entry['compiled_mean_abs_diff_vs_eager']:.6f}"
+            assert torch.isfinite(compiled_out).all()
+        except Exception as exc:
+            if name == "baseline":
+                compiled_status = "expected:_slow_grouped_mm_not_compileable"
+            else:
+                compiled_status = f"unavailable:{exc.__class__.__name__}"
+            entry["compiled_status"] = compiled_status
+            compiled_failures.append((name, traceback.format_exc()))
 
-@CUDA_ONLY
-@pytest.mark.skipif(not has_fbgemm_moe_kernels(), reason="fbgemm MoE kernels are not available")
-@pytest.mark.parametrize(("n_experts", "top_k", "d_model", "d_hidden"), [(16, 8, 2048, 1024)])
-def test_fbgemm_moe_repeated_run_heads(
-    n_experts: int,
-    top_k: int,
-    d_model: int,
-    d_hidden: int,
-):
-    torch.manual_seed(0)
-    torch.cuda.manual_seed_all(0)
-    moe_fbgemm, _ = _make_moe_modules(
-        n_experts=n_experts,
-        top_k=top_k,
-        d_model=d_model,
-        d_hidden=d_hidden,
-    )
-    x, logits, expert_in_proj, expert_out_proj = _make_moe_inputs(
-        n_experts=n_experts,
-        top_k=top_k,
-        d_model=d_model,
-        d_hidden=d_hidden,
-    )
-    with torch.no_grad():
-        moe_fbgemm.expert_in_proj.copy_(expert_in_proj)
-        moe_fbgemm.expert_out_proj.copy_(expert_out_proj)
-
-    module_1 = _run_moe_module_eager(moe_fbgemm, x.unsqueeze(0), gate=logits.unsqueeze(0)).squeeze(0)
-    module_2 = _run_moe_module_eager(moe_fbgemm, x.unsqueeze(0), gate=logits.unsqueeze(0)).squeeze(0)
-    loaded_1 = _run_loaded_moe_eager(x, logits, expert_in_proj, expert_out_proj, top_k)
-    loaded_2 = _run_loaded_moe_eager(x, logits, expert_in_proj, expert_out_proj, top_k)
-    fbgemm_1 = _run_fbgemm_moe_eager(x, logits, expert_in_proj, expert_out_proj, top_k)
-    fbgemm_2 = _run_fbgemm_moe_eager(x, logits, expert_in_proj, expert_out_proj, top_k)
-
-    for name, lhs, rhs in [
-        ("module", module_1, module_2),
-        ("loaded", loaded_1, loaded_2),
-        ("old_fbgemm", fbgemm_1, fbgemm_2),
-    ]:
-        diff = (lhs.float() - rhs.float()).abs()
-        print(f"\n[{name}] run1 head: {lhs[0, :16].float().cpu().tolist()}")
-        print(f"[{name}] run2 head: {rhs[0, :16].float().cpu().tolist()}")
-        print(f"[{name}] abs diff head: {diff[0, :16].cpu().tolist()}")
-        print(
-            f"[{name}] max_abs_diff={float(diff.max().item()):.6f} "
-            f"mean_abs_diff={float(diff.mean().item()):.6f}"
+        result[name] = entry
+        rows.append(
+            (
+                name,
+                eager_ms_str,
+                compiled_ms_str,
+                speedup_str,
+                f"{entry['eager_self_max_abs_diff']:.6f}",
+                f"{entry['eager_self_mean_abs_diff']:.6f}",
+                f"{entry['eager_max_abs_diff_vs_baseline']:.6f}",
+                f"{entry['eager_mean_abs_diff_vs_baseline']:.6f}",
+                compiled_vs_baseline_max_str,
+                compiled_vs_baseline_mean_str,
+                compiled_vs_eager_max_str,
+                compiled_vs_eager_mean_str,
+                compiled_status,
+            )
         )
 
+        assert torch.isfinite(eager_out).all()
 
-@CUDA_ONLY
-# @pytest.mark.skipif(not has_fbgemm_moe_kernels(), reason="fbgemm MoE kernels are not available")
-@pytest.mark.parametrize(("n_experts", "top_k", "d_model", "d_hidden"), [(16, 8, 2048, 1024)])
-def test_fbgemm_moe_eager_vs_compiled_timing(
-    n_experts: int,
-    top_k: int,
-    d_model: int,
-    d_hidden: int,
-    record_property,
-    request,
-):
-    _require_benchmark_flag(request)
-    moe_fbgemm, _ = _make_moe_modules(
-        n_experts=n_experts,
-        top_k=top_k,
-        d_model=d_model,
-        d_hidden=d_hidden,
+    header = (
+        "impl".ljust(10)
+        + "eager_ms".rjust(12)
+        + "compiled_ms".rjust(14)
+        + "speedup".rjust(12)
+        + "self_max".rjust(12)
+        + "self_mean".rjust(13)
+        + "vs_base_max".rjust(14)
+        + "vs_base_mean".rjust(15)
+        + "comp_vs_base_max".rjust(18)
+        + "comp_vs_base_mean".rjust(19)
+        + "comp_vs_eager_max".rjust(19)
+        + "comp_vs_eager_mean".rjust(20)
+        + "status".rjust(20)
     )
-    x = torch.randn((1, 512, d_model), device="cuda", dtype=torch.bfloat16)
+    print("\nmoe implementation matrix")
+    print(header)
+    print("-" * len(header))
+    for row in rows:
+        print(
+            row[0].ljust(10)
+            + row[1].rjust(12)
+            + row[2].rjust(14)
+            + row[3].rjust(12)
+            + row[4].rjust(12)
+            + row[5].rjust(13)
+            + row[6].rjust(14)
+            + row[7].rjust(15)
+            + row[8].rjust(18)
+            + row[9].rjust(19)
+            + row[10].rjust(19)
+            + row[11].rjust(20)
+            + row[12].rjust(20)
+        )
+    if compiled_failures:
+        print("\ncompiled failure tracebacks")
+        for name, tb in compiled_failures:
+            print(f"[{name}]")
+            print(tb.rstrip())
 
-    eager_out = _run_moe_module_eager(moe_fbgemm, x)
-    compiled_out = _run_moe_module_compiled_inference(moe_fbgemm, x)
-    diff = (compiled_out.float() - eager_out.float()).abs()
-
-    eager_ms = _time_cuda_ms(lambda: _run_moe_module_eager(moe_fbgemm, x))
-    compiled_ms = _time_cuda_ms(lambda: _run_moe_module_compiled_inference(moe_fbgemm, x))
-    result = {
-        "eager_ms": round(eager_ms, 4),
-        "compiled_ms": round(compiled_ms, 4),
-        "speedup_vs_eager": round(eager_ms / compiled_ms, 4),
-        "max_abs_diff": round(float(diff.max().item()), 6),
-        "mean_abs_diff": round(float(diff.mean().item()), 6),
-    }
-
-    record_property("fbgemm_moe_eager_vs_compiled_timing", result)
-    print(f"\nfbgemm moe eager vs compiled timing: {result}")
-
-
-@CUDA_ONLY
-@pytest.mark.skipif(not has_fbgemm_moe_kernels(), reason="fbgemm MoE kernels are not available")
-@pytest.mark.parametrize(("n_experts", "top_k", "d_model", "d_hidden"), [(16, 8, 2048, 1024)])
-def test_moe_module_forward_matches_fbgemm_eager_and_compiled(
-    n_experts: int,
-    top_k: int,
-    d_model: int,
-    d_hidden: int,
-):
-    moe_fbgemm, moe_fallback = _make_moe_modules(
-        n_experts=n_experts,
-        top_k=top_k,
-        d_model=d_model,
-        d_hidden=d_hidden,
-    )
-    x = torch.randn((1, 512, d_model), device="cuda", dtype=torch.bfloat16)
-
-    eager_fbgemm = _run_moe_module_eager(moe_fbgemm, x)
-    eager_fallback = _run_moe_module_eager(moe_fallback, x)
-    compiled_fbgemm = _run_moe_module_compiled_inference(moe_fbgemm, x)
-
-    fallback_diff = (eager_fallback.float() - eager_fbgemm.float()).abs()
-    compiled_diff = (compiled_fbgemm.float() - eager_fbgemm.float()).abs()
-
-    print(
-        f"\nmoe module diffs: "
-        f"fallback_max_abs_diff={float(fallback_diff.max().item()):.6f} "
-        f"fallback_mean_abs_diff={float(fallback_diff.mean().item()):.6f} "
-        f"compiled_max_abs_diff={float(compiled_diff.max().item()):.6f} "
-        f"compiled_mean_abs_diff={float(compiled_diff.mean().item()):.6f}"
-    )
-
-    assert torch.isfinite(eager_fallback).all()
-    assert torch.isfinite(compiled_fbgemm).all()
-
-
-@CUDA_ONLY
-@pytest.mark.skipif(not has_fbgemm_moe_kernels(), reason="fbgemm MoE kernels are not available")
-@pytest.mark.parametrize(("n_experts", "top_k", "d_model", "d_hidden"), [(16, 8, 2048, 1024)])
-def test_moe_module_timing_vs_fbgemm_eager_and_compiled(
-    n_experts: int,
-    top_k: int,
-    d_model: int,
-    d_hidden: int,
-    record_property,
-    request,
-):
-    _require_benchmark_flag(request)
-    moe_fbgemm, moe_fallback = _make_moe_modules(
-        n_experts=n_experts,
-        top_k=top_k,
-        d_model=d_model,
-        d_hidden=d_hidden,
-    )
-    x = torch.randn((1, 512, d_model), device="cuda", dtype=torch.bfloat16)
-
-    eager_fbgemm = _run_moe_module_eager(moe_fbgemm, x)
-    eager_fallback = _run_moe_module_eager(moe_fallback, x)
-    compiled_fbgemm = _run_moe_module_compiled_inference(moe_fbgemm, x)
-    fallback_diff = (eager_fallback.float() - eager_fbgemm.float()).abs()
-    compiled_diff = (compiled_fbgemm.float() - eager_fbgemm.float()).abs()
-
-    fallback_ms = _time_cuda_ms(lambda: _run_moe_module_eager(moe_fallback, x))
-    eager_fbgemm_ms = _time_cuda_ms(lambda: _run_moe_module_eager(moe_fbgemm, x))
-    compiled_fbgemm_ms = _time_cuda_ms(lambda: _run_moe_module_compiled_inference(moe_fbgemm, x))
-    result = {
-        "fallback_ms": round(fallback_ms, 4),
-        "eager_fbgemm_ms": round(eager_fbgemm_ms, 4),
-        "compiled_fbgemm_ms": round(compiled_fbgemm_ms, 4),
-        "fallback_slowdown_vs_eager_fbgemm": round(fallback_ms / eager_fbgemm_ms, 4),
-        "fallback_slowdown_vs_compiled_fbgemm": round(fallback_ms / compiled_fbgemm_ms, 4),
-        "compiled_speedup_vs_eager_fbgemm": round(eager_fbgemm_ms / compiled_fbgemm_ms, 4),
-        "fallback_max_abs_diff": round(float(fallback_diff.max().item()), 6),
-        "fallback_mean_abs_diff": round(float(fallback_diff.mean().item()), 6),
-        "compiled_max_abs_diff": round(float(compiled_diff.max().item()), 6),
-        "compiled_mean_abs_diff": round(float(compiled_diff.mean().item()), 6),
-    }
-
-    record_property("moe_module_timing_vs_fbgemm_eager_and_compiled", result)
-    print(f"\nmoe module timing vs fbgemm eager and compiled: {result}")
-
-
-@CUDA_ONLY
-@pytest.mark.skipif(not has_fbgemm_moe_kernels(), reason="fbgemm MoE kernels are not available")
-@pytest.mark.parametrize(("n_experts", "top_k", "d_model", "d_hidden"), [(16, 8, 2048, 1024)])
-def test_moe_module_compiled_timing_vs_fbgemm_compiled(
-    n_experts: int,
-    top_k: int,
-    d_model: int,
-    d_hidden: int,
-    record_property,
-    request,
-):
-    _require_benchmark_flag(request)
-    moe_fbgemm, moe_fallback = _make_moe_modules(
-        n_experts=n_experts,
-        top_k=top_k,
-        d_model=d_model,
-        d_hidden=d_hidden,
-    )
-    x = torch.randn((1, 512, d_model), device="cuda", dtype=torch.bfloat16)
-
-    compiled_fbgemm = _run_moe_module_compiled_inference(moe_fbgemm, x)
-    compiled_fallback = _run_moe_fallback_module_compiled_inference(moe_fallback, x)
-    compiled_diff = (compiled_fallback.float() - compiled_fbgemm.float()).abs()
-
-    compiled_fallback_ms = _time_cuda_ms(lambda: _run_moe_fallback_module_compiled_inference(moe_fallback, x))
-    compiled_fbgemm_ms = _time_cuda_ms(lambda: _run_moe_module_compiled_inference(moe_fbgemm, x))
-    result = {
-        "compiled_fallback_ms": round(compiled_fallback_ms, 4),
-        "compiled_fbgemm_ms": round(compiled_fbgemm_ms, 4),
-        "fallback_slowdown_vs_compiled_fbgemm": round(compiled_fallback_ms / compiled_fbgemm_ms, 4),
-        "compiled_max_abs_diff": round(float(compiled_diff.max().item()), 6),
-        "compiled_mean_abs_diff": round(float(compiled_diff.mean().item()), 6),
-    }
-
-    record_property("moe_module_compiled_timing_vs_fbgemm_compiled", result)
-    print(f"\nmoe module compiled timing vs fbgemm compiled: {result}")
+    record_property("moe_implementation_matrix", result)

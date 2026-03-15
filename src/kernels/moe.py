@@ -1,17 +1,18 @@
 """
-Code here all yoinked from https://github.com/pytorch/FBGEMM
+MoE routing and scatter kernels adapted from FBGEMM.
 """
 
 
 from __future__ import annotations
 
 import torch
-from torch.library import custom_op
+from torch.library import custom_op, triton_op, wrap_triton
 import triton
 import triton.language as tl
 
 
-# based on https://github.com/pytorch/FBGEMM/blob/2364886be020b45246eacf8a3eb294194bb08b84/fbgemm_gpu/experimental/gen_ai/src/moe/index_shuffling.cu
+# adapted from:
+# https://github.com/pytorch/FBGEMM/blob/2364886be020b45246eacf8a3eb294194bb08b84/fbgemm_gpu/experimental/gen_ai/src/moe/index_shuffling.cu
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=2),
@@ -93,7 +94,17 @@ def _index_shuffling_scatter_kernel(
     tl.store(shuffled_token_indices_ptr + shuffled_offsets, offsets // top_k, mask=mask)
 
 
-def index_shuffling(scores: torch.Tensor, top_k: int = 1) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+@triton_op(
+    "world_engine::index_shuffling",
+    mutates_args=(),
+)
+def index_shuffling(
+    scores: torch.Tensor,
+    top_k: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    To be noted that this is non-deterministic.
+    """
     assert scores.ndim == 2
     assert top_k > 0
 
@@ -109,7 +120,7 @@ def index_shuffling(scores: torch.Tensor, top_k: int = 1) -> tuple[torch.Tensor,
     expert_indices = torch.empty(n_elements, device=scores.device, dtype=torch.int32)
     token_counts = torch.zeros(n_experts, device=scores.device, dtype=torch.int32)
     token_offsets = torch.empty(n_elements, device=scores.device, dtype=torch.int32)
-    _index_shuffling_topk_kernel[(n_tokens,)](
+    wrap_triton(_index_shuffling_topk_kernel)[(n_tokens,)](
         scores,
         expert_indices,
         token_offsets,
@@ -130,7 +141,7 @@ def index_shuffling(scores: torch.Tensor, top_k: int = 1) -> tuple[torch.Tensor,
     def scatter_grid(meta):
         return (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
 
-    _index_shuffling_scatter_kernel[scatter_grid](
+    wrap_triton(_index_shuffling_scatter_kernel)[scatter_grid](
         expert_indices,
         token_offsets,
         token_counts,
@@ -145,7 +156,8 @@ def index_shuffling(scores: torch.Tensor, top_k: int = 1) -> tuple[torch.Tensor,
     return token_counts, shuffled_expert_indices, shuffled_token_indices
 
 
-# yoinked from https://github.com/pytorch/FBGEMM/blob/main/fbgemm_gpu/experimental/gen_ai/gen_ai/moe/gather_scatter.py
+# adapted from:
+# https://github.com/pytorch/FBGEMM/blob/main/fbgemm_gpu/experimental/gen_ai/gen_ai/moe/gather_scatter.py
 @triton.jit
 def _fbgemm_scatter_add_dense_tokens(
     out_tokens,
@@ -176,7 +188,6 @@ def _fbgemm_scatter_add_dense_tokens(
             None,
             eviction_policy="evict_first",
         )
-
         tl.atomic_add(
             out_tokens + output_token_index * D + feature_offset,
             input_token_value,
@@ -185,45 +196,44 @@ def _fbgemm_scatter_add_dense_tokens(
         )
         feature_offset += BLOCK_D_INNER
 
-# You might notice several things wrong with this function over here but I assure you these are all intentional and have been double checked.
-# First is that the schema here is intentionally wrong, in that the out_tokens is not marked as mutated in-place as is normally required.
-# https://github.com/pytorch/FBGEMM/blob/e8a65d91591033850537c0ff5e5d2bd78685efed/fbgemm_gpu/experimental/gen_ai/gen_ai/moe/gather_scatter.py#L370
-# It might be unintentional, but the registered schema for FBGEMM's `torch.ops.fbgemm.scatter_add_dense_tokens` omits this mutation annotation, and a side
-# effect of doing so is that the final torch.compiled MoE path is about 3x faster. Why? Best guess is that the mutation annotation is causing the 
-# compiler to be more conservative about optimisation around the out_tokens, which inhibits some optimizations. 
-# Secondly, is that it's a torch.library.custom_op instead of a triton_op, which is also intentional because custom_op prevents torch.compile from tracing
-# into the function. If torch.compile traces into the function instead of treating it as an opaque callable, it ends up "optimising" it in a way that regresses performance.
-# In any case, this means that it's a performance loss to be correct, and that this should definitely be tested for regression depending on future torch package changes.
-@custom_op(
+@triton_op(
     "world_engine::scatter_add_dense_tokens",
-    schema="(Tensor out_tokens, Tensor in_tokens, Tensor token_indices, Tensor? valid_token_count=None) -> None",
-    mutates_args=(), 
-    device_types="cuda",
+    mutates_args=(),
 )
 def scatter_add_dense_tokens(
-    out_tokens: torch.Tensor,
     in_tokens: torch.Tensor,
     token_indices: torch.Tensor,
+    n_tokens: int,
     valid_token_count: torch.Tensor | None = None,
-) -> None:
+) -> torch.Tensor:
+    """
+    Order-invariant MoE scatter-add specialized for the final token combine.
+
+    The upstream FBGEMM operator exposes an incorrect mutation schema for torch.compile.
+    This reimplementation fixes that + materializes its own fp32 output tensor (FBGEMM 
+    version relies on caller to pass in out_tokens) to avoid numeric inaccuracy footguns.
+    """
     assert torch.version.hip is not None or (
         torch.version.cuda is not None and torch.version.cuda >= "12.4"
     ), "Requires CUDA version 12.4 or later on Nvidia GPUs!"
 
-    assert out_tokens.ndim == 2 and in_tokens.ndim == 2
-    assert in_tokens.shape[1] == out_tokens.shape[1]
+    assert in_tokens.ndim == 2
     assert token_indices.ndim == 1
-    assert out_tokens.is_cuda and in_tokens.is_cuda and token_indices.is_cuda
-    assert out_tokens.is_contiguous()
+    assert in_tokens.is_cuda and token_indices.is_cuda
     assert in_tokens.is_contiguous()
     assert token_indices.is_contiguous()
-    assert out_tokens.dtype in (torch.float16, torch.bfloat16, torch.float32)
-    assert in_tokens.dtype == out_tokens.dtype
+    # it's fine if the in_tokens are a different precision, tritons atomic_add implicitly casts to the destination type
+    assert in_tokens.dtype in (torch.float16, torch.bfloat16, torch.float32)
 
     a, D = in_tokens.shape
-    if a == 0:
-        return
     assert token_indices.shape == (a,)
+    assert n_tokens >= 0
+    if a == 0:
+        return torch.zeros((n_tokens, D), device=in_tokens.device, dtype=torch.float32)
+
+    # explicitly accumulate in fp32; lower-precision atomics are too imprecise
+    # for the final MoE token combine
+    out_tokens = torch.zeros((n_tokens, D), device=in_tokens.device, dtype=torch.float32)
 
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
     if a >= NUM_SMS:
@@ -238,7 +248,7 @@ def scatter_add_dense_tokens(
         BLOCK_D_INNER //= 2
 
     grid = (a, D // BLOCK_D_OUTER)
-    _fbgemm_scatter_add_dense_tokens[grid](
+    wrap_triton(_fbgemm_scatter_add_dense_tokens)[grid](
         out_tokens,
         in_tokens,
         token_indices,
@@ -247,13 +257,13 @@ def scatter_add_dense_tokens(
         BLOCK_D_OUTER,  # pyre-ignore
         BLOCK_D_INNER,  # pyre-ignore
     )
-    return None
+    return out_tokens
 
 @scatter_add_dense_tokens.register_fake
 def _scatter_add_dense_tokens_fake(
-    out_tokens: torch.Tensor,
     in_tokens: torch.Tensor,
     token_indices: torch.Tensor,
+    n_tokens: int,
     valid_token_count: torch.Tensor | None = None,
 ):
-    return None
+    return in_tokens.new_empty((n_tokens, in_tokens.shape[1]), dtype=torch.float32)

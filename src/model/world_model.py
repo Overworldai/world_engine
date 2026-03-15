@@ -9,24 +9,10 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-
-
-try:
-    from fbgemm_gpu.experimental.gen_ai.moe import index_shuffling as fbgemm_index_shuffling
-    import fbgemm_gpu.experimental.gen_ai.moe.gather_scatter  # noqa
-    print("FBGEMM found for MoE kernels! :)")
-    HAS_FBGEMM = True
-except ImportError:
-    from ..kernels import index_shuffling as custom_index_shuffling
-    from ..kernels import grouped_gemm as custom_grouped_gemm
-    from ..kernels import scatter_add_dense_tokens as custom_scatter_add_dense_tokens
-    print("FBGEMM not found, using custom kernel implementations :3")
-    HAS_FBGEMM = False
-
-
 from .attn import Attn, CrossAttention, OrthoRoPEAngles
 from .nn import AdaLN, ada_gate, ada_rmsnorm, NoiseConditioner
 from .base_model import BaseModel
+from .moe import MoECustomKernels
 
 
 class PromptEncoder(nn.Module):
@@ -92,108 +78,6 @@ class CFG(nn.Module):
 
         # sampling-time switch
         return x if is_conditioned else null
-
-
-class MoEWithoutFBGEMM(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.top_k = config.moe_top_k
-        moe_mlp_ratio = getattr(config, "moe_mlp_ratio", None) or config.mlp_ratio / config.moe_top_k
-        d_intermediate = int(config.d_model * moe_mlp_ratio)
-        self.router = nn.Linear(config.d_model, config.moe_n_experts, bias=False)
-        self.expert_in_proj = nn.Parameter(
-            torch.empty(config.moe_n_experts, d_intermediate * (2 if config.gated_linear else 1), config.d_model)
-        )
-        self.expert_out_proj = nn.Parameter(torch.empty(config.moe_n_experts, config.d_model, d_intermediate))
-
-    def forward(self, x: torch.Tensor, gate: torch.Tensor | None = None) -> torch.Tensor:
-        if self.training or torch.is_grad_enabled():
-            raise NotImplementedError("inference only")
-
-        orig_shape = x.shape
-        x = x.reshape(-1, orig_shape[-1])
-        logits = self.router(x) if gate is None else gate.reshape(-1, gate.size(-1))
-
-        logits_fp32 = logits.float()
-        token_counts, expert_sorted, src = custom_index_shuffling(logits_fp32, top_k=self.top_k)
-
-        E = self.expert_in_proj.size(0)
-        m_sizes = token_counts[:E].to(torch.int32).contiguous()
-
-        src = src.to(torch.long)
-        expert_sorted = expert_sorted.to(torch.long)
-        logZ = logits_fp32.logsumexp(-1)
-        weights = (logits_fp32[src, expert_sorted] - logZ[src]).exp().to(x.dtype)
-
-        x_grouped = x.index_select(0, torch.cat((src, src[:1]), dim=0))
-        h = custom_grouped_gemm(
-            x_grouped,
-            self.expert_in_proj.reshape(-1, self.expert_in_proj.shape[-1]).contiguous(),
-            m_sizes,
-        )
-
-        if self.config.gated_linear:
-            gate_act, up = h.chunk(2, dim=-1)
-            h = F.silu(gate_act) * up
-        else:
-            h = F.silu(h)
-
-        y_grouped = custom_grouped_gemm(
-            h,
-            self.expert_out_proj.reshape(-1, self.expert_out_proj.shape[-1]).contiguous(),
-            m_sizes,
-        )[:-1]
-        out = torch.zeros_like(x)
-        custom_scatter_add_dense_tokens(out, (y_grouped * weights.unsqueeze(-1)).contiguous(), src)
-        return out.reshape(orig_shape)
-
-
-class MoE(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.top_k = config.moe_top_k
-        moe_mlp_ratio = getattr(config, "moe_mlp_ratio", None) or (config.mlp_ratio / config.moe_top_k)
-        d_int = int(config.d_model * moe_mlp_ratio)
-
-        self.router = nn.Linear(config.d_model, config.moe_n_experts, bias=False)
-        self.expert_in_proj = nn.Parameter(
-            torch.empty(config.moe_n_experts, d_int * (2 if config.gated_linear else 1), config.d_model)
-        )  # (E, N, K) for grouped_mm
-        self.expert_out_proj = nn.Parameter(torch.empty(config.moe_n_experts, config.d_model, d_int))  # (E, N, K)
-
-    def forward(self, x: torch.Tensor, gate: torch.Tensor | None = None) -> torch.Tensor:
-        if self.training or torch.is_grad_enabled():
-            raise NotImplementedError("inference only")
-
-        orig = x.shape
-        x = x.reshape(-1, orig[-1])
-        logits = self.router(x) if gate is None else gate.reshape(-1, gate.size(-1))
-
-        logits32 = logits.float()
-        token_counts, expert_sorted, src = fbgemm_index_shuffling(logits32, top_k=self.top_k)
-
-        E = self.expert_in_proj.size(0)
-        offs = token_counts[:E].cumsum(0).to(torch.int32)
-
-        src = src.to(torch.long)
-        expert_sorted = expert_sorted.to(torch.long)
-        logZ = logits32.logsumexp(-1)
-        w = (logits32[src, expert_sorted] - logZ[src]).exp().to(x.dtype)  # [T*K]
-
-        xg = x.index_select(0, torch.cat((src, src[:1]), 0))  # pad by 1 for grouped_mm offs constraint
-        h = F.grouped_mm(xg, self.expert_in_proj.transpose(-2, -1), offs=offs)
-        if self.config.gated_linear:
-            ga, up = h.chunk(2, -1)
-            h = F.silu(ga) * up
-        else:
-            h = F.silu(h)
-
-        yg = F.grouped_mm(h, self.expert_out_proj.transpose(-2, -1), offs=offs)[:-1]
-        out = torch.zeros_like(x)
-        torch.ops.fbgemm.scatter_add_dense_tokens(out, (yg * w.unsqueeze(-1)).contiguous(), src)
-        return out.reshape(orig)
 
 
 class MLP(nn.Module):
@@ -262,7 +146,7 @@ class WorldDiTBlock(nn.Module):
         self.config = config
         self.attn = Attn(config, layer_idx)
         if getattr(config, "moe", False):
-            self.mlp = MoE(config) if HAS_FBGEMM else MoEWithoutFBGEMM(config)
+            self.mlp = MoECustomKernels(config)
         else:
             self.mlp = MLP(config.d_model, config.d_model * config.mlp_ratio, config.d_model)
         self.cond_head = CondHead(config)

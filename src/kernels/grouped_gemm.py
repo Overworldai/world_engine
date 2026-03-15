@@ -1,5 +1,5 @@
 """
-yoinked from https://github.com/pytorch/FBGEMM/blob/main/fbgemm_gpu/experimental/gemm/triton_gemm/grouped_gemm.py
+Grouped GEMM kernel adapted from FBGEMM's Triton implementation.
 """
 
 
@@ -10,6 +10,7 @@ import warnings
 from typing import Optional
 
 import torch
+from torch.library import triton_op, wrap_triton
 import triton
 import triton.language as tl
 from triton.runtime import driver
@@ -217,7 +218,7 @@ def _fbgemm_grouped_gemm(
                             b_desc_ptr, [n_offset, k_offset], [BLOCK_SIZE_N, BLOCK_SIZE_K], dtype
                         )
                         if USE_FAST_ACCUM:
-                            accumulator = tl.dot(a, b.T, accumulator)
+                            accumulator = tl.dot(a, b.T, acc=accumulator)
                         else:
                             accumulator += tl.dot(a, b.T)
                 else:
@@ -231,6 +232,12 @@ def _fbgemm_grouped_gemm(
                         updated_k_offset_mask = updated_k_offset[None, :] < K
                         a = tl.load(a_ptrs, mask=(offs_am[:, None] < m_size) & updated_k_offset_mask, other=0.0)
                         b = tl.load(b_ptrs, mask=(offs_bn[:, None] < n_size) & updated_k_offset_mask, other=0.0)
+                        if a.dtype != b.dtype:
+                            if a.dtype == tl.float32 or b.dtype == tl.float32:
+                                a = a.to(tl.float32)
+                                b = b.to(tl.float32)
+                            else:
+                                b = b.to(a.dtype)
                         accumulator += tl.dot(a, b.T)
                         a_ptrs += BLOCK_SIZE_K
                         b_ptrs += BLOCK_SIZE_K
@@ -264,15 +271,17 @@ def _fbgemm_grouped_gemm(
 
             iterated_tiles += num_tiles
 
-
+@triton_op(
+    "world_engine::grouped_gemm",
+    mutates_args=(),
+)
 def grouped_gemm(
     x: torch.Tensor,
     w: torch.Tensor,
     m_sizes: torch.Tensor,
     use_fast_accum: bool = True,
-    *,
     use_warp_specialization: bool = True,
-    output_tensor: Optional[torch.Tensor] = None,
+    fp32_output: bool = False,
     scatter_add_indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     use_tma_load = not torch.version.hip
@@ -304,18 +313,15 @@ def grouped_gemm(
         use_warp_specialization = False
         use_tma_load = False
         use_tma_store = False
-        assert output_tensor is None, "Fused scatter add path disabled when K or N is not a multiple of 8."
+        assert scatter_add_indices is None, "Fused scatter add path disabled when K or N is not a multiple of 8."
 
-    if output_tensor is None:
-        fuse_scatter_add = False
-        assert scatter_add_indices is None
-        y = torch.empty((m, n), device=x.device, dtype=torch.bfloat16)
-    else:
-        fuse_scatter_add = True
-        assert scatter_add_indices is not None
+    fuse_scatter_add = scatter_add_indices is not None
+    y_dtype = torch.float32 if fp32_output else torch.bfloat16
+    y = torch.empty((m, n), device=x.device, dtype=y_dtype)
+
+    if fuse_scatter_add:
         assert scatter_add_indices.is_contiguous()
         assert scatter_add_indices.shape == (m,)
-        y = output_tensor
 
     if m == 0 or n == 0:
         return y
@@ -362,8 +368,9 @@ def grouped_gemm(
 
     m_bucket_cap = 16384
     m_bucket = min(triton.next_power_of_2(m), m_bucket_cap)
-    # Keep the non-warp-specialized path for now; it is enough for the fallback MoE use case.
-    _fbgemm_grouped_gemm[grid](
+    # Keep the non-warp-specialized path available; it is sufficient for the
+    # local MoE fallback path and much easier to reason about while debugging.
+    wrap_triton(_fbgemm_grouped_gemm)[grid](
         desc_x,
         desc_w,
         y,
