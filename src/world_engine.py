@@ -4,7 +4,7 @@ import torch
 from torch import Tensor
 from dataclasses import dataclass, field
 
-from .model import HAS_FBGEMM, WorldModel, StaticKVCache, PromptEncoder
+from .model import WorldModel, StaticKVCache, PromptEncoder
 from .ae import get_ae
 from .patch_model import apply_inference_patches
 from .quantize import quantize_model
