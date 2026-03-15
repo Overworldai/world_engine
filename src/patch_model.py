@@ -128,7 +128,10 @@ class MergedQKVAttn(Attn):
         q, k = rms_norm(q), rms_norm(k)
         q, k = self.rope(q, rope_angles), self.rope(k, rope_angles)
 
-        k, v, bm, block_written, active_blocks, block_size = kv_cache.upsert(k, v, pos_ids, self.layer_idx)
+        layer_cache = kv_cache.layers[self.layer_idx]
+        k, v, bm, block_written, active_blocks, block_size = layer_cache.upsert(
+            torch.stack([k, v], dim=0), pos_ids, kv_cache._is_frozen
+        )
 
         meta = AttnMeta(
             flex_block_mask=bm,
@@ -189,7 +192,8 @@ def patch_MLPFusion_split(model) -> None:
 
 
 def apply_inference_patches(model) -> None:
-    patch_cached_noise_conditioning(model)
+    if next(model.parameters()).dtype == torch.bfloat16:
+        patch_cached_noise_conditioning(model)
     patch_Attn_merge_qkv(model)
     patch_MLPFusion_split(model)
 

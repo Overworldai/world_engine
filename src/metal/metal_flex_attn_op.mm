@@ -15,11 +15,15 @@ namespace {
 
 struct MetalRuntime {
     id<MTLComputePipelineState> pipeline_generic = nil;
+    id<MTLComputePipelineState> pipeline_generic_block_written = nil;
+    id<MTLComputePipelineState> pipeline_generic_bf16 = nil;
     id<MTLComputePipelineState> pipeline_dh64_bs4_single = nil;
     id<MTLComputePipelineState> pipeline_dh64_bs4_gqa2_single = nil;
     id<MTLComputePipelineState> pipeline_dh64_bs4_gqa2_dense = nil;
     id<MTLComputePipelineState> pipeline_dh64_bs4_gqa2_dualhead = nil;
     uint32_t thread_execution_width_generic = 32;
+    uint32_t thread_execution_width_generic_block_written = 32;
+    uint32_t thread_execution_width_generic_bf16 = 32;
     uint32_t thread_execution_width_dh64_bs4_single = 32;
     uint32_t thread_execution_width_dh64_bs4_gqa2_single = 32;
     uint32_t thread_execution_width_dh64_bs4_gqa2_dense = 32;
@@ -62,6 +66,8 @@ MetalRuntime& get_metal_runtime() {
             }
 
             id<MTLFunction> fn_generic = [lib newFunctionWithName:@"metal_flex_attn_forward"];
+            id<MTLFunction> fn_generic_block_written = [lib newFunctionWithName:@"metal_flex_attn_forward_from_block_written"];
+            id<MTLFunction> fn_generic_bf16 = [lib newFunctionWithName:@"metal_flex_attn_forward_bf16"];
             id<MTLFunction> fn_dh64_bs4_single = [lib newFunctionWithName:@"metal_flex_attn_forward_dh64_bs4_single"];
             id<MTLFunction> fn_dh64_bs4_gqa2_single = [lib newFunctionWithName:@"metal_flex_attn_forward_dh64_bs4_gqa2_single"];
             id<MTLFunction> fn_dh64_bs4_gqa2_dense = [lib newFunctionWithName:@"metal_flex_attn_forward_dh64_bs4_gqa2_dense"];
@@ -74,6 +80,16 @@ MetalRuntime& get_metal_runtime() {
             rt.pipeline_generic = [device newComputePipelineStateWithFunction:fn_generic error:&pipe_error];
             if (!rt.pipeline_generic) {
                 return;
+            }
+            rt.pipeline_generic_block_written = [device newComputePipelineStateWithFunction:fn_generic_block_written error:&pipe_error];
+            if (!rt.pipeline_generic_block_written) {
+                return;
+            }
+            if (fn_generic_bf16) {
+                rt.pipeline_generic_bf16 = [device newComputePipelineStateWithFunction:fn_generic_bf16 error:&pipe_error];
+                if (rt.pipeline_generic_bf16) {
+                    rt.thread_execution_width_generic_bf16 = static_cast<uint32_t>(rt.pipeline_generic_bf16.threadExecutionWidth);
+                }
             }
             rt.pipeline_dh64_bs4_single = [device newComputePipelineStateWithFunction:fn_dh64_bs4_single error:&pipe_error];
             if (!rt.pipeline_dh64_bs4_single) {
@@ -92,6 +108,7 @@ MetalRuntime& get_metal_runtime() {
                 return;
             }
             rt.thread_execution_width_generic = static_cast<uint32_t>(rt.pipeline_generic.threadExecutionWidth);
+            rt.thread_execution_width_generic_block_written = static_cast<uint32_t>(rt.pipeline_generic_block_written.threadExecutionWidth);
             rt.thread_execution_width_dh64_bs4_single = static_cast<uint32_t>(rt.pipeline_dh64_bs4_single.threadExecutionWidth);
             rt.thread_execution_width_dh64_bs4_gqa2_single = static_cast<uint32_t>(rt.pipeline_dh64_bs4_gqa2_single.threadExecutionWidth);
             rt.thread_execution_width_dh64_bs4_gqa2_dense = static_cast<uint32_t>(rt.pipeline_dh64_bs4_gqa2_dense.threadExecutionWidth);
@@ -145,6 +162,14 @@ static bool enable_gqa2_dualhead_specialization() {
 
 static bool enable_fp16_accum() {
     const char* env = std::getenv("WORLD_METAL_FP16_ACCUM");
+    if (!env) {
+        return true;
+    }
+    return std::string(env) == "1";
+}
+
+static bool prefer_active_dispatch_path() {
+    const char* env = std::getenv("WORLD_METAL_PREFER_ACTIVE_DISPATCH");
     if (!env) {
         return true;
     }
@@ -276,8 +301,12 @@ at::Tensor metal_flex_attn_ref_impl(
 ) {
     TORCH_CHECK(q.device().is_mps() && k.device().is_mps() && v.device().is_mps(),
                 "flex_attn_metal expects q/k/v on MPS");
-    TORCH_CHECK(q.scalar_type() == at::kHalf && k.scalar_type() == at::kHalf && v.scalar_type() == at::kHalf,
-                "flex_attn_metal currently supports float16 only");
+    TORCH_CHECK(
+        (q.scalar_type() == at::kHalf || q.scalar_type() == at::kBFloat16)
+            && q.scalar_type() == k.scalar_type()
+            && q.scalar_type() == v.scalar_type(),
+        "flex_attn_metal currently supports float16 or bfloat16 (matching dtypes)"
+    );
     TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(),
                 "flex_attn_metal expects contiguous q/k/v");
     TORCH_CHECK(k.sizes() == v.sizes(), "k and v must match");
@@ -332,9 +361,12 @@ at::Tensor metal_flex_attn_ref_impl(
         scores = scores.masked_fill(mask_tensor.eq(0), -std::numeric_limits<float>::infinity());
     }
     if (causal) {
+        // Query rows correspond to the tail window [L-T, L), so causal bounds
+        // must be shifted by q_start rather than using naive row index.
+        const int64_t q_start = std::max<int64_t>(0, L - T);
         auto causal_mask = at::triu(
             at::ones({T, L}, q.options().dtype(at::kBool)),
-            /*diagonal=*/1
+            /*diagonal=*/q_start + 1
         );
         scores = scores.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), -std::numeric_limits<float>::infinity());
     }
@@ -359,11 +391,13 @@ at::Tensor metal_flex_attn_fast_dispatch_impl(
     TORCH_CHECK(q.device().is_mps() && k.device().is_mps() && v.device().is_mps(),
                 "flex_attn_metal_fast expects q/k/v on MPS");
     TORCH_CHECK(block_written.device().is_mps(), "block_written must be on MPS");
-    TORCH_CHECK(q.scalar_type() == at::kHalf && k.scalar_type() == at::kHalf && v.scalar_type() == at::kHalf,
-                "flex_attn_metal_fast currently supports float16 only");
+    TORCH_CHECK(
+        (q.scalar_type() == at::kHalf || q.scalar_type() == at::kBFloat16)
+            && q.scalar_type() == k.scalar_type()
+            && q.scalar_type() == v.scalar_type(),
+        "flex_attn_metal_fast currently supports float16 or bfloat16 (matching dtypes)"
+    );
     TORCH_CHECK(block_written.scalar_type() == at::kByte, "block_written must be uint8");
-    TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(),
-                "flex_attn_metal_fast expects contiguous q/k/v");
     TORCH_CHECK(block_written.is_contiguous(), "block_written must be contiguous");
     TORCH_CHECK(k.sizes() == v.sizes(), "k and v must match");
     TORCH_CHECK(q.size(0) == k.size(0) && q.size(3) == k.size(3),
@@ -372,12 +406,21 @@ at::Tensor metal_flex_attn_fast_dispatch_impl(
     TORCH_CHECK((q.size(1) % k.size(1)) == 0, "q heads must be divisible by kv heads for GQA");
     TORCH_CHECK(block_size > 0, "block_size must be > 0");
 
-    const uint32_t B = static_cast<uint32_t>(q.size(0));
-    const uint32_t Hq = static_cast<uint32_t>(q.size(1));
-    const uint32_t Hkv = static_cast<uint32_t>(k.size(1));
-    const uint32_t T = static_cast<uint32_t>(q.size(2));
-    const uint32_t L = static_cast<uint32_t>(k.size(2));
-    const uint32_t Dh = static_cast<uint32_t>(q.size(3));
+    auto& rt = get_metal_runtime();
+    TORCH_CHECK(rt.init_ok, "flex_attn_metal_fast: metal runtime init failed");
+
+    const auto input_dtype = q.scalar_type();
+    const bool use_bf16_io = (input_dtype == at::kBFloat16);
+    const at::Tensor qh = use_bf16_io ? q.to(at::kHalf).contiguous() : q.contiguous();
+    const at::Tensor kh = use_bf16_io ? k.to(at::kHalf).contiguous() : k.contiguous();
+    const at::Tensor vh = use_bf16_io ? v.to(at::kHalf).contiguous() : v.contiguous();
+
+    const uint32_t B = static_cast<uint32_t>(qh.size(0));
+    const uint32_t Hq = static_cast<uint32_t>(qh.size(1));
+    const uint32_t Hkv = static_cast<uint32_t>(kh.size(1));
+    const uint32_t T = static_cast<uint32_t>(qh.size(2));
+    const uint32_t L = static_cast<uint32_t>(kh.size(2));
+    const uint32_t Dh = static_cast<uint32_t>(qh.size(3));
     TORCH_CHECK(Dh <= 128, "flex_attn_metal_fast currently supports Dh <= 128");
     const uint32_t BlockSize = static_cast<uint32_t>(block_size);
     const uint32_t KVBLOCKS = (L + BlockSize - 1) / BlockSize;
@@ -386,69 +429,73 @@ at::Tensor metal_flex_attn_fast_dispatch_impl(
                 "block_written must have exactly ceil(L/block_size) elements");
 
     at::Tensor active_blocks;
-    if (block_written.all().item<bool>()) {
-        active_blocks = at::arange(
-            static_cast<int64_t>(KVBLOCKS),
-            q.options().device(q.device()).dtype(at::kInt)
-        ).contiguous();
-    } else {
+    uint32_t ActiveCount = KVBLOCKS;
+    const bool use_active_dispatch = prefer_active_dispatch_path();
+    if (use_active_dispatch) {
         active_blocks = at::nonzero(block_written.gt(0)).flatten().to(at::kInt).contiguous();
+        ActiveCount = static_cast<uint32_t>(active_blocks.numel());
     }
-    const uint32_t ActiveCount = static_cast<uint32_t>(active_blocks.numel());
 
-    auto& rt = get_metal_runtime();
-    TORCH_CHECK(rt.init_ok, "flex_attn_metal_fast: metal runtime init failed");
-
-    at::Tensor out = at::zeros_like(q);
+    at::Tensor out = at::zeros_like(qh);
     if (ActiveCount == 0) {
-        return out;
+        return use_bf16_io ? out.to(input_dtype) : out;
     }
     const uint32_t FP16Accum = enable_fp16_accum() ? 1u : 0u;
-    const bool use_specialized = (Dh == 64u && BlockSize == 4u);
-    if (use_specialized) {
-        const float density = static_cast<float>(ActiveCount) / static_cast<float>(std::max<uint32_t>(1u, KVBLOCKS));
-        const bool use_gqa2_specialized = (Hq == (Hkv << 1));
-        const bool use_gqa2_dense = use_gqa2_specialized && (ActiveCount == KVBLOCKS);
-        const bool use_gqa2_dualhead = enable_gqa2_dualhead_specialization() && use_gqa2_specialized && (density <= 0.75f) && (T >= 256u);
-        const uint32_t tuned_tg = get_tg_size();
-        if (use_gqa2_dualhead) {
-            dispatch_fast_kernel_dh64_bs4_gqa2_dualhead(
-                rt.pipeline_dh64_bs4_gqa2_dualhead,
-                rt.thread_execution_width_dh64_bs4_gqa2_dualhead,
-                q, k, v, active_blocks, out,
-                B, Hq, T, L, Dh, BlockSize, ActiveCount, Causal, Hkv,
-                FP16Accum,
-                "flex_attn_metal_fast", tuned_tg
-            );
-        } else if (use_gqa2_dense) {
-            dispatch_fast_kernel(
-                rt.pipeline_dh64_bs4_gqa2_dense,
-                rt.thread_execution_width_dh64_bs4_gqa2_dense,
-                q, k, v, active_blocks, out,
-                B, Hq, T, L, Dh, BlockSize, ActiveCount, Causal, Hkv,
-                FP16Accum,
-                "flex_attn_metal_fast", tuned_tg
-            );
-        } else if (use_gqa2_specialized) {
-            dispatch_fast_kernel(
-                rt.pipeline_dh64_bs4_gqa2_single,
-                rt.thread_execution_width_dh64_bs4_gqa2_single,
-                q, k, v, active_blocks, out,
-                B, Hq, T, L, Dh, BlockSize, ActiveCount, Causal, Hkv,
-                FP16Accum,
-                "flex_attn_metal_fast", tuned_tg
-            );
+    if (use_active_dispatch && ActiveCount > 0u) {
+        if (Dh == 64u && BlockSize == 4u) {
+            const float density = static_cast<float>(ActiveCount) / static_cast<float>(std::max<uint32_t>(1u, KVBLOCKS));
+            const bool use_gqa2_specialized = (Hq == (Hkv << 1));
+            const bool use_gqa2_dense = use_gqa2_specialized && (ActiveCount == KVBLOCKS);
+            const bool use_gqa2_dualhead = enable_gqa2_dualhead_specialization() && use_gqa2_specialized && (density <= 0.75f) && (T >= 256u);
+            const uint32_t tuned_tg = get_tg_size();
+            if (use_gqa2_dualhead) {
+                dispatch_fast_kernel_dh64_bs4_gqa2_dualhead(
+                    rt.pipeline_dh64_bs4_gqa2_dualhead,
+                    rt.thread_execution_width_dh64_bs4_gqa2_dualhead,
+                    qh, kh, vh, active_blocks, out,
+                    B, Hq, T, L, Dh, BlockSize, ActiveCount, Causal, Hkv,
+                    FP16Accum,
+                    "flex_attn_metal_fast", tuned_tg
+                );
+            } else if (use_gqa2_dense) {
+                dispatch_fast_kernel(
+                    rt.pipeline_dh64_bs4_gqa2_dense,
+                    rt.thread_execution_width_dh64_bs4_gqa2_dense,
+                    qh, kh, vh, active_blocks, out,
+                    B, Hq, T, L, Dh, BlockSize, ActiveCount, Causal, Hkv,
+                    FP16Accum,
+                    "flex_attn_metal_fast", tuned_tg
+                );
+            } else if (use_gqa2_specialized) {
+                dispatch_fast_kernel(
+                    rt.pipeline_dh64_bs4_gqa2_single,
+                    rt.thread_execution_width_dh64_bs4_gqa2_single,
+                    qh, kh, vh, active_blocks, out,
+                    B, Hq, T, L, Dh, BlockSize, ActiveCount, Causal, Hkv,
+                    FP16Accum,
+                    "flex_attn_metal_fast", tuned_tg
+                );
+            } else {
+                dispatch_fast_kernel(
+                    rt.pipeline_dh64_bs4_single, rt.thread_execution_width_dh64_bs4_single, qh, kh, vh, active_blocks, out,
+                    B, Hq, T, L, Dh, BlockSize, ActiveCount, Causal, Hkv,
+                    FP16Accum,
+                    "flex_attn_metal_fast", tuned_tg
+                );
+            }
         } else {
             dispatch_fast_kernel(
-                rt.pipeline_dh64_bs4_single, rt.thread_execution_width_dh64_bs4_single, q, k, v, active_blocks, out,
+                rt.pipeline_generic, rt.thread_execution_width_generic, qh, kh, vh, active_blocks, out,
                 B, Hq, T, L, Dh, BlockSize, ActiveCount, Causal, Hkv,
                 FP16Accum,
-                "flex_attn_metal_fast", tuned_tg
+                "flex_attn_metal_fast", 0u
             );
         }
     } else {
         dispatch_fast_kernel(
-            rt.pipeline_generic, rt.thread_execution_width_generic, q, k, v, active_blocks, out,
+            rt.pipeline_generic_block_written,
+            rt.thread_execution_width_generic_block_written,
+            qh, kh, vh, block_written, out,
             B, Hq, T, L, Dh, BlockSize, ActiveCount, Causal, Hkv,
             FP16Accum,
             "flex_attn_metal_fast", 0u
@@ -456,7 +503,7 @@ at::Tensor metal_flex_attn_fast_dispatch_impl(
     }
     // Do not force immediate commit/wait here; let MPS stream scheduling batch
     // this op naturally with surrounding kernels for better throughput.
-    return out;
+    return use_bf16_io ? out.to(input_dtype) : out;
 }
 
 at::Tensor metal_flex_attn_fast_dispatch_active_impl(
@@ -470,11 +517,13 @@ at::Tensor metal_flex_attn_fast_dispatch_active_impl(
     TORCH_CHECK(q.device().is_mps() && k.device().is_mps() && v.device().is_mps(),
                 "flex_attn_metal_fast_active expects q/k/v on MPS");
     TORCH_CHECK(active_blocks.device().is_mps(), "active_blocks must be on MPS");
-    TORCH_CHECK(q.scalar_type() == at::kHalf && k.scalar_type() == at::kHalf && v.scalar_type() == at::kHalf,
-                "flex_attn_metal_fast_active currently supports float16 only");
+    TORCH_CHECK(
+        (q.scalar_type() == at::kHalf || q.scalar_type() == at::kBFloat16)
+            && q.scalar_type() == k.scalar_type()
+            && q.scalar_type() == v.scalar_type(),
+        "flex_attn_metal_fast_active currently supports float16 or bfloat16 (matching dtypes)"
+    );
     TORCH_CHECK(active_blocks.scalar_type() == at::kInt, "active_blocks must be int32");
-    TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(),
-                "flex_attn_metal_fast_active expects contiguous q/k/v");
     TORCH_CHECK(active_blocks.is_contiguous(), "active_blocks must be contiguous");
     TORCH_CHECK(k.sizes() == v.sizes(), "k and v must match");
     TORCH_CHECK(q.size(0) == k.size(0) && q.size(3) == k.size(3),
@@ -483,12 +532,22 @@ at::Tensor metal_flex_attn_fast_dispatch_active_impl(
     TORCH_CHECK((q.size(1) % k.size(1)) == 0, "q heads must be divisible by kv heads for GQA");
     TORCH_CHECK(block_size > 0, "block_size must be > 0");
 
-    const uint32_t B = static_cast<uint32_t>(q.size(0));
-    const uint32_t Hq = static_cast<uint32_t>(q.size(1));
-    const uint32_t Hkv = static_cast<uint32_t>(k.size(1));
-    const uint32_t T = static_cast<uint32_t>(q.size(2));
-    const uint32_t L = static_cast<uint32_t>(k.size(2));
-    const uint32_t Dh = static_cast<uint32_t>(q.size(3));
+    auto& rt = get_metal_runtime();
+    TORCH_CHECK(rt.init_ok, "flex_attn_metal_fast_active: metal runtime init failed");
+
+    const auto input_dtype = q.scalar_type();
+    const bool use_bf16_io = (input_dtype == at::kBFloat16);
+    const bool use_native_bf16_generic = use_bf16_io && (rt.pipeline_generic_bf16 != nil);
+    const at::Tensor qh = use_native_bf16_generic ? q.contiguous() : (use_bf16_io ? q.to(at::kHalf).contiguous() : q.contiguous());
+    const at::Tensor kh = use_native_bf16_generic ? k.contiguous() : (use_bf16_io ? k.to(at::kHalf).contiguous() : k.contiguous());
+    const at::Tensor vh = use_native_bf16_generic ? v.contiguous() : (use_bf16_io ? v.to(at::kHalf).contiguous() : v.contiguous());
+
+    const uint32_t B = static_cast<uint32_t>(qh.size(0));
+    const uint32_t Hq = static_cast<uint32_t>(qh.size(1));
+    const uint32_t Hkv = static_cast<uint32_t>(kh.size(1));
+    const uint32_t T = static_cast<uint32_t>(qh.size(2));
+    const uint32_t L = static_cast<uint32_t>(kh.size(2));
+    const uint32_t Dh = static_cast<uint32_t>(qh.size(3));
     TORCH_CHECK(Dh <= 128, "flex_attn_metal_fast_active currently supports Dh <= 128");
     const uint32_t BlockSize = static_cast<uint32_t>(block_size);
     const uint32_t KVBLOCKS = (L + BlockSize - 1) / BlockSize;
@@ -499,16 +558,19 @@ at::Tensor metal_flex_attn_fast_dispatch_active_impl(
     );
     const uint32_t ActiveCount = static_cast<uint32_t>(active_blocks.numel());
 
-    auto& rt = get_metal_runtime();
-    TORCH_CHECK(rt.init_ok, "flex_attn_metal_fast_active: metal runtime init failed");
-
-    at::Tensor out = at::zeros_like(q);
+    at::Tensor out = at::zeros_like(qh);
     if (ActiveCount == 0) {
-        return out;
+        return use_bf16_io ? out.to(input_dtype) : out;
     }
     const uint32_t FP16Accum = enable_fp16_accum() ? 1u : 0u;
-    const bool use_specialized = (Dh == 64u && BlockSize == 4u);
-    if (use_specialized) {
+    if (use_native_bf16_generic) {
+        dispatch_fast_kernel(
+            rt.pipeline_generic_bf16, rt.thread_execution_width_generic_bf16, qh, kh, vh, active_blocks, out,
+            B, Hq, T, L, Dh, BlockSize, ActiveCount, Causal, Hkv,
+            FP16Accum,
+            "flex_attn_metal_fast_active", 0u
+        );
+    } else if (Dh == 64u && BlockSize == 4u) {
         const float density = static_cast<float>(ActiveCount) / static_cast<float>(std::max<uint32_t>(1u, KVBLOCKS));
         const bool use_gqa2_specialized = (Hq == (Hkv << 1));
         const bool use_gqa2_dense = use_gqa2_specialized && (ActiveCount == KVBLOCKS);
@@ -518,7 +580,7 @@ at::Tensor metal_flex_attn_fast_dispatch_active_impl(
             dispatch_fast_kernel_dh64_bs4_gqa2_dualhead(
                 rt.pipeline_dh64_bs4_gqa2_dualhead,
                 rt.thread_execution_width_dh64_bs4_gqa2_dualhead,
-                q, k, v, active_blocks, out,
+                qh, kh, vh, active_blocks, out,
                 B, Hq, T, L, Dh, BlockSize, ActiveCount, Causal, Hkv,
                 FP16Accum,
                 "flex_attn_metal_fast_active", tuned_tg
@@ -527,7 +589,7 @@ at::Tensor metal_flex_attn_fast_dispatch_active_impl(
             dispatch_fast_kernel(
                 rt.pipeline_dh64_bs4_gqa2_dense,
                 rt.thread_execution_width_dh64_bs4_gqa2_dense,
-                q, k, v, active_blocks, out,
+                qh, kh, vh, active_blocks, out,
                 B, Hq, T, L, Dh, BlockSize, ActiveCount, Causal, Hkv,
                 FP16Accum,
                 "flex_attn_metal_fast_active", tuned_tg
@@ -536,14 +598,14 @@ at::Tensor metal_flex_attn_fast_dispatch_active_impl(
             dispatch_fast_kernel(
                 rt.pipeline_dh64_bs4_gqa2_single,
                 rt.thread_execution_width_dh64_bs4_gqa2_single,
-                q, k, v, active_blocks, out,
+                qh, kh, vh, active_blocks, out,
                 B, Hq, T, L, Dh, BlockSize, ActiveCount, Causal, Hkv,
                 FP16Accum,
                 "flex_attn_metal_fast_active", tuned_tg
             );
         } else {
             dispatch_fast_kernel(
-                rt.pipeline_dh64_bs4_single, rt.thread_execution_width_dh64_bs4_single, q, k, v, active_blocks, out,
+                rt.pipeline_dh64_bs4_single, rt.thread_execution_width_dh64_bs4_single, qh, kh, vh, active_blocks, out,
                 B, Hq, T, L, Dh, BlockSize, ActiveCount, Causal, Hkv,
                 FP16Accum,
                 "flex_attn_metal_fast_active", tuned_tg
@@ -551,13 +613,13 @@ at::Tensor metal_flex_attn_fast_dispatch_active_impl(
         }
     } else {
         dispatch_fast_kernel(
-            rt.pipeline_generic, rt.thread_execution_width_generic, q, k, v, active_blocks, out,
+            rt.pipeline_generic, rt.thread_execution_width_generic, qh, kh, vh, active_blocks, out,
             B, Hq, T, L, Dh, BlockSize, ActiveCount, Causal, Hkv,
             FP16Accum,
             "flex_attn_metal_fast_active", 0u
         );
     }
-    return out;
+    return (use_bf16_io && !use_native_bf16_generic) ? out.to(input_dtype) : out;
 }
 
 at::Tensor metal_flex_attn_fast_dispatch_from_mask_impl(
@@ -569,10 +631,12 @@ at::Tensor metal_flex_attn_fast_dispatch_from_mask_impl(
 ) {
     TORCH_CHECK(q.device().is_mps() && k.device().is_mps() && v.device().is_mps(),
                 "flex_attn_metal_fast expects q/k/v on MPS");
-    TORCH_CHECK(q.scalar_type() == at::kHalf && k.scalar_type() == at::kHalf && v.scalar_type() == at::kHalf,
-                "flex_attn_metal_fast currently supports float16 only");
-    TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(),
-                "flex_attn_metal_fast expects contiguous q/k/v");
+    TORCH_CHECK(
+        (q.scalar_type() == at::kHalf || q.scalar_type() == at::kBFloat16)
+            && q.scalar_type() == k.scalar_type()
+            && q.scalar_type() == v.scalar_type(),
+        "flex_attn_metal_fast currently supports float16 or bfloat16 (matching dtypes)"
+    );
     TORCH_CHECK(k.sizes() == v.sizes(), "k and v must match");
     TORCH_CHECK(q.size(0) == k.size(0) && q.size(3) == k.size(3),
                 "q/k must match on batch and head dim");

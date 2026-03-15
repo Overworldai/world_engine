@@ -10,13 +10,6 @@ from torch import Tensor
 
 from torch.nn.attention.flex_attention import flex_attention
 
-try:
-    import torch.library  # type: ignore[attr-defined]
-
-    _HAS_METAL_BACKEND = True
-except Exception:
-    _HAS_METAL_BACKEND = False
-
 
 class AttnBackend(str, Enum):
     PYTORCH_FLEX = "pytorch-flex"
@@ -42,6 +35,20 @@ def _metal_impl_mode() -> str:
     # WORLD_METAL_IMPL=ref|fast
     mode = os.getenv("WORLD_METAL_IMPL", "ref").lower()
     return "fast" if mode == "fast" else "ref"
+
+
+def _metal_use_causal(cfg: "AttnConfig") -> bool:
+    """
+    Keep Metal behavior aligned with flex_attention backend semantics.
+
+    The flex path in this repo does not pass `causal` explicitly into
+    `flex_attention`; masking semantics are encoded by BlockMask metadata.
+    To preserve CPU/CUDA parity, Metal defaults to non-causal unless
+    explicitly overridden.
+    """
+    if os.getenv("WORLD_METAL_FORCE_CAUSAL", "0") == "1":
+        return bool(cfg.causal)
+    return False
 
 
 @dataclass
@@ -92,7 +99,7 @@ def world_flex_attn_forward(
     v: Tensor,
     meta: Optional[AttnMeta],
     cfg: AttnConfig,
-    backend: AttnBackend = AttnBackend.default(),
+    backend: Optional[AttnBackend] = None,
 ) -> Tensor:
     """
     Backend-neutral attention entrypoint used by high-level modules.
@@ -107,6 +114,9 @@ def world_flex_attn_forward(
             - AUTO:         choose PYTORCH_FLEX or METAL based on device /
                             availability.
     """
+    if backend is None:
+        backend = AttnBackend.default()
+
     if backend is AttnBackend.AUTO:
         backend = AttnBackend.METAL if q.device.type == "mps" else AttnBackend.PYTORCH_FLEX
 
@@ -115,21 +125,20 @@ def world_flex_attn_forward(
         return flex_attention(q, k, v, block_mask=block_mask, enable_gqa=cfg.enable_gqa)
 
     if backend is AttnBackend.METAL:
-        if not _HAS_METAL_BACKEND:
-            raise RuntimeError("Metal attention backend requested but custom op is not available")
         mask = None
         mode = _metal_impl_mode()
+        use_causal = _metal_use_causal(cfg)
         if mode == "fast":
             if meta is not None and meta.active_blocks is not None and meta.block_size is not None:
                 return torch.ops.world.flex_attn_metal_fast_active(
-                    q, k, v, meta.active_blocks, int(meta.block_size), cfg.causal
+                    q, k, v, meta.active_blocks, int(meta.block_size), use_causal
                 )
             if meta is not None and meta.block_written is not None and meta.block_size is not None:
                 return torch.ops.world.flex_attn_metal_fast_blocks(
-                    q, k, v, meta.block_written, int(meta.block_size), cfg.causal
+                    q, k, v, meta.block_written, int(meta.block_size), use_causal
                 )
-            return torch.ops.world.flex_attn_metal_fast(q, k, v, mask, cfg.causal)
-        return torch.ops.world.flex_attn_metal_ref(q, k, v, mask, cfg.causal)
+            return torch.ops.world.flex_attn_metal_fast(q, k, v, mask, use_causal)
+        return torch.ops.world.flex_attn_metal_ref(q, k, v, mask, use_causal)
 
     raise ValueError(f"Unknown attention backend: {backend}")
 

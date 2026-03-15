@@ -1,11 +1,7 @@
 import time
-from pathlib import Path
-import sys
 
 import pytest
 import torch
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src" / "model"))
 
 from attn_backend import (
     AttnBackend,
@@ -13,6 +9,7 @@ from attn_backend import (
     AttnMeta,
     world_flex_attn_forward,
 )
+from metal_test_utils import require_metal_attn_ops, timed_ms_sync
 
 
 pytestmark = pytest.mark.skipif(
@@ -35,35 +32,8 @@ def _rand_gqa_tensors(B: int, Hq: int, Hkv: int, T: int, L: int, Dh: int, dtype:
     return q, k, v
 
 
-def _require_metal_ops():
-    if not hasattr(torch.ops, "world"):
-        pytest.skip("Metal world namespace not registered")
-    if not (
-        hasattr(torch.ops.world, "flex_attn_metal_ref")
-        and hasattr(torch.ops.world, "flex_attn_metal_fast")
-        and hasattr(torch.ops.world, "flex_attn_metal_fast_blocks")
-        and hasattr(torch.ops.world, "flex_attn_metal_fast_active")
-    ):
-        pytest.skip("Metal ref/fast/fast_blocks/fast_active ops not registered")
-
-
-def _timed_ms_sync(fn, warmup: int, iters: int):
-    for _ in range(warmup):
-        fn()
-    torch.mps.synchronize()
-    samples = []
-    for _ in range(iters):
-        t0 = time.perf_counter()
-        fn()
-        torch.mps.synchronize()
-        samples.append((time.perf_counter() - t0) * 1000.0)
-    samples_t = torch.tensor(samples, dtype=torch.float64)
-    return {
-        "mean_ms": float(samples_t.mean().item()),
-        "p50_ms": float(samples_t.quantile(0.50).item()),
-        "p95_ms": float(samples_t.quantile(0.95).item()),
-        "max_ms": float(samples_t.max().item()),
-    }
+_require_metal_ops = require_metal_attn_ops
+_timed_ms_sync = timed_ms_sync
 
 
 @pytest.mark.parametrize("dtype", [torch.float16])

@@ -95,7 +95,8 @@ kernel void metal_flex_attn_forward(
         return;
     }
 
-    const uint kv_limit = (causal != 0) ? min((uint)L, t + 1) : (uint)L;
+    const uint q_start = (L > T) ? (L - T) : 0u;
+    const uint kv_limit = (causal != 0) ? min((uint)L, q_start + t + 1u) : (uint)L;
     if (kv_limit == 0) {
         for (uint d = 0; d < Dh; ++d) {
             out[out_offset + d] = half(0.0h);
@@ -166,6 +167,247 @@ kernel void metal_flex_attn_forward(
     }
 }
 
+kernel void metal_flex_attn_forward_from_block_written(
+    device const half*         q,
+    device const half*         k,
+    device const half*         v,
+    device const uchar*        block_written, // [kv_blocks] 0/1
+    device half*               out,
+    constant uint&             B,
+    constant uint&             Hq,
+    constant uint&             T,
+    constant uint&             L,
+    constant uint&             Dh,
+    constant uint&             block_size,
+    constant uint&             active_count, // interpreted as kv_blocks in this kernel
+    constant uint&             causal,
+    constant uint&             Hkv,
+    constant uint&             fp16_accum,
+    uint                       tid        [[thread_position_in_grid]],
+    uint                       lane_id    [[thread_index_in_simdgroup]],
+    uint                       simd_size  [[threads_per_simdgroup]]
+) {
+    (void)fp16_accum;
+    const uint total_queries = B * Hq * T;
+    if (simd_size == 0) {
+        return;
+    }
+    const uint qid = tid / simd_size;
+    if (qid >= total_queries) {
+        return;
+    }
+
+    const uint bh = qid / T;
+    const uint t = qid % T;
+    const uint b = bh / Hq;
+    const uint hq = bh % Hq;
+    const uint group_size = max((uint)1, Hq / max((uint)1, Hkv));
+    const uint hkv = min(hq / group_size, max((uint)0, Hkv - 1));
+
+    const uint q_offset = (((b * Hq + hq) * T + t) * Dh);
+    const uint kv_base = (((b * Hkv + hkv) * L) * Dh);
+    const uint out_offset = q_offset;
+    const float inv_sqrt_dh = rsqrt((float)Dh);
+    const uint safe_block_size = max((uint)1, block_size);
+    const uint kv_blocks = active_count;
+    const uint kMaxDh = 128;
+
+    if (Dh > kMaxDh) {
+        for (uint d = 0; d < Dh; ++d) {
+            out[out_offset + d] = half(0.0h);
+        }
+        return;
+    }
+
+    const uint q_start = (L > T) ? (L - T) : 0u;
+    const uint kv_limit = (causal != 0) ? min((uint)L, q_start + t + 1u) : (uint)L;
+    if (kv_limit == 0) {
+        for (uint d = 0; d < Dh; ++d) {
+            out[out_offset + d] = half(0.0h);
+        }
+        return;
+    }
+
+    float m = -INFINITY;
+    float l_acc = 0.0f;
+    uint owned_dims[4];
+    float q_regs[4];
+    float acc[4];
+    uint owned_count = 0;
+    for (uint d = lane_id; d < Dh; d += simd_size) {
+        if (owned_count < 4) {
+            owned_dims[owned_count] = d;
+            q_regs[owned_count] = (float)q[q_offset + d];
+            acc[owned_count] = 0.0f;
+            owned_count++;
+        }
+    }
+
+    for (uint bidx = 0; bidx < kv_blocks; ++bidx) {
+        if (block_written[bidx] == 0) {
+            continue;
+        }
+        const uint block_start = bidx * safe_block_size;
+        if (block_start >= kv_limit) {
+            break;
+        }
+        const uint block_end = min(kv_limit, block_start + safe_block_size);
+        for (uint kv_idx = block_start; kv_idx < block_end; ++kv_idx) {
+            float dot_local = 0.0f;
+            const uint k_offset = kv_base + kv_idx * Dh;
+            for (uint i = 0; i < owned_count; ++i) {
+                const uint d = owned_dims[i];
+                dot_local += q_regs[i] * (float)k[k_offset + d];
+            }
+            const float dot = simd_sum(dot_local);
+            const float s = dot * inv_sqrt_dh;
+            const float m_new = max(m, s);
+            const float alpha = fast::exp(m - m_new);
+            const float beta = fast::exp(s - m_new);
+            const uint v_offset = kv_base + kv_idx * Dh;
+
+            for (uint i = 0; i < owned_count; ++i) {
+                const uint d2 = owned_dims[i];
+                acc[i] = acc[i] * alpha + beta * (float)v[v_offset + d2];
+            }
+            l_acc = l_acc * alpha + beta;
+            m = m_new;
+        }
+    }
+
+    if (!(l_acc > 0.0f)) {
+        for (uint i = 0; i < owned_count; ++i) {
+            out[out_offset + owned_dims[i]] = half(0.0h);
+        }
+        return;
+    }
+
+    const float inv_l = 1.0f / l_acc;
+    for (uint i = 0; i < owned_count; ++i) {
+        out[out_offset + owned_dims[i]] = half(acc[i] * inv_l);
+    }
+}
+
+#if __METAL_VERSION__ >= 310
+kernel void metal_flex_attn_forward_bf16(
+    device const bfloat*       q,
+    device const bfloat*       k,
+    device const bfloat*       v,
+    device const int*          active_blocks, // [active_count] block indices
+    device bfloat*             out,
+    constant uint&             B,
+    constant uint&             Hq,
+    constant uint&             T,
+    constant uint&             L,
+    constant uint&             Dh,
+    constant uint&             block_size,
+    constant uint&             active_count,
+    constant uint&             causal,
+    constant uint&             Hkv,
+    constant uint&             fp16_accum,
+    uint                       tid        [[thread_position_in_grid]],
+    uint                       lane_id    [[thread_index_in_simdgroup]],
+    uint                       simd_size  [[threads_per_simdgroup]]
+) {
+    (void)fp16_accum;
+    const uint total_queries = B * Hq * T;
+    if (simd_size == 0) {
+        return;
+    }
+    const uint qid = tid / simd_size;
+    if (qid >= total_queries) {
+        return;
+    }
+
+    const uint bh = qid / T;
+    const uint t = qid % T;
+    const uint b = bh / Hq;
+    const uint hq = bh % Hq;
+    const uint group_size = max((uint)1, Hq / max((uint)1, Hkv));
+    const uint hkv = min(hq / group_size, max((uint)0, Hkv - 1));
+
+    const uint q_offset = (((b * Hq + hq) * T + t) * Dh);
+    const uint kv_base = (((b * Hkv + hkv) * L) * Dh);
+    const uint out_offset = q_offset;
+    const float inv_sqrt_dh = rsqrt((float)Dh);
+    const uint safe_block_size = max((uint)1, block_size);
+    const uint kMaxDh = 128;
+
+    if (Dh > kMaxDh) {
+        for (uint d = 0; d < Dh; ++d) {
+            out[out_offset + d] = bfloat(0.0f);
+        }
+        return;
+    }
+
+    const uint q_start = (L > T) ? (L - T) : 0u;
+    const uint kv_limit = (causal != 0) ? min((uint)L, q_start + t + 1u) : (uint)L;
+    if (kv_limit == 0) {
+        for (uint d = 0; d < Dh; ++d) {
+            out[out_offset + d] = bfloat(0.0f);
+        }
+        return;
+    }
+
+    float m = -INFINITY;
+    float l_acc = 0.0f;
+    uint owned_dims[4];
+    float q_regs[4];
+    float acc[4];
+    uint owned_count = 0;
+    for (uint d = lane_id; d < Dh; d += simd_size) {
+        if (owned_count < 4) {
+            owned_dims[owned_count] = d;
+            q_regs[owned_count] = (float)q[q_offset + d];
+            acc[owned_count] = 0.0f;
+            owned_count++;
+        }
+    }
+
+    for (uint ai = 0; ai < active_count; ++ai) {
+        const uint bidx = (uint)active_blocks[ai];
+        const uint block_start = bidx * safe_block_size;
+        if (block_start >= kv_limit) {
+            break;
+        }
+        const uint block_end = min(kv_limit, block_start + safe_block_size);
+        for (uint kv_idx = block_start; kv_idx < block_end; ++kv_idx) {
+            float dot_local = 0.0f;
+            const uint k_offset = kv_base + kv_idx * Dh;
+            for (uint i = 0; i < owned_count; ++i) {
+                const uint d = owned_dims[i];
+                dot_local += q_regs[i] * (float)k[k_offset + d];
+            }
+            const float dot = simd_sum(dot_local);
+            const float s = dot * inv_sqrt_dh;
+            const float m_new = max(m, s);
+            const float alpha = fast::exp(m - m_new);
+            const float beta = fast::exp(s - m_new);
+            const uint v_offset = kv_base + kv_idx * Dh;
+
+            for (uint i = 0; i < owned_count; ++i) {
+                const uint d2 = owned_dims[i];
+                acc[i] = acc[i] * alpha + beta * (float)v[v_offset + d2];
+            }
+            l_acc = l_acc * alpha + beta;
+            m = m_new;
+        }
+    }
+
+    if (!(l_acc > 0.0f)) {
+        for (uint i = 0; i < owned_count; ++i) {
+            out[out_offset + owned_dims[i]] = bfloat(0.0f);
+        }
+        return;
+    }
+
+    const float inv_l = 1.0f / l_acc;
+    for (uint i = 0; i < owned_count; ++i) {
+        out[out_offset + owned_dims[i]] = bfloat(acc[i] * inv_l);
+    }
+}
+#endif
+
 kernel void metal_flex_attn_forward_dh64_bs4_single(
     device const half*         q,
     device const half*         k,
@@ -207,7 +449,8 @@ kernel void metal_flex_attn_forward_dh64_bs4_single(
     const uint out_offset = q_offset;
     const float inv_sqrt_dh = 0.125f;
     const uint d_pair = lane_id << 1; // contiguous pair in [0, 62]
-    const uint kv_limit = (causal != 0) ? min((uint)L, t + 1u) : (uint)L;
+    const uint q_start = (L > T) ? (L - T) : 0u;
+    const uint kv_limit = (causal != 0) ? min((uint)L, q_start + t + 1u) : (uint)L;
     if (kv_limit == 0u) {
         out[out_offset + d_pair + 0u] = half(0.0h);
         out[out_offset + d_pair + 1u] = half(0.0h);
@@ -391,7 +634,8 @@ kernel void metal_flex_attn_forward_dh64_bs4_gqa2_single(
     const uint out_offset = q_offset;
     const float inv_sqrt_dh = 0.125f;
     const uint d_pair = lane_id << 1;
-    const uint kv_limit = (causal != 0) ? min((uint)L, t + 1u) : (uint)L;
+    const uint q_start = (L > T) ? (L - T) : 0u;
+    const uint kv_limit = (causal != 0) ? min((uint)L, q_start + t + 1u) : (uint)L;
     if (kv_limit == 0u) {
         out[out_offset + d_pair + 0u] = half(0.0h);
         out[out_offset + d_pair + 1u] = half(0.0h);
@@ -556,7 +800,8 @@ kernel void metal_flex_attn_forward_dh64_bs4_gqa2_dualhead(
     const uint kv_base = (((b * Hkv + hkv) * L) * 64u);
     const float inv_sqrt_dh = 0.125f;
     const uint d_pair = lane_id << 1;
-    const uint kv_limit = (causal != 0) ? min((uint)L, t + 1u) : (uint)L;
+    const uint q_start = (L > T) ? (L - T) : 0u;
+    const uint kv_limit = (causal != 0) ? min((uint)L, q_start + t + 1u) : (uint)L;
     if (kv_limit == 0u || active_count == 0u) {
         out[out_offset0 + d_pair + 0u] = half(0.0h);
         out[out_offset0 + d_pair + 1u] = half(0.0h);
@@ -680,7 +925,8 @@ kernel void metal_flex_attn_forward_dh64_bs4_gqa2_dense(
     const uint out_offset = q_offset;
     const float inv_sqrt_dh = 0.125f;
     const uint d_pair = lane_id << 1;
-    const uint kv_limit = (causal != 0) ? min((uint)L, t + 1u) : (uint)L;
+    const uint q_start = (L > T) ? (L - T) : 0u;
+    const uint kv_limit = (causal != 0) ? min((uint)L, q_start + t + 1u) : (uint)L;
     if (kv_limit == 0u || active_count == 0u) {
         out[out_offset + d_pair + 0u] = half(0.0h);
         out[out_offset + d_pair + 1u] = half(0.0h);

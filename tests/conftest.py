@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 from pathlib import Path
-import os
 import math
+import sys
 
 import pytest
 import torch
-from torch.utils.cpp_extension import load
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src" / "model"))
+
+from metal.runtime import ensure_metal_attention_op_loaded
 
 
-_EXT_NAME = "world_metal_attn_ext"
-_EXT_BUILT = False
 _FALLBACK_REGISTERED = False
 
 
@@ -136,46 +138,7 @@ def _register_python_fallback_op() -> None:
 
 
 def _load_metal_attention_extension() -> None:
-    global _EXT_BUILT
-    if _EXT_BUILT:
-        return
-
-    if not torch.backends.mps.is_available():
-        # Let MPS-gated tests skip naturally.
-        return
-
-    source = Path(__file__).resolve().parents[1] / "src" / "metal" / "metal_flex_attn_op.mm"
-    if not source.exists():
-        raise FileNotFoundError(f"Missing Metal extension source: {source}")
-
-    build_dir = Path(__file__).resolve().parents[1] / ".build" / "torch_extensions"
-    build_dir.mkdir(parents=True, exist_ok=True)
-
-    repo_root = Path(__file__).resolve().parents[1]
-    venv_bin = repo_root / ".venv" / "bin"
-
-    # Make the extension cache deterministic in this repo.
-    os.environ.setdefault("TORCH_EXTENSIONS_DIR", str(build_dir))
-    # torch.utils.cpp_extension shells out to `ninja`; ensure the venv binary
-    # is discoverable even when PATH is inherited from the host shell.
-    if venv_bin.exists():
-        os.environ["PATH"] = f"{venv_bin}:{os.environ.get('PATH', '')}"
-        os.environ.setdefault("NINJA", str(venv_bin / "ninja"))
-
-    try:
-        load(
-            name=_EXT_NAME,
-            sources=[str(source)],
-            extra_cflags=["-std=c++17"],
-            extra_ldflags=["-framework", "Metal", "-framework", "Foundation"],
-            with_cuda=False,
-            is_python_module=False,
-            verbose=False,
-        )
-        _EXT_BUILT = True
-    except Exception:
-        # Keep tests executable on environments where the ObjC++ binding is not
-        # yet compatible with the installed torch MPS headers.
+    if not ensure_metal_attention_op_loaded():
         _register_python_fallback_op()
 
 

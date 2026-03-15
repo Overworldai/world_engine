@@ -105,7 +105,11 @@ class NoiseConditioner(NoCastModule):
         super().__init__()
         assert fourier_dim % 2 == 0
         half = fourier_dim // 2
-        self.freq = nn.Buffer(torch.logspace(0, -1, steps=half, base=base, dtype=torch.float32), persistent=False)
+        # Build on CPU to avoid MPS missing logspace kernel during model init.
+        self.freq = nn.Buffer(
+            torch.logspace(0, -1, steps=half, base=base, dtype=torch.float32, device="cpu"),
+            persistent=False,
+        )
         self.mlp = MLP(fourier_dim, dim * 4, dim)
 
     def forward(self, s, eps=torch.finfo(torch.float32).eps):

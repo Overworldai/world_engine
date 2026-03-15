@@ -1,4 +1,5 @@
 from typing import Dict, Optional, Set, Tuple
+import os
 import torch
 from torch import Tensor
 from dataclasses import dataclass, field
@@ -15,6 +16,8 @@ torch.set_float32_matmul_precision("medium")  # low: bf16, medium: tf32, high: f
 
 # fix graph break:
 torch._dynamo.config.capture_scalar_outputs = True
+# Avoid per-layer recompiles from static integer attrs like layer_idx on MPS mixed-compile paths.
+torch._dynamo.config.allow_unspec_int_on_nn_module = True
 
 COMPILE_OPTIONS = {
     "max_autotune": True,
@@ -41,7 +44,9 @@ class WorldEngine:
         model_config_overrides: Optional[Dict] = None,
         device=None,
         dtype=torch.bfloat16,
-        load_weights: bool = True
+        load_weights: bool = True,
+        scheduler_steps: Optional[int] = None,
+        cache_interval: int = 1,
     ):
         """
         model_uri: HF URI or local folder containing model.safetensors and config.yaml
@@ -50,6 +55,16 @@ class WorldEngine:
         """
         self.device = torch.get_default_device() if device is None else device
         self.dtype = torch.get_default_dtype() if dtype is None else dtype
+        if cache_interval <= 0:
+            raise ValueError("cache_interval must be >= 1")
+        self.cache_interval = int(cache_interval)
+        self._gen_count = 0
+        force_compile_metal = os.getenv("WORLD_FORCE_COMPILE_METAL", "0") == "1"
+        self._disable_compile = (
+            str(self.device).startswith("mps")
+            and os.getenv("WORLD_ATTENTION_BACKEND", "flex").lower() == "metal"
+            and not force_compile_metal
+        )
 
         self.model_cfg = WorldModel.load_config(model_uri)
 
@@ -76,6 +91,18 @@ class WorldEngine:
 
             # Inference Scheduler
             self.scheduler_sigmas = torch.tensor(self.model_cfg.scheduler_sigmas, dtype=dtype)
+            if scheduler_steps is not None:
+                if scheduler_steps <= 0:
+                    raise ValueError("scheduler_steps must be > 0 when provided")
+                if scheduler_steps > int(self.scheduler_sigmas.numel()):
+                    raise ValueError(
+                        f"scheduler_steps={scheduler_steps} exceeds available "
+                        f"{int(self.scheduler_sigmas.numel())}"
+                    )
+                self.scheduler_sigmas = self.scheduler_sigmas[: int(scheduler_steps)].contiguous()
+            self.scheduler_dsigmas = self.scheduler_sigmas.diff().contiguous()
+            self.scheduler_step_sigmas = self.scheduler_sigmas[:-1].contiguous()
+            self._sigma_zero = torch.zeros((1, 1), dtype=dtype)
 
             pH, pW = getattr(self.model_cfg, "patch", [1, 1])
             self.frm_shape = 1, 1, self.model_cfg.channels, self.model_cfg.height * pH, self.model_cfg.width * pW
@@ -83,7 +110,7 @@ class WorldEngine:
             # State
             inference_fps = getattr(self.model_cfg, "inference_fps", self.model_cfg.base_fps)
             latent_fps = inference_fps / getattr(self.model_cfg, "temporal_compression", 1)
-            self.ts_mult = int(self.model_cfg.base_fps) // latent_fps
+            self.ts_mult = int(int(self.model_cfg.base_fps) // latent_fps)
             self.frame_ts = torch.tensor([[0]], dtype=torch.long)
 
             # Static input context tensors
@@ -96,11 +123,19 @@ class WorldEngine:
             }
 
             self._prompt_ctx = {"prompt_emb": None, "prompt_pad_mask": None}
+            if force_compile_metal and str(self.device).startswith("mps") and os.getenv("WORLD_ATTENTION_BACKEND", "flex").lower() == "metal":
+                # Allow graph breaks around custom Metal ops while still compiling dense surrounding math.
+                self._cache_pass_fn = self._cache_pass_mixed
+                self._denoise_pass_fn = self._denoise_pass_mixed
+            else:
+                self._cache_pass_fn = self._cache_pass_eager if self._disable_compile else self._cache_pass
+                self._denoise_pass_fn = self._denoise_pass_eager if self._disable_compile else self._denoise_pass
 
     @torch.inference_mode()
     def reset(self):
         """Reset state for new generation"""
         self.kv_cache.reset()
+        self._gen_count = 0
         self.frame_ts.zero_()
         for v in self._ctx.values():
             v.zero_()
@@ -128,15 +163,17 @@ class WorldEngine:
         assert img.dtype == torch.uint8, img.dtype
         x0 = self.vae.encode(img).unsqueeze(1)
         inputs = self.prep_inputs(x=x0, ctrl=ctrl)
-        self._cache_pass(x0, inputs, self.kv_cache)
+        self._cache_pass_fn(x0, inputs, self.kv_cache)
         return img
 
     @torch.inference_mode()
     def gen_frame(self, ctrl: CtrlInput = None, return_img: bool = True):
         x = torch.randn(self.frm_shape, device=self.device, dtype=self.dtype)
         inputs = self.prep_inputs(x=x, ctrl=ctrl)
-        x0 = self._denoise_pass(x, inputs, self.kv_cache).clone()
-        self._cache_pass(x0, inputs, self.kv_cache)
+        x0 = self._denoise_pass_fn(x, inputs, self.kv_cache)
+        if (self._gen_count % self.cache_interval) == 0:
+            self._cache_pass_fn(x0, inputs, self.kv_cache)
+        self._gen_count += 1
         return (self.vae.decode(x0.squeeze(1)) if return_img else x0.squeeze(1))
 
     @torch.compile
@@ -156,8 +193,14 @@ class WorldEngine:
         self._ctx["button"].zero_()
         if ctrl.button:
             self._ctx["button"][..., list(ctrl.button)] = 1.0
-        ctrl.mouse = torch.as_tensor(ctrl.mouse, device=x.device, dtype=self.dtype)
-        ctrl.scroll_wheel = torch.sign(torch.as_tensor(ctrl.scroll_wheel, device=x.device, dtype=self.dtype))
+        mx, my = ctrl.mouse
+        ctrl.mouse = (float(mx), float(my))
+        if ctrl.scroll_wheel > 0:
+            ctrl.scroll_wheel = 1.0
+        elif ctrl.scroll_wheel < 0:
+            ctrl.scroll_wheel = -1.0
+        else:
+            ctrl.scroll_wheel = 0.0
         ctx = self._prep_inputs(x, ctrl)
 
         # prepare prompt conditioning
@@ -170,14 +213,51 @@ class WorldEngine:
     @torch.compile(fullgraph=True, dynamic=False, options=COMPILE_OPTIONS)
     def _denoise_pass(self, x, ctx: Dict[str, Tensor], kv_cache):
         kv_cache.set_frozen(True)
-        sigma = x.new_empty((x.size(0), x.size(1)))
-        for step_sig, step_dsig in zip(self.scheduler_sigmas, self.scheduler_sigmas.diff()):
-            v = self.model(x, sigma.fill_(step_sig), **ctx, kv_cache=kv_cache)
-            x = x + step_dsig * v
+        bt = (x.size(0), x.size(1))
+        for i in range(self.scheduler_dsigmas.numel()):
+            sigma_bt = self.scheduler_step_sigmas[i].expand(bt)
+            v = self.model(x, sigma_bt, **ctx, kv_cache=kv_cache, ctrl_cond=True, prompt_cond=True)
+            x = x + self.scheduler_dsigmas[i] * v
+        return x
+
+    def _denoise_pass_eager(self, x, ctx: Dict[str, Tensor], kv_cache):
+        kv_cache.set_frozen(True)
+        bt = (x.size(0), x.size(1))
+        for i in range(self.scheduler_dsigmas.numel()):
+            sigma_bt = self.scheduler_step_sigmas[i].expand(bt)
+            v = self.model(x, sigma_bt, **ctx, kv_cache=kv_cache, ctrl_cond=True, prompt_cond=True)
+            x = x + self.scheduler_dsigmas[i] * v
+        return x
+
+    @torch.compile(dynamic=False, options=COMPILE_OPTIONS)
+    def _denoise_pass_mixed(self, x, ctx: Dict[str, Tensor], kv_cache):
+        kv_cache.set_frozen(True)
+        bt = (x.size(0), x.size(1))
+        for i in range(self.scheduler_dsigmas.numel()):
+            sigma_bt = self.scheduler_step_sigmas[i].expand(bt)
+            v = self.model(x, sigma_bt, **ctx, kv_cache=kv_cache, ctrl_cond=True, prompt_cond=True)
+            x = x + self.scheduler_dsigmas[i] * v
         return x
 
     @torch.compile(fullgraph=True, dynamic=False, options=COMPILE_OPTIONS)
     def _cache_pass(self, x, ctx: Dict[str, Tensor], kv_cache):
         """Side effect: updates kv cache"""
         kv_cache.set_frozen(False)
-        self.model(x, x.new_zeros((x.size(0), x.size(1))), **ctx, kv_cache=kv_cache)
+        self.model(
+            x, self._sigma_zero.expand((x.size(0), x.size(1))), **ctx, kv_cache=kv_cache, ctrl_cond=True, prompt_cond=True
+        )
+
+    def _cache_pass_eager(self, x, ctx: Dict[str, Tensor], kv_cache):
+        """Side effect: updates kv cache"""
+        kv_cache.set_frozen(False)
+        self.model(
+            x, self._sigma_zero.expand((x.size(0), x.size(1))), **ctx, kv_cache=kv_cache, ctrl_cond=True, prompt_cond=True
+        )
+
+    @torch.compile(dynamic=False, options=COMPILE_OPTIONS)
+    def _cache_pass_mixed(self, x, ctx: Dict[str, Tensor], kv_cache):
+        """Side effect: updates kv cache"""
+        kv_cache.set_frozen(False)
+        self.model(
+            x, self._sigma_zero.expand((x.size(0), x.size(1))), **ctx, kv_cache=kv_cache, ctrl_cond=True, prompt_cond=True
+        )

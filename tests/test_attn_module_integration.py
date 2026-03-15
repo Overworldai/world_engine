@@ -1,13 +1,9 @@
-from pathlib import Path
-import sys
-
 import pytest
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src" / "model"))
-
 from kv_cache import LayerKVCache
 from attn_backend import AttnBackend, AttnConfig, AttnMeta, world_flex_attn_forward
+from metal_test_utils import require_metal_attn_ops
 
 
 pytestmark = pytest.mark.skipif(
@@ -16,12 +12,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _require_metal_ops():
-    if not hasattr(torch.ops, "world"):
-        pytest.skip("Metal world namespace not registered")
-    required = ["flex_attn_metal_ref", "flex_attn_metal_fast", "flex_attn_metal_fast_blocks", "flex_attn_metal_fast_active"]
-    if not all(hasattr(torch.ops.world, name) for name in required):
-        pytest.skip("Required Metal ops not registered")
+_require_metal_ops = require_metal_attn_ops
 
 
 def _pos_ids(frame_idx: int, B: int, T: int, device: str):
@@ -53,6 +44,8 @@ def test_kv_cache_to_backend_path_matches_ref(causal, gqa, monkeypatch):
     k, v, _bm, block_written, active_blocks, bs = cache.upsert(
         torch.stack([kf, vf], dim=0), _pos_ids(1, B, T, "mps"), is_frozen=False
     )
+    if active_blocks is None:
+        active_blocks = torch.nonzero(block_written, as_tuple=False).flatten().to(torch.int32).contiguous()
 
     # Direct block-written fast path.
     out_fast_blocks = torch.ops.world.flex_attn_metal_fast_blocks(q, k, v, block_written, int(bs), causal)
@@ -83,7 +76,7 @@ def test_kv_cache_to_backend_path_matches_ref(causal, gqa, monkeypatch):
     )
 
 
-def test_world_flex_attn_forward_prefers_block_metadata(monkeypatch):
+def test_world_flex_attn_forward_prefers_active_metadata(monkeypatch):
     _require_metal_ops()
     monkeypatch.setenv("WORLD_METAL_IMPL", "fast")
     monkeypatch.setenv("WORLD_METAL_FAST_NO_FALLBACK", "1")
@@ -95,8 +88,9 @@ def test_world_flex_attn_forward_prefers_block_metadata(monkeypatch):
 
     block_size = 4
     kv_blocks = (L + block_size - 1) // block_size
-    block_written = torch.tensor([(i % 2) == 0 for i in range(kv_blocks)], device="mps", dtype=torch.uint8).contiguous()
-    active_blocks = torch.nonzero(block_written, as_tuple=False).flatten().to(torch.int32).contiguous()
+    # Deliberately provide conflicting metadata. Backend should prefer active_blocks.
+    block_written = torch.ones((kv_blocks,), device="mps", dtype=torch.uint8).contiguous()
+    active_blocks = torch.tensor([0, 2, 4], device="mps", dtype=torch.int32).contiguous()
 
     meta = AttnMeta(
         flex_block_mask=None,

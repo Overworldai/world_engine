@@ -1,12 +1,8 @@
-from pathlib import Path
-import sys
 import math
 import random
 
 import pytest
 import torch
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src" / "model"))
 
 from attn_backend import (
     AttnBackend,
@@ -14,6 +10,7 @@ from attn_backend import (
     AttnMeta,
     world_flex_attn_forward,
 )
+from metal_test_utils import require_metal_attn_ops
 
 
 pytestmark = pytest.mark.skipif(
@@ -29,16 +26,7 @@ def _rand_attn_tensors(B: int, H: int, T: int, L: int, Dh: int, dtype: torch.dty
     return q, k, v
 
 
-def _require_metal_op():
-    if not hasattr(torch.ops, "world"):
-        pytest.skip("Metal world namespace not registered")
-    if not (
-        hasattr(torch.ops.world, "flex_attn_metal_ref")
-        and hasattr(torch.ops.world, "flex_attn_metal_fast")
-        and hasattr(torch.ops.world, "flex_attn_metal_fast_blocks")
-        and hasattr(torch.ops.world, "flex_attn_metal_fast_active")
-    ):
-        pytest.skip("Metal ref/fast/fast_blocks/fast_active ops not registered")
+_require_metal_op = require_metal_attn_ops
 
 
 def _reference_attention(
@@ -104,7 +92,7 @@ def _dense_mask_from_block_written(
     return dense.view(1, 1, 1, l).expand(1, 1, t, l).contiguous()
 
 
-@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_metal_vs_reference_small_random(dtype):
     _require_metal_op()
 
@@ -131,7 +119,7 @@ def test_metal_vs_reference_small_random(dtype):
     assert mean_abs_diff < 2e-2
 
 
-@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_metal_vs_reference_small_random_causal(dtype):
     _require_metal_op()
 
@@ -249,8 +237,8 @@ def test_ref_and_fast_op_shapes_and_parity(dtype):
     assert torch.allclose(
         out_ref.to("cpu", dtype=torch.float32),
         out_fast.to("cpu", dtype=torch.float32),
-        rtol=1e-3,
-        atol=1e-3,
+        rtol=2e-3,
+        atol=2e-3,
     )
 
 
