@@ -103,6 +103,10 @@ class WorldEngine:
                 self.scheduler_sigmas = self.scheduler_sigmas[: int(scheduler_steps)].contiguous()
             self.scheduler_dsigmas = self.scheduler_sigmas.diff().contiguous()
             self.scheduler_step_sigmas = self.scheduler_sigmas[:-1].contiguous()
+            n_steps = self.scheduler_dsigmas.numel()
+            self._step_sigmas_11 = [self.scheduler_step_sigmas[i].view(1, 1).contiguous() for i in range(n_steps)]
+            self._dsigmas_scalar = [self.scheduler_dsigmas[i] for i in range(n_steps)]
+            self._n_denoise_steps = n_steps
             self._sigma_zero = torch.zeros((1, 1), dtype=dtype)
 
             pH, pW = getattr(self.model_cfg, "patch", [1, 1])
@@ -222,51 +226,39 @@ class WorldEngine:
     @torch.compile(fullgraph=True, dynamic=False, options=COMPILE_OPTIONS)
     def _denoise_pass(self, x, ctx: Dict[str, Tensor], kv_cache):
         kv_cache.set_frozen(True)
-        bt = (x.size(0), x.size(1))
-        for i in range(self.scheduler_dsigmas.numel()):
-            sigma_bt = self.scheduler_step_sigmas[i].expand(bt)
-            v = self.model(x, sigma_bt, **ctx, kv_cache=kv_cache, ctrl_cond=True, prompt_cond=True)
-            x = x + self.scheduler_dsigmas[i] * v
+        for i in range(self._n_denoise_steps):
+            v = self.model(x, self._step_sigmas_11[i], **ctx, kv_cache=kv_cache, ctrl_cond=True, prompt_cond=True)
+            x = x + self._dsigmas_scalar[i] * v
         return x
 
     def _denoise_pass_eager(self, x, ctx: Dict[str, Tensor], kv_cache):
         kv_cache.set_frozen(True)
-        bt = (x.size(0), x.size(1))
-        for i in range(self.scheduler_dsigmas.numel()):
-            sigma_bt = self.scheduler_step_sigmas[i].expand(bt)
-            v = self.model(x, sigma_bt, **ctx, kv_cache=kv_cache, ctrl_cond=True, prompt_cond=True)
-            x = x + self.scheduler_dsigmas[i] * v
+        for i in range(self._n_denoise_steps):
+            v = self.model(x, self._step_sigmas_11[i], **ctx, kv_cache=kv_cache, ctrl_cond=True, prompt_cond=True)
+            x = x + self._dsigmas_scalar[i] * v
         return x
 
     @torch.compile(dynamic=False, options=COMPILE_OPTIONS)
     def _denoise_pass_mixed(self, x, ctx: Dict[str, Tensor], kv_cache):
         kv_cache.set_frozen(True)
-        bt = (x.size(0), x.size(1))
-        for i in range(self.scheduler_dsigmas.numel()):
-            sigma_bt = self.scheduler_step_sigmas[i].expand(bt)
-            v = self.model(x, sigma_bt, **ctx, kv_cache=kv_cache, ctrl_cond=True, prompt_cond=True)
-            x = x + self.scheduler_dsigmas[i] * v
+        for i in range(self._n_denoise_steps):
+            v = self.model(x, self._step_sigmas_11[i], **ctx, kv_cache=kv_cache, ctrl_cond=True, prompt_cond=True)
+            x = x + self._dsigmas_scalar[i] * v
         return x
 
     @torch.compile(fullgraph=True, dynamic=False, options=COMPILE_OPTIONS)
     def _cache_pass(self, x, ctx: Dict[str, Tensor], kv_cache):
         """Side effect: updates kv cache"""
         kv_cache.set_frozen(False)
-        self.model(
-            x, self._sigma_zero.expand((x.size(0), x.size(1))), **ctx, kv_cache=kv_cache, ctrl_cond=True, prompt_cond=True
-        )
+        self.model(x, self._sigma_zero, **ctx, kv_cache=kv_cache, ctrl_cond=True, prompt_cond=True)
 
     def _cache_pass_eager(self, x, ctx: Dict[str, Tensor], kv_cache):
         """Side effect: updates kv cache"""
         kv_cache.set_frozen(False)
-        self.model(
-            x, self._sigma_zero.expand((x.size(0), x.size(1))), **ctx, kv_cache=kv_cache, ctrl_cond=True, prompt_cond=True
-        )
+        self.model(x, self._sigma_zero, **ctx, kv_cache=kv_cache, ctrl_cond=True, prompt_cond=True)
 
     @torch.compile(dynamic=False, options=COMPILE_OPTIONS)
     def _cache_pass_mixed(self, x, ctx: Dict[str, Tensor], kv_cache):
         """Side effect: updates kv cache"""
         kv_cache.set_frozen(False)
-        self.model(
-            x, self._sigma_zero.expand((x.size(0), x.size(1))), **ctx, kv_cache=kv_cache, ctrl_cond=True, prompt_cond=True
-        )
+        self.model(x, self._sigma_zero, **ctx, kv_cache=kv_cache, ctrl_cond=True, prompt_cond=True)

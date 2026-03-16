@@ -124,7 +124,6 @@ class MergedQKVAttn(Attn):
 
         del self.q_proj, self.k_proj, self.v_proj
 
-    @torch._dynamo.disable
     def _stateful_attention(self, q, k, v, pos_ids, kv_cache):
         frame_idx = kv_cache.get_frame_idx(pos_ids)
         layer_cache = kv_cache.layers[self.layer_idx]
