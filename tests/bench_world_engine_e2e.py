@@ -3,6 +3,7 @@ import io
 import random
 import time
 import urllib.request
+import json
 from pathlib import Path
 import sys
 
@@ -73,6 +74,7 @@ def main():
     parser.add_argument("--scheduler-steps", type=int, default=0, help="Override denoise scheduler steps (0=use model default)")
     parser.add_argument("--cache-interval", type=int, default=1, help="Run cache update every N generated frames")
     parser.add_argument("--quant", default="none", choices=["none", "w8a8", "nvfp4"], help="Optional model quantization mode")
+    parser.add_argument("--json-out", default="", help="Optional path to write machine-readable benchmark summary JSON")
     args = parser.parse_args()
 
     if args.device == "mps" and not torch.backends.mps.is_available():
@@ -234,6 +236,31 @@ def main():
         f"fps        p50={1000.0/max(total_p50,1e-9):.2f} "
         f"p95={1000.0/max(total_p95,1e-9):.2f} mean={1000.0/max(total_mean,1e-9):.2f}"
     )
+    if args.json_out:
+        summary = {
+            "model_uri": args.model_uri,
+            "device": args.device,
+            "attention_backend": args.attention_backend,
+            "dtype": args.dtype,
+            "quant": args.quant,
+            "return_img": bool(args.return_img),
+            "write_video": bool(args.write_video),
+            "scheduler_steps": int(engine.scheduler_sigmas.numel()),
+            "cache_interval": int(args.cache_interval),
+            "frames": int(n),
+            "total_ms": {"p50": total_p50, "p95": total_p95, "mean": total_mean},
+            "prep_ms": {"p50": prep_p50, "p95": prep_p95, "mean": prep_mean},
+            "denoise_ms": {"p50": den_p50, "p95": den_p95, "mean": den_mean},
+            "cache_ms": {"p50": cache_p50, "p95": cache_p95, "mean": cache_mean},
+            "decode_ms": {"p50": dec_p50, "p95": dec_p95, "mean": dec_mean},
+            "fps": {
+                "p50": 1000.0 / max(total_p50, 1e-9),
+                "p95": 1000.0 / max(total_p95, 1e-9),
+                "mean": 1000.0 / max(total_mean, 1e-9),
+            },
+        }
+        Path(args.json_out).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.json_out).write_text(json.dumps(summary, indent=2), encoding="utf-8")
     if args.write_video:
         print(f"wrote={args.out}")
 

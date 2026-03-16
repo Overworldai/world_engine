@@ -115,6 +115,34 @@ def _percentile(values: list[float], q: float) -> float:
     return float(np.percentile(arr, q))
 
 
+def _gen_frame_with_step_attribution(engine: WorldEngine, ctrl: CtrlInput) -> tuple[torch.Tensor, list[float], float]:
+    """Manual gen-frame path used only for denoise step timing attribution."""
+    x = torch.randn(engine.frm_shape, device=engine.device, dtype=engine.dtype)
+    inputs = engine.prep_inputs(x=x, ctrl=ctrl)
+    kv_cache = engine.kv_cache
+    kv_cache.set_frozen(True)
+    bt = (x.size(0), x.size(1))
+    step_times_ms: list[float] = []
+    for i in range(engine.scheduler_dsigmas.numel()):
+        sigma_bt = engine.scheduler_step_sigmas[i].expand(bt)
+        t0 = time.perf_counter()
+        v = engine.model(x, sigma_bt, **inputs, kv_cache=kv_cache, ctrl_cond=True, prompt_cond=True)
+        _sync_if_mps(engine.device)
+        t1 = time.perf_counter()
+        step_times_ms.append((t1 - t0) * 1000.0)
+        x = x + engine.scheduler_dsigmas[i] * v
+
+    cache_ms = 0.0
+    if (engine._gen_count % engine.cache_interval) == 0:
+        t0 = time.perf_counter()
+        engine._cache_pass_fn(x, inputs, kv_cache)
+        _sync_if_mps(engine.device)
+        t1 = time.perf_counter()
+        cache_ms = (t1 - t0) * 1000.0
+    engine._gen_count += 1
+    return engine.vae.decode(x.squeeze(1)), step_times_ms, cache_ms
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-uri", default="Overworld-Models/Lapp0-WP-Mini-1.4.5-BL-Distill")
@@ -122,11 +150,13 @@ def main():
     parser.add_argument("--seed-url", default="")
     parser.add_argument("--device", default="mps")
     parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
+    parser.add_argument("--quant", default="none", choices=["none", "w8a8", "nvfp4"])
     parser.add_argument("--profile-steps", type=int, default=64)
     parser.add_argument("--dump-phases", default="append,gen1")
     parser.add_argument("--output-dir", default="diagnostics/out/metal_profile_baseline")
     parser.add_argument("--write-video", action="store_true")
     parser.add_argument("--module-timing", action="store_true")
+    parser.add_argument("--denoise-attribution", action="store_true")
     parser.add_argument("--manifest-note", default="")
     args = parser.parse_args()
 
@@ -162,7 +192,9 @@ def main():
     frame = _load_seed_frame(seed_url)
     seed = torch.from_numpy(np.repeat(frame[None], 4, axis=0))
 
-    engine = WorldEngine(args.model_uri, device=args.device, dtype=dtype)
+    quant = None if args.quant == "none" else args.quant
+    engine = WorldEngine(args.model_uri, device=args.device, dtype=dtype, quant=quant)
+    quant_report = getattr(engine.model, "_quantization_report", None)
     # Compatibility for restored world_engine path.
     if hasattr(engine, "ts_mult"):
         engine.ts_mult = int(engine.ts_mult)
@@ -172,6 +204,7 @@ def main():
     dump_index: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     module_timing_enabled = bool(args.module_timing)
+    denoise_attr_enabled = bool(args.denoise_attribution)
     module_timing: dict[str, dict[str, Any]] = {}
     start_times: dict[str, list[float]] = {}
 
@@ -244,7 +277,12 @@ def main():
         gen_times = []
         current_phase["name"] = "gen1"
         g0 = time.perf_counter()
-        first = engine.gen_frame(ctrl=ctrl_seq[0])
+        denoise_step_times_ms: list[float] = []
+        first_cache_ms = 0.0
+        if denoise_attr_enabled:
+            first, denoise_step_times_ms, first_cache_ms = _gen_frame_with_step_attribution(engine, ctrl_seq[0])
+        else:
+            first = engine.gen_frame(ctrl=ctrl_seq[0])
         _sync_if_mps(engine.device)
         g1 = time.perf_counter()
         gen_times.append(g1 - g0)
@@ -308,6 +346,29 @@ def main():
         rows.sort(key=lambda x: x["total_ms"], reverse=True)
         module_timing_report["modules"] = rows
 
+    denoise_attr_report = {
+        "enabled": denoise_attr_enabled,
+        "step_times_ms": [],
+        "first_frame_cache_ms": 0.0,
+        "per_block_component_total_ms": [],
+    }
+    if denoise_attr_enabled:
+        denoise_attr_report["step_times_ms"] = denoise_step_times_ms
+        denoise_attr_report["first_frame_cache_ms"] = float(first_cache_ms)
+        component_rows = []
+        for row in module_timing_report.get("modules", []):
+            name = row.get("module_name", "")
+            if ".attn" in name or ".mlp" in name:
+                component_rows.append(
+                    {
+                        "module_name": name,
+                        "module_type": row.get("module_type", ""),
+                        "total_ms": float(row.get("total_ms", 0.0)),
+                        "mean_ms": float(row.get("mean_ms", 0.0)),
+                    }
+                )
+        denoise_attr_report["per_block_component_total_ms"] = component_rows[:100]
+
     # Torch profiler snapshot around one gen frame.
     with torch.inference_mode():
         with torch.profiler.profile(
@@ -322,6 +383,8 @@ def main():
     prof_path.write_text(prof_table, encoding="utf-8")
     module_timing_path = output_dir / "module_timing_report.json"
     module_timing_path.write_text(json.dumps(module_timing_report, indent=2), encoding="utf-8")
+    denoise_attr_path = output_dir / "denoise_attribution_report.json"
+    denoise_attr_path.write_text(json.dumps(denoise_attr_report, indent=2), encoding="utf-8")
 
     git_sha = ""
     try:
@@ -338,18 +401,22 @@ def main():
         "seed_url": seed_url,
         "device": args.device,
         "dtype": args.dtype,
+        "quant": args.quant,
         "profile_steps": args.profile_steps,
         "dump_phases": args.dump_phases,
         "module_timing": module_timing_enabled,
         "write_video": bool(args.write_video),
         "manifest_note": args.manifest_note,
         "timestamp_unix_s": time.time(),
+        "quantization_report": quant_report,
         "env": {
             "WORLD_ATTENTION_BACKEND": os.environ.get("WORLD_ATTENTION_BACKEND"),
             "WORLD_METAL_IMPL": os.environ.get("WORLD_METAL_IMPL"),
             "WORLD_METAL_FAST_NO_FALLBACK": os.environ.get("WORLD_METAL_FAST_NO_FALLBACK"),
             "WORLD_METAL_PREFER_ACTIVE_DISPATCH": os.environ.get("WORLD_METAL_PREFER_ACTIVE_DISPATCH"),
             "TORCHDYNAMO_DISABLE": os.environ.get("TORCHDYNAMO_DISABLE"),
+            "WORLD_HYBRID_COMPILE_METAL": os.environ.get("WORLD_HYBRID_COMPILE_METAL"),
+            "WORLD_FORCE_COMPILE_METAL": os.environ.get("WORLD_FORCE_COMPILE_METAL"),
         },
     }
     manifest_path = output_dir / "run_manifest.json"
@@ -361,17 +428,22 @@ def main():
         "seed_url": seed_url,
         "device": args.device,
         "dtype": args.dtype,
+        "quant": args.quant,
         "env": {
             "WORLD_ATTENTION_BACKEND": os.environ.get("WORLD_ATTENTION_BACKEND"),
             "WORLD_METAL_IMPL": os.environ.get("WORLD_METAL_IMPL"),
             "WORLD_METAL_FAST_NO_FALLBACK": os.environ.get("WORLD_METAL_FAST_NO_FALLBACK"),
             "WORLD_METAL_PREFER_ACTIVE_DISPATCH": os.environ.get("WORLD_METAL_PREFER_ACTIVE_DISPATCH"),
             "TORCHDYNAMO_DISABLE": os.environ.get("TORCHDYNAMO_DISABLE"),
+            "WORLD_HYBRID_COMPILE_METAL": os.environ.get("WORLD_HYBRID_COMPILE_METAL"),
+            "WORLD_FORCE_COMPILE_METAL": os.environ.get("WORLD_FORCE_COMPILE_METAL"),
         },
         "timings": timings,
+        "quantization_report": quant_report,
         "tensor_dump_count": len(dump_index),
         "tensor_dump_index_path": str(output_dir / "tensor_dump_index.json"),
         "module_timing_path": str(module_timing_path),
+        "denoise_attribution_path": str(denoise_attr_path),
         "profiler_path": str(prof_path),
         "run_manifest_path": str(manifest_path),
     }

@@ -1,5 +1,6 @@
 import argparse
 import io
+import os
 import random
 import urllib.request
 
@@ -17,19 +18,26 @@ def main():
     parser.add_argument("--model-uri", default="Overworld-Models/Lapp0-WP-Mini-1.4.5-BL-Distill")
     parser.add_argument("--device", default="mps")
     parser.add_argument("--dtype", default="float16", choices=["float16", "bfloat16"])
+    parser.add_argument("--quant", default="none", choices=["none", "w8a8", "nvfp4"])
     parser.add_argument("--frames", type=int, default=64)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--seed-url", default="")
     parser.add_argument("--out", default="diagnostics/out/fp16_variant_metal_mps_saved.mp4")
+    parser.add_argument("--hybrid-compile", action="store_true")
+    parser.add_argument("--force-compile", action="store_true")
     args = parser.parse_args()
 
     random.seed(args.seed)
+    os.environ["WORLD_HYBRID_COMPILE_METAL"] = "1" if args.hybrid_compile else "0"
+    os.environ["WORLD_FORCE_COMPILE_METAL"] = "1" if args.force_compile else "0"
     ensure_metal_attention_op_loaded()
 
+    quant = None if args.quant == "none" else args.quant
     engine = WorldEngine(
         args.model_uri,
         device=args.device,
         dtype=(torch.float16 if args.dtype == "float16" else torch.bfloat16),
+        quant=quant,
     )
     # Compatibility for current world_engine timestamp math.
     engine.ts_mult = int(engine.ts_mult)

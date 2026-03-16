@@ -5,6 +5,7 @@ import subprocess
 import sys
 import statistics
 from pathlib import Path
+import torch
 
 
 def _run(cmd: list[str], env: dict[str, str]) -> None:
@@ -26,12 +27,52 @@ def _preset_defaults(preset: str) -> dict[str, str]:
     return {}
 
 
+def _safety_check(dump_dir: Path) -> dict:
+    index_path = dump_dir / "tensor_dump_index.json"
+    if not index_path.exists():
+        return {"checked": False, "reason": "tensor_dump_index_missing", "pass": False}
+    idx = json.loads(index_path.read_text(encoding="utf-8"))
+    nonfinite = 0
+    tensors_checked = 0
+
+    def _check_obj(obj):
+        nonlocal nonfinite, tensors_checked
+        if isinstance(obj, torch.Tensor):
+            tensors_checked += 1
+            if obj.is_floating_point():
+                finite = torch.isfinite(obj).all().item()
+                if not bool(finite):
+                    nonfinite += 1
+            return
+        if isinstance(obj, (list, tuple)):
+            for x in obj:
+                _check_obj(x)
+            return
+        if isinstance(obj, dict):
+            for x in obj.values():
+                _check_obj(x)
+
+    for entry in idx:
+        p = Path(entry["file"])
+        if not p.exists():
+            continue
+        obj = torch.load(p, map_location="cpu")
+        _check_obj(obj)
+    return {
+        "checked": True,
+        "tensors_checked": tensors_checked,
+        "nonfinite_tensors": nonfinite,
+        "pass": nonfinite == 0,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--preset", default="none", choices=["none", "fp16"])
     parser.add_argument("--model-uri", default="Overworld-Models/Lapp0-WP-Mini-1.4.5-BL-Distill")
     parser.add_argument("--device", default="mps")
     parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
+    parser.add_argument("--quant", default="none", choices=["none", "w8a8", "nvfp4"])
     parser.add_argument("--profile-steps", type=int, default=32)
     parser.add_argument("--perf-repeats", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
@@ -43,6 +84,8 @@ def main():
     parser.add_argument("--strict", action="store_true")
     parser.add_argument("--visual-review-on-fail", action="store_true")
     parser.add_argument("--visual-review-frames", type=int, default=32)
+    parser.add_argument("--hybrid-compile", action="store_true")
+    parser.add_argument("--force-compile", action="store_true")
     args = parser.parse_args()
 
     defaults = _preset_defaults(args.preset)
@@ -70,7 +113,7 @@ def main():
     env = os.environ.copy()
     env.setdefault("HF_HUB_OFFLINE", "1")
     env.setdefault("TRANSFORMERS_OFFLINE", "1")
-    env.setdefault("TORCHDYNAMO_DISABLE", "1")
+    env.setdefault("TORCHDYNAMO_DISABLE", "0")
     env.setdefault("WORLD_ATTENTION_BACKEND", "metal")
     env.setdefault("WORLD_METAL_IMPL", "fast")
     env.setdefault("WORLD_METAL_FAST_NO_FALLBACK", "1")
@@ -78,12 +121,15 @@ def main():
     env.setdefault("WORLD_KV_RUNTIME_CHECKS", "0")
     env.setdefault("WORLD_KV_COMPUTE_ACTIVE_BLOCKS", "0")
     env.setdefault("PYTHONPATH", ".")
+    env["WORLD_HYBRID_COMPILE_METAL"] = "1" if args.hybrid_compile else "0"
+    env["WORLD_FORCE_COMPILE_METAL"] = "1" if args.force_compile else "0"
 
     py = sys.executable
     profile_script = "tests/profile_and_dump_variant_metal.py"
     compare_script = "tests/compare_tensor_dumps.py"
     hotspot_script = "tests/summarize_hotspots.py"
     video_script = "tests/gen_world_variant_metal_save.py"
+    bench_script = "tests/bench_world_engine_e2e.py"
 
     # 1) Perf-only run (repeat and aggregate median)
     perf_runs_dir = output_dir / "perf_runs"
@@ -104,6 +150,8 @@ def main():
                 args.dtype,
                 "--profile-steps",
                 str(args.profile_steps),
+                "--quant",
+                args.quant,
                 "--seed",
                 str(args.seed + i),
                 "--seed-url",
@@ -132,6 +180,53 @@ def main():
     # Keep a convenience report path for downstream consumers.
     (perf_dir / "profile_report.json").write_text(json.dumps(perf_reports[-1], indent=2), encoding="utf-8")
 
+    # 1.5) Phase timing and latent/decoded FPS via e2e bench script.
+    latent_json = perf_dir / "bench_latent.json"
+    decoded_json = perf_dir / "bench_decoded.json"
+    _run(
+        [
+            py,
+            bench_script,
+            "--model-uri",
+            args.model_uri,
+            "--device",
+            args.device,
+            "--attention-backend",
+            "metal",
+            "--dtype",
+            args.dtype,
+            "--quant",
+            args.quant,
+            "--frames",
+            str(args.profile_steps),
+            "--json-out",
+            str(latent_json),
+        ],
+        env,
+    )
+    _run(
+        [
+            py,
+            bench_script,
+            "--model-uri",
+            args.model_uri,
+            "--device",
+            args.device,
+            "--attention-backend",
+            "metal",
+            "--dtype",
+            args.dtype,
+            "--quant",
+            args.quant,
+            "--frames",
+            str(args.profile_steps),
+            "--return-img",
+            "--json-out",
+            str(decoded_json),
+        ],
+        env,
+    )
+
     # 2) Dump run + module timing
     _run(
         [
@@ -145,6 +240,8 @@ def main():
             args.dtype,
             "--profile-steps",
             str(args.profile_steps),
+            "--quant",
+            args.quant,
             "--seed",
             str(args.seed),
             "--seed-url",
@@ -233,6 +330,9 @@ def main():
     cur_perf = _load_json(perf_dir / "perf_aggregate.json")
     quick_cmp = _load_json(compare_quick_dir / "comparison_summary.json")
     full_cmp = _load_json(compare_full_dir / "comparison_summary.json")
+    safety = _safety_check(dump_dir)
+    bench_latent = _load_json(latent_json)
+    bench_decoded = _load_json(decoded_json)
 
     base_mean = float(base_perf["timings"]["gen_mean_s"])
     cur_mean = float(cur_perf["gen_mean_s_median"])
@@ -246,10 +346,11 @@ def main():
         and p90_regression_pct <= float(perf_cfg["max_p90_regression_pct"])
     )
     correctness_pass = bool(quick_cmp["pass"]) and bool(full_cmp["pass"])
-    overall_pass = correctness_pass and perf_pass
+    safety_pass = bool(safety.get("pass", False))
+    overall_pass = correctness_pass and perf_pass and safety_pass
     visual_review_video = ""
     visual_review_required = False
-    if args.visual_review_on_fail and not correctness_pass:
+    if args.visual_review_on_fail and (not correctness_pass or not safety_pass):
         visual_review_required = True
         visual_review_video = str(output_dir / "visual_review_fail.mp4")
         _run(
@@ -262,6 +363,8 @@ def main():
                 args.device,
                 "--dtype",
                 args.dtype,
+                "--quant",
+                args.quant,
                 "--frames",
                 str(args.visual_review_frames),
                 "--seed",
@@ -289,14 +392,31 @@ def main():
             "current_gen_p90_s": cur_p90,
             "p90_regression_pct": p90_regression_pct,
         },
+        "runtime": {
+            "quant": args.quant,
+            "hybrid_compile": bool(args.hybrid_compile),
+            "force_compile": bool(args.force_compile),
+            "bench_latent_json": str(latent_json),
+            "bench_decoded_json": str(decoded_json),
+            "bench_latent_fps_mean": float(bench_latent["fps"]["mean"]),
+            "bench_decoded_fps_mean": float(bench_decoded["fps"]["mean"]),
+            "bench_phase_mean_ms": {
+                "prep": float(bench_decoded["prep_ms"]["mean"]),
+                "denoise": float(bench_decoded["denoise_ms"]["mean"]),
+                "cache": float(bench_decoded["cache_ms"]["mean"]),
+                "decode": float(bench_decoded["decode_ms"]["mean"]),
+            },
+        },
         "gates": {
             "quick_correctness_pass": bool(quick_cmp["pass"]),
             "full_correctness_pass": bool(full_cmp["pass"]),
             "correctness_pass": correctness_pass,
+            "safety_pass": safety_pass,
             "performance_pass": perf_pass,
             "overall_pass": overall_pass,
             "visual_review_required": visual_review_required,
         },
+        "safety": safety,
         "visual_review_video": visual_review_video,
         "thresholds": cfg,
     }

@@ -2,6 +2,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import warnings
 
 
 QUANTS = [None]  # TODO: enable specific quant based on model config, which should specify compatible quants [None, "w8a8", "fp8"]
@@ -188,11 +189,14 @@ def quantize_model(model: nn.Module, quant: str):
     if quant is None:
         return model
 
+    def is_linear(m: nn.Module) -> bool:
+        return isinstance(m, nn.Linear) and (getattr(m, "weight", None) is not None)
+
     def eligible(m: nn.Module) -> bool:
-        w = getattr(m, "weight", None)
-        if not isinstance(m, nn.Linear):
+        if not is_linear(m):
             return False
-        if getattr(w, "dtype", None) != torch.bfloat16:
+        w = m.weight
+        if w.dtype not in (torch.bfloat16, torch.float16):
             return False
         o, k = w.shape
         return (o % 32 == 0) and (k % 32 == 0)
@@ -203,8 +207,51 @@ def quantize_model(model: nn.Module, quant: str):
         "fp8": FP8Linear,
     }[quant]
 
-    for name, child in model.named_children():
-        setattr(model, name, new_linear(child)) if eligible(child) else quantize_model(
-            child, quant
+    stats = {
+        "quant": quant,
+        "total_linear_layers": 0,
+        "eligible_linear_layers": 0,
+        "converted_linear_layers": 0,
+        "failed_linear_layers": 0,
+        "total_linear_weight_elems": 0,
+        "eligible_weight_elems": 0,
+        "converted_weight_elems": 0,
+        "failed_examples": [],
+    }
+
+    def walk(mod: nn.Module):
+        for name, child in mod.named_children():
+            if is_linear(child):
+                w = child.weight
+                elems = int(w.numel())
+                stats["total_linear_layers"] += 1
+                stats["total_linear_weight_elems"] += elems
+                if eligible(child):
+                    stats["eligible_linear_layers"] += 1
+                    stats["eligible_weight_elems"] += elems
+                    try:
+                        setattr(mod, name, new_linear(child))
+                        stats["converted_linear_layers"] += 1
+                        stats["converted_weight_elems"] += elems
+                    except Exception as exc:
+                        stats["failed_linear_layers"] += 1
+                        if len(stats["failed_examples"]) < 8:
+                            stats["failed_examples"].append(f"{name}: {type(exc).__name__}: {exc}")
+                continue
+            walk(child)
+
+    walk(model)
+    eligible_elems = max(1, int(stats["eligible_weight_elems"]))
+    total_elems = max(1, int(stats["total_linear_weight_elems"]))
+    stats["eligible_coverage_pct"] = float(stats["converted_weight_elems"]) * 100.0 / float(eligible_elems)
+    stats["total_coverage_pct"] = float(stats["converted_weight_elems"]) * 100.0 / float(total_elems)
+
+    model._quantized_linear_count = int(stats["converted_linear_layers"])
+    model._quantization_report = stats
+    if stats["converted_linear_layers"] == 0:
+        warnings.warn(
+            f"quantize_model('{quant}') converted 0 layers on this runtime; "
+            "falling back to original precision for all linear ops.",
+            stacklevel=2,
         )
     return model

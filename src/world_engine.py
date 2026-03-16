@@ -60,6 +60,7 @@ class WorldEngine:
         self.cache_interval = int(cache_interval)
         self._gen_count = 0
         force_compile_metal = os.getenv("WORLD_FORCE_COMPILE_METAL", "0") == "1"
+        hybrid_compile_metal = os.getenv("WORLD_HYBRID_COMPILE_METAL", "0") == "1"
         self._disable_compile = (
             str(self.device).startswith("mps")
             and os.getenv("WORLD_ATTENTION_BACKEND", "flex").lower() == "metal"
@@ -112,6 +113,7 @@ class WorldEngine:
             latent_fps = inference_fps / getattr(self.model_cfg, "temporal_compression", 1)
             self.ts_mult = int(int(self.model_cfg.base_fps) // latent_fps)
             self.frame_ts = torch.tensor([[0]], dtype=torch.long)
+            self._frame_idx_int = 0
 
             # Static input context tensors
             self._ctx = {
@@ -123,7 +125,8 @@ class WorldEngine:
             }
 
             self._prompt_ctx = {"prompt_emb": None, "prompt_pad_mask": None}
-            if force_compile_metal and str(self.device).startswith("mps") and os.getenv("WORLD_ATTENTION_BACKEND", "flex").lower() == "metal":
+            metal_runtime = str(self.device).startswith("mps") and os.getenv("WORLD_ATTENTION_BACKEND", "flex").lower() == "metal"
+            if (force_compile_metal or hybrid_compile_metal) and metal_runtime:
                 # Allow graph breaks around custom Metal ops while still compiling dense surrounding math.
                 self._cache_pass_fn = self._cache_pass_mixed
                 self._denoise_pass_fn = self._denoise_pass_mixed
@@ -136,6 +139,7 @@ class WorldEngine:
         """Reset state for new generation"""
         self.kv_cache.reset()
         self._gen_count = 0
+        self._frame_idx_int = 0
         self.frame_ts.zero_()
         for v in self._ctx.values():
             v.zero_()
@@ -151,6 +155,7 @@ class WorldEngine:
         """Loads a world state object saved via save_state. Doesn't load or change model"""
         self.kv_cache.load_state(state["kv_cache"])
         self.frame_ts.copy_(state["frame_ts"])
+        self._frame_idx_int = int(self.frame_ts[0, 0].item())
 
     def set_prompt(self, prompt: str):
         """Apply text conditioning for T2V"""
@@ -203,6 +208,9 @@ class WorldEngine:
         else:
             scroll_wheel = 0.0
         ctx = self._prep_inputs(mouse_x, mouse_y, scroll_wheel)
+        # Thread a cheap Python-side frame index hint to avoid per-layer scalar syncs.
+        self.kv_cache.set_frame_idx_int(self._frame_idx_int)
+        self._frame_idx_int += 1
 
         # prepare prompt conditioning
         if self.model_cfg.prompt_conditioning is None:

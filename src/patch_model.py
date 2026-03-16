@@ -8,61 +8,67 @@ from .model.world_model import MLPFusion
 from .model.attn_backend import AttnConfig, AttnMeta, world_flex_attn_forward
 
 
-def _bf16_u16(x: Tensor) -> Tensor:
-    # reinterpret bf16 storage as int16 -> unsigned 0..65535 in int32
+def _f16_u16(x: Tensor) -> Tensor:
+    # reinterpret fp16/bf16 storage as int16 -> unsigned 0..65535 in int32
+    if x.dtype not in (torch.bfloat16, torch.float16):
+        raise RuntimeError(f"_f16_u16 expects float16/bfloat16, got {x.dtype}")
     return x.contiguous().view(torch.int16).to(torch.int32) & 0xFFFF
 
 
 class CachedDenoiseStepEmb(nn.Module):
-    """bf16 sigma -> bf16 embedding via 64k LUT; invalid sigma => OOB index error (no silent wrong)."""
-    def __init__(self, base: nn.Module, sigmas: list[float]):
+    """f16 sigma -> f16 embedding via 64k LUT; invalid sigma => OOB index error (no silent wrong)."""
+    def __init__(self, base: nn.Module, sigmas: list[float], dtype: torch.dtype):
         super().__init__()
         device = next(base.parameters()).device
+        if dtype not in (torch.bfloat16, torch.float16):
+            raise RuntimeError(f"CachedDenoiseStepEmb dtype must be float16/bfloat16, got {dtype}")
+        self.dtype = dtype
 
-        levels = torch.tensor(sigmas, device=device, dtype=torch.bfloat16)          # [S]
-        bits = _bf16_u16(levels)                                                   # [S]
+        levels = torch.tensor(sigmas, device=device, dtype=dtype)                  # [S]
+        bits = _f16_u16(levels)                                                    # [S]
         if torch.unique(bits).numel() != bits.numel():
-            raise ValueError("scheduler_sigmas collide in bf16; caching would be ambiguous")
+            raise ValueError(f"scheduler_sigmas collide in {dtype}; caching would be ambiguous")
 
         with torch.no_grad():
-            table = base(levels[:, None]).squeeze(1).to(torch.bfloat16).contiguous()  # [S,D]
+            table = base(levels[:, None]).squeeze(1).to(dtype).contiguous()  # [S,D]
 
         lut = torch.full((65536,), -1, device=device, dtype=torch.int32)
         lut[bits] = torch.arange(bits.numel(), device=device, dtype=torch.int32)
 
-        self.register_buffer("table", table, persistent=False)                     # [S,D] bf16
+        self.register_buffer("table", table, persistent=False)                     # [S,D] f16
         self.register_buffer("lut", lut, persistent=False)                         # [65536] int32
         self.register_buffer("oob", torch.tensor(bits.numel(), device=device, dtype=torch.int32), persistent=False)
 
     def forward(self, sigma: Tensor) -> Tensor:
-        if sigma.dtype is not torch.bfloat16:
-            raise RuntimeError("CachedDenoiseStepEmb expects sigma bf16")
-        idx = self.lut[_bf16_u16(sigma)]
+        if sigma.dtype != self.dtype:
+            raise RuntimeError(f"CachedDenoiseStepEmb expects sigma {self.dtype}, got {sigma.dtype}")
+        idx = self.lut[_f16_u16(sigma)]
         idx = torch.where(idx >= 0, idx, self.oob)                                 # invalid -> S (OOB)
-        return self.table[idx.to(torch.int64)]                                     # [...,D] bf16
+        return self.table[idx.to(torch.int64)]                                     # [...,D] f16
 
 
 class CachedCondHead(nn.Module):
-    """bf16 cond -> cached (s0,b0,g0,s1,b1,g1); invalid cond => OOB index error (no silent wrong)."""
+    """f16 cond -> cached (s0,b0,g0,s1,b1,g1); invalid cond => OOB index error (no silent wrong)."""
     def __init__(self, base, cached_denoise_step_emb: CachedDenoiseStepEmb, max_key_dims: int = 8):
         super().__init__()
         table = cached_denoise_step_emb.table                                      # [S,D] bf16
         S, D = table.shape
+        self.dtype = table.dtype
 
         with torch.no_grad():
             emb = table[:, None, :]                                                # [S,1,D]
-            cache = torch.stack([t.squeeze(1) for t in base(emb)], 0).to(torch.bfloat16).contiguous()  # [6,S,D]
+            cache = torch.stack([t.squeeze(1) for t in base(emb)], 0).to(table.dtype).contiguous()  # [6,S,D]
 
-        # pick a single embedding dimension whose bf16 bits uniquely identify sigma
+        # pick a single embedding dimension whose f16 bits uniquely identify sigma
         key_dim = None
         for d in range(min(D, max_key_dims)):
-            b = _bf16_u16(table[:, d])
+            b = _f16_u16(table[:, d])
             if torch.unique(b).numel() == S:
                 key_dim = d
                 key_bits = b
                 break
         if key_dim is None:
-            raise ValueError("Could not find a unique bf16 key dim for cond->sigma mapping; increase max_key_dims")
+            raise ValueError("Could not find a unique f16 key dim for cond->sigma mapping; increase max_key_dims")
 
         lut = torch.full((65536,), -1, device=table.device, dtype=torch.int32)
         lut[key_bits] = torch.arange(S, device=table.device, dtype=torch.int32)
@@ -73,20 +79,25 @@ class CachedCondHead(nn.Module):
         self.register_buffer("oob", torch.tensor(S, device=table.device, dtype=torch.int32), persistent=False)
 
     def forward(self, cond: Tensor):
-        if cond.dtype is not torch.bfloat16:
-            raise RuntimeError("CachedCondHead expects cond bf16")
-        idx = self.lut[_bf16_u16(cond[..., self.key_dim])]
+        if cond.dtype != self.dtype:
+            raise RuntimeError(f"CachedCondHead expects cond {self.dtype}, got {cond.dtype}")
+        idx = self.lut[_f16_u16(cond[..., self.key_dim])]
         idx = torch.where(idx >= 0, idx, self.oob)                                 # invalid -> S (OOB)
-        g = self.cache[:, idx.to(torch.int64)]                                     # [6,...,D] bf16 (or errors)
+        g = self.cache[:, idx.to(torch.int64)]                                     # [6,...,D] f16 (or errors)
         return tuple(g.unbind(0))                                                  # (s0,b0,g0,s1,b1,g1)
 
 
-def patch_cached_noise_conditioning(model) -> None:
-    # Call AFTER: model.to(device="cuda", dtype=torch.bfloat16).eval()
-    cached_denoise_step_emb = CachedDenoiseStepEmb(model.denoise_step_emb, model.config.scheduler_sigmas)
+def patch_cached_noise_conditioning(model, dtype: torch.dtype) -> None:
+    # Call after model dtype/device are finalized.
+    cached_denoise_step_emb = CachedDenoiseStepEmb(model.denoise_step_emb, model.config.scheduler_sigmas, dtype=dtype)
     model.denoise_step_emb = cached_denoise_step_emb
     for blk in model.transformer.blocks:
         blk.cond_head = CachedCondHead(blk.cond_head, cached_denoise_step_emb)
+
+
+@torch._dynamo.disable
+def _world_flex_attn_eager(q, k, v, meta, cfg):
+    return world_flex_attn_forward(q, k, v, meta, cfg)
 
 
 class MergedQKVAttn(Attn):
@@ -113,6 +124,25 @@ class MergedQKVAttn(Attn):
 
         del self.q_proj, self.k_proj, self.v_proj
 
+    @torch._dynamo.disable
+    def _stateful_attention(self, q, k, v, pos_ids, kv_cache):
+        frame_idx = kv_cache.get_frame_idx(pos_ids)
+        layer_cache = kv_cache.layers[self.layer_idx]
+        k, v, bm, block_written, active_blocks, block_size = layer_cache.upsert(
+            torch.stack([k, v], dim=0), pos_ids, kv_cache._is_frozen, frame_idx_int=frame_idx
+        )
+        meta = AttnMeta(
+            flex_block_mask=bm,
+            q_len=q.size(2),
+            kv_len=k.size(2),
+            block_written=block_written,
+            active_blocks=active_blocks,
+            block_size=block_size,
+        )
+        cfg = AttnConfig(causal=True, enable_gqa=self.enable_gqa)
+        # Keep only the custom op call on eager side to reduce graph-break scope.
+        return _world_flex_attn_eager(q, k, v, meta, cfg)
+
     def forward(self, x, pos_ids, rope_angles, v1, kv_cache):
         q, k, v = self.qkv_proj(x).split((self.q_out, self.kv_out, self.kv_out), dim=-1)
 
@@ -127,23 +157,7 @@ class MergedQKVAttn(Attn):
 
         q, k = rms_norm(q), rms_norm(k)
         q, k = self.rope(q, rope_angles), self.rope(k, rope_angles)
-
-        frame_idx = kv_cache.get_frame_idx(pos_ids)
-        layer_cache = kv_cache.layers[self.layer_idx]
-        k, v, bm, block_written, active_blocks, block_size = layer_cache.upsert(
-            torch.stack([k, v], dim=0), pos_ids, kv_cache._is_frozen, frame_idx_int=frame_idx
-        )
-
-        meta = AttnMeta(
-            flex_block_mask=bm,
-            q_len=q.size(2),
-            kv_len=k.size(2),
-            block_written=block_written,
-            active_blocks=active_blocks,
-            block_size=block_size,
-        )
-        cfg = AttnConfig(causal=True, enable_gqa=self.enable_gqa)
-        y = world_flex_attn_forward(q, k, v, meta, cfg)
+        y = self._stateful_attention(q, k, v, pos_ids, kv_cache)
 
         if self.gated_attn:
             gates = torch.sigmoid(self.gate_proj(x[..., : self.n_heads]))
@@ -193,8 +207,9 @@ def patch_MLPFusion_split(model) -> None:
 
 
 def apply_inference_patches(model) -> None:
-    if next(model.parameters()).dtype == torch.bfloat16:
-        patch_cached_noise_conditioning(model)
+    model_dtype = next(model.parameters()).dtype
+    if model_dtype in (torch.bfloat16, torch.float16):
+        patch_cached_noise_conditioning(model, dtype=model_dtype)
     patch_Attn_merge_qkv(model)
     patch_MLPFusion_split(model)
 

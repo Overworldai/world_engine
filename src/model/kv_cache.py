@@ -126,6 +126,7 @@ class LayerKVCache(nn.Module):
         self._metal_bs_cache = 0
         self._blocks_per_frame = 0
         self._seen_slots: set[int] = set()
+        self._seen_slots_ordered: list[int] = []
         self._slot_block_ranges: list[torch.Tensor] = []
         self._tail_block_range: torch.Tensor | None = None
         self._can_build_active_without_nonzero = False
@@ -146,6 +147,7 @@ class LayerKVCache(nn.Module):
         self._metal_bs_cache = 0
         self._blocks_per_frame = 0
         self._seen_slots.clear()
+        self._seen_slots_ordered = []
         self._slot_block_ranges = []
         self._tail_block_range = None
         self._can_build_active_without_nonzero = False
@@ -184,6 +186,7 @@ class LayerKVCache(nn.Module):
         ring_written = self.written.narrow(0, 0, ring_tokens).view(self.num_buckets, self.tpf)
         occupied = ring_written.any(dim=1).to("cpu")
         self._seen_slots = {i for i, w in enumerate(occupied.tolist()) if bool(w)}
+        self._seen_slots_ordered = sorted(self._seen_slots)
 
     def _active_blocks_for_block_written(
         self,
@@ -194,7 +197,7 @@ class LayerKVCache(nn.Module):
     ) -> torch.Tensor:
         if self._can_build_active_without_nonzero and self._tail_block_range is not None:
             parts: list[torch.Tensor] = []
-            for seen_slot in sorted(self._seen_slots):
+            for seen_slot in self._seen_slots_ordered:
                 if write_step and seen_slot == slot:
                     continue
                 parts.append(self._slot_block_ranges[seen_slot])
@@ -287,6 +290,9 @@ class LayerKVCache(nn.Module):
                     self.written.narrow(0, ring_start, T).fill_(True)
                     if need_active_metadata:
                         self._seen_slots.add(slot)
+                        if slot not in self._seen_slots_ordered:
+                            self._seen_slots_ordered.append(slot)
+                            self._seen_slots_ordered.sort()
                     if self._metal_backend:
                         ring_block_start = ring_start // metal_bs
                         self._block_written.narrow(0, ring_block_start, self._blocks_per_frame).fill_(1)
@@ -323,6 +329,7 @@ class StaticKVCache(nn.Module):
         self._cached_fpos_ptr = -1
         self._cached_fpos_version = -1
         self._cached_fpos_value = 0
+        self._frame_idx_hint: int | None = None
 
     def reset(self):
         for layer in self.layers:
@@ -331,6 +338,7 @@ class StaticKVCache(nn.Module):
         self._cached_fpos_ptr = -1
         self._cached_fpos_version = -1
         self._cached_fpos_value = 0
+        self._frame_idx_hint = None
 
     @torch.inference_mode()
     def get_state(self):
@@ -348,11 +356,17 @@ class StaticKVCache(nn.Module):
         self._cached_fpos_ptr = -1
         self._cached_fpos_version = -1
         self._cached_fpos_value = 0
+        self._frame_idx_hint = None
 
     def set_frozen(self, is_frozen: bool):
         self._is_frozen = is_frozen
 
+    def set_frame_idx_int(self, frame_idx_int: int):
+        self._frame_idx_hint = int(frame_idx_int)
+
     def get_frame_idx(self, pos_ids: TensorDict) -> int:
+        if self._frame_idx_hint is not None:
+            return self._frame_idx_hint
         fpos = pos_ids["f_pos"]
         ptr = int(fpos.data_ptr())
         version = int(fpos._version)
