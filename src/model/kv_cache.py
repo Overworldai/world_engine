@@ -122,6 +122,7 @@ class LayerKVCache(nn.Module):
         self._mask_written = nn.Buffer(torch.empty_like(written), persistent=False)
         self._block_written = nn.Buffer(torch.empty(0, dtype=torch.uint8), persistent=False)
         self._all_blocks_i32 = nn.Buffer(torch.empty(0, dtype=torch.int32), persistent=False)
+        self._tmp_block_written = nn.Buffer(torch.empty(0, dtype=torch.uint8), persistent=False)
         self._metal_bs_cache = 0
         self._blocks_per_frame = 0
         self._seen_slots: set[int] = set()
@@ -134,6 +135,9 @@ class LayerKVCache(nn.Module):
         #   current_idx:   [L, L+1, ..., L+tpf-1] (tail slice)
         self.frame_offsets = nn.Buffer(torch.arange(self.tpf, dtype=torch.long), persistent=False)
         self.current_idx = nn.Buffer(self.frame_offsets + L, persistent=False)
+        self._metal_backend = _using_metal_backend()
+        self._need_active_metadata = self._metal_backend or _compute_active_blocks_enabled()
+        self._configured_metal_bs = _metal_block_size()
 
     def reset(self):
         self.kv.zero_()
@@ -149,12 +153,16 @@ class LayerKVCache(nn.Module):
             self._block_written.zero_()
         if self._all_blocks_i32.numel() > 0:
             self._all_blocks_i32 = self._all_blocks_i32.new_empty((0,), dtype=torch.int32)
+        if self._tmp_block_written.numel() > 0:
+            self._tmp_block_written.zero_()
 
     def _ensure_block_written(self, metal_bs: int):
         if self._metal_bs_cache == metal_bs and self._block_written.numel() > 0:
             return
         block_any = _block_any_for_size(self.written, metal_bs).to(torch.uint8).contiguous()
         self._block_written = block_any
+        if self._tmp_block_written.numel() != block_any.numel():
+            self._tmp_block_written = torch.empty_like(block_any)
         self._all_blocks_i32 = torch.arange(block_any.numel(), device=block_any.device, dtype=torch.int32)
         self._metal_bs_cache = metal_bs
         self._blocks_per_frame = (self.tpf + metal_bs - 1) // metal_bs
@@ -244,14 +252,15 @@ class LayerKVCache(nn.Module):
         self.kv.narrow(3, self.L, T).copy_(kv)
 
         bm = None
-        metal_bs = _metal_block_size()
-        need_active_metadata = _using_metal_backend() or _compute_active_blocks_enabled()
+        metal_bs = self._configured_metal_bs
+        need_active_metadata = self._need_active_metadata
         write_step = (frame_idx % self.pinned_dilation) == 0
-        if _using_metal_backend():
+        if self._metal_backend:
             self._ensure_block_written(metal_bs)
             ring_block_start = ring_start // metal_bs
             if write_step:
-                block_written = self._block_written.clone()
+                block_written = self._tmp_block_written
+                block_written.copy_(self._block_written)
                 block_written.narrow(0, ring_block_start, self._blocks_per_frame).zero_()
             else:
                 block_written = self._block_written
@@ -278,7 +287,7 @@ class LayerKVCache(nn.Module):
                     self.written.narrow(0, ring_start, T).fill_(True)
                     if need_active_metadata:
                         self._seen_slots.add(slot)
-                    if _using_metal_backend():
+                    if self._metal_backend:
                         ring_block_start = ring_start // metal_bs
                         self._block_written.narrow(0, ring_block_start, self._blocks_per_frame).fill_(1)
 
@@ -311,11 +320,17 @@ class StaticKVCache(nn.Module):
         ])
 
         self._is_frozen = True
+        self._cached_fpos_ptr = -1
+        self._cached_fpos_version = -1
+        self._cached_fpos_value = 0
 
     def reset(self):
         for layer in self.layers:
             layer.reset()
         self._is_frozen = True
+        self._cached_fpos_ptr = -1
+        self._cached_fpos_version = -1
+        self._cached_fpos_value = 0
 
     @torch.inference_mode()
     def get_state(self):
@@ -330,13 +345,23 @@ class StaticKVCache(nn.Module):
             layer.written.copy_(written)
             layer.rebuild_seen_slots()
             layer._metal_bs_cache = 0
+        self._cached_fpos_ptr = -1
+        self._cached_fpos_version = -1
+        self._cached_fpos_value = 0
 
     def set_frozen(self, is_frozen: bool):
         self._is_frozen = is_frozen
 
     def get_frame_idx(self, pos_ids: TensorDict) -> int:
-        return int(pos_ids["f_pos"][0, 0].item())
+        fpos = pos_ids["f_pos"]
+        ptr = int(fpos.data_ptr())
+        version = int(fpos._version)
+        if ptr != self._cached_fpos_ptr or version != self._cached_fpos_version:
+            self._cached_fpos_ptr = ptr
+            self._cached_fpos_version = version
+            self._cached_fpos_value = int(fpos[0, 0].item())
+        return self._cached_fpos_value
 
-    def upsert(self, k: Tensor, v: Tensor, pos_ids: TensorDict, layer: int):
+    def upsert(self, k: Tensor, v: Tensor, pos_ids: TensorDict, layer: int, frame_idx_int: int | None = None):
         kv = torch.stack([k, v], dim=0)
-        return self.layers[layer].upsert(kv, pos_ids, self._is_frozen)
+        return self.layers[layer].upsert(kv, pos_ids, self._is_frozen, frame_idx_int=frame_idx_int)

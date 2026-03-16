@@ -177,10 +177,10 @@ class WorldEngine:
         return (self.vae.decode(x0.squeeze(1)) if return_img else x0.squeeze(1))
 
     @torch.compile
-    def _prep_inputs(self, x, ctrl=None):
-        self._ctx["mouse"][0, 0, 0] = ctrl.mouse[0]
-        self._ctx["mouse"][0, 0, 1] = ctrl.mouse[1]
-        self._ctx["scroll"][0, 0, 0] = ctrl.scroll_wheel
+    def _prep_inputs(self, mouse_x: float, mouse_y: float, scroll_wheel: float):
+        self._ctx["mouse"][0, 0, 0] = mouse_x
+        self._ctx["mouse"][0, 0, 1] = mouse_y
+        self._ctx["scroll"][0, 0, 0] = scroll_wheel
 
         self._ctx["frame_idx"].copy_(self.frame_ts)
         self._ctx["frame_timestamp"].copy_(self.frame_ts).mul_(self.ts_mult)
@@ -194,14 +194,15 @@ class WorldEngine:
         if ctrl.button:
             self._ctx["button"][..., list(ctrl.button)] = 1.0
         mx, my = ctrl.mouse
-        ctrl.mouse = (float(mx), float(my))
+        mouse_x = float(mx)
+        mouse_y = float(my)
         if ctrl.scroll_wheel > 0:
-            ctrl.scroll_wheel = 1.0
+            scroll_wheel = 1.0
         elif ctrl.scroll_wheel < 0:
-            ctrl.scroll_wheel = -1.0
+            scroll_wheel = -1.0
         else:
-            ctrl.scroll_wheel = 0.0
-        ctx = self._prep_inputs(x, ctrl)
+            scroll_wheel = 0.0
+        ctx = self._prep_inputs(mouse_x, mouse_y, scroll_wheel)
 
         # prepare prompt conditioning
         if self.model_cfg.prompt_conditioning is None:

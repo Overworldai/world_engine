@@ -83,3 +83,45 @@ python tests/perf_regression_gate.py --output docs/perf_baseline_mps_w8a8.json -
 - latent-only: `total_ms p50 ~210.8`, `FPS p50 ~4.74`
 - with decode: `total_ms p50 ~219.3`, `FPS p50 ~4.56`
 
+### Optimization gate workflow (baseline-safe)
+
+Use the new optimization gate runner to ensure every speed change is validated
+against tensor-dump correctness and performance thresholds:
+
+```bash
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TORCHDYNAMO_DISABLE=1 \
+WORLD_ATTENTION_BACKEND=metal WORLD_METAL_IMPL=fast WORLD_METAL_FAST_NO_FALLBACK=1 \
+WORLD_METAL_PREFER_ACTIVE_DISPATCH=1 WORLD_KV_RUNTIME_CHECKS=0 WORLD_KV_COMPUTE_ACTIVE_BLOCKS=0 \
+PYTHONPATH=. ./.venv/bin/python tests/run_optimization_gate.py \
+  --model-uri Overworld-Models/Lapp0-WP-Mini-1.4.5-BL-Distill \
+  --device mps --dtype bfloat16 --profile-steps 16 \
+  --baseline-dump-dir diagnostics/out/metal_profile_baseline \
+  --baseline-perf-report diagnostics/out/metal_profile_perf_only/profile_report.json \
+  --output-dir diagnostics/out/optimization_gate_run
+```
+
+Artifacts written:
+
+- `gate_report.json` (overall decision)
+- perf run reports under `perf/`
+- dump run reports under `dump/`
+- quick/full comparisons under `compare_quick/` and `compare_full/`
+
+### Tensor-dump regression comparison
+
+You can compare any candidate dump run against baseline directly:
+
+```bash
+PYTHONPATH=. ./.venv/bin/python tests/compare_tensor_dumps.py \
+  --baseline-dir diagnostics/out/metal_profile_baseline \
+  --candidate-dir diagnostics/out/optimization_gate_run/dump \
+  --phase all --strict \
+  --out-dir diagnostics/out/optimization_gate_run/manual_compare
+```
+
+The comparison emits:
+
+- `comparison_summary.json`
+- `comparison_worst_modules.json`
+- `comparison_full.json`
+

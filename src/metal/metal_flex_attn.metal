@@ -84,7 +84,7 @@ kernel void metal_flex_attn_forward(
     const uint q_offset = (((b * Hq + hq) * T + t) * Dh);
     const uint kv_base = (((b * Hkv + hkv) * L) * Dh);
     const uint out_offset = q_offset;
-    const float inv_sqrt_dh = rsqrt((float)Dh);
+    const float inv_sqrt_dh = (Dh == 64u) ? 0.125f : rsqrt((float)Dh);
     const uint safe_block_size = max((uint)1, block_size);
     const uint kMaxDh = 128;
 
@@ -207,7 +207,7 @@ kernel void metal_flex_attn_forward_from_block_written(
     const uint q_offset = (((b * Hq + hq) * T + t) * Dh);
     const uint kv_base = (((b * Hkv + hkv) * L) * Dh);
     const uint out_offset = q_offset;
-    const float inv_sqrt_dh = rsqrt((float)Dh);
+    const float inv_sqrt_dh = (Dh == 64u) ? 0.125f : rsqrt((float)Dh);
     const uint safe_block_size = max((uint)1, block_size);
     const uint kv_blocks = active_count;
     const uint kMaxDh = 128;
@@ -329,7 +329,7 @@ kernel void metal_flex_attn_forward_bf16(
     const uint q_offset = (((b * Hq + hq) * T + t) * Dh);
     const uint kv_base = (((b * Hkv + hkv) * L) * Dh);
     const uint out_offset = q_offset;
-    const float inv_sqrt_dh = rsqrt((float)Dh);
+    const float inv_sqrt_dh = (Dh == 64u) ? 0.125f : rsqrt((float)Dh);
     const uint safe_block_size = max((uint)1, block_size);
     const uint kMaxDh = 128;
 

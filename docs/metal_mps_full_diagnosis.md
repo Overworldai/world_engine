@@ -231,3 +231,35 @@ Existing Metal numeric/integration/perf suites remain in gate runs.
 
 `aten::_local_scalar_dense`, `aten::copy_`, and cast/copy ops (`aten::to`, `aten::_to_copy`) remain significant in profiles. Attention sparse indexing overhead (`aten::nonzero`) is eliminated in steady state (`count=0`).
 
+## Optimization program tooling (2026-03-15)
+
+To support safe iterative optimization with quantitative correctness gates, the
+following tools were added:
+
+- `tests/profile_and_dump_variant_metal.py`
+  - supports per-module tensor dumps and module timing report output.
+- `tests/compare_tensor_dumps.py`
+  - compares baseline vs candidate dumps with cosine/MAE/RMSE/max-abs metrics.
+- `tests/run_optimization_gate.py`
+  - orchestrates perf run + dump run + quick/full comparisons and writes a
+    consolidated `gate_report.json`.
+- `tests/optimization_gate_config.json`
+  - codifies quick/full correctness thresholds and performance acceptance
+    thresholds.
+
+### New artifact conventions
+
+For each optimization iteration, write outputs under:
+
+- `diagnostics/out/iter_###_<label>/perf/`
+- `diagnostics/out/iter_###_<label>/dump/`
+- `diagnostics/out/iter_###_<label>/compare_quick/`
+- `diagnostics/out/iter_###_<label>/compare_full/`
+- `diagnostics/out/iter_###_<label>/gate_report.json`
+
+### Mandatory process cleanup
+
+After each run, all Python processes should be terminated before the next
+measurement to avoid stale memory/process contamination. This is required for
+reproducible performance statistics on MPS.
+

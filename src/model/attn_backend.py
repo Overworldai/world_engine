@@ -10,6 +10,11 @@ from torch import Tensor
 
 from torch.nn.attention.flex_attention import flex_attention
 
+_METAL_IMPL_MODE = "fast" if os.getenv("WORLD_METAL_IMPL", "ref").lower() == "fast" else "ref"
+_METAL_FORCE_CAUSAL = os.getenv("WORLD_METAL_FORCE_CAUSAL", "0") == "1"
+_METAL_IMPL_RAW = os.getenv("WORLD_METAL_IMPL", "ref").lower()
+_METAL_FORCE_CAUSAL_RAW = os.getenv("WORLD_METAL_FORCE_CAUSAL", "0")
+
 
 class AttnBackend(str, Enum):
     PYTORCH_FLEX = "pytorch-flex"
@@ -33,8 +38,12 @@ class AttnBackend(str, Enum):
 
 def _metal_impl_mode() -> str:
     # WORLD_METAL_IMPL=ref|fast
-    mode = os.getenv("WORLD_METAL_IMPL", "ref").lower()
-    return "fast" if mode == "fast" else "ref"
+    global _METAL_IMPL_MODE, _METAL_IMPL_RAW
+    raw = os.getenv("WORLD_METAL_IMPL", "ref").lower()
+    if raw != _METAL_IMPL_RAW:
+        _METAL_IMPL_RAW = raw
+        _METAL_IMPL_MODE = "fast" if raw == "fast" else "ref"
+    return _METAL_IMPL_MODE
 
 
 def _metal_use_causal(cfg: "AttnConfig") -> bool:
@@ -46,7 +55,12 @@ def _metal_use_causal(cfg: "AttnConfig") -> bool:
     To preserve CPU/CUDA parity, Metal defaults to non-causal unless
     explicitly overridden.
     """
-    if os.getenv("WORLD_METAL_FORCE_CAUSAL", "0") == "1":
+    global _METAL_FORCE_CAUSAL, _METAL_FORCE_CAUSAL_RAW
+    raw = os.getenv("WORLD_METAL_FORCE_CAUSAL", "0")
+    if raw != _METAL_FORCE_CAUSAL_RAW:
+        _METAL_FORCE_CAUSAL_RAW = raw
+        _METAL_FORCE_CAUSAL = raw == "1"
+    if _METAL_FORCE_CAUSAL:
         return bool(cfg.causal)
     return False
 

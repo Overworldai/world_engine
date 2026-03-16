@@ -1,0 +1,20 @@
+{
+  "quick_gate": {
+    "sentinel_modules_regex": "transformer\\.blocks\\.(0|11|23)\\.(attn|mlp)",
+    "cosine_min": 0.999,
+    "mae_max": 0.01,
+    "rmse_max": 0.01,
+    "max_abs_max": 0.1
+  },
+  "full_gate": {
+    "cosine_min": 0.999,
+    "mae_max": 0.01,
+    "rmse_max": 0.01,
+    "max_abs_max": 0.1
+  },
+  "performance_gate": {
+    "min_median_improvement_pct": 3.0,
+    "max_p90_regression_pct": 2.0
+  }
+}
+

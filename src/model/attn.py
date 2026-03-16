@@ -108,8 +108,11 @@ class Attn(nn.Module):
         q, k = rms_norm(q), rms_norm(k)
         q, k = self.rope(q, rope_angles), self.rope(k, rope_angles)
 
-        # Update KV-cache in-place
-        k, v, bm, block_written, active_blocks, block_size = kv_cache.upsert(k, v, pos_ids, self.layer_idx)
+        # Update KV-cache in-place; pass frame index once to avoid per-layer scalar extraction.
+        frame_idx = kv_cache.get_frame_idx(pos_ids)
+        k, v, bm, block_written, active_blocks, block_size = kv_cache.upsert(
+            k, v, pos_ids, self.layer_idx, frame_idx_int=frame_idx
+        )
 
         # SDPA/Flex/Metal attention -> Attention Gate -> Out Proj
         meta = AttnMeta(

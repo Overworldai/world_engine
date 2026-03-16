@@ -128,9 +128,10 @@ class MergedQKVAttn(Attn):
         q, k = rms_norm(q), rms_norm(k)
         q, k = self.rope(q, rope_angles), self.rope(k, rope_angles)
 
+        frame_idx = kv_cache.get_frame_idx(pos_ids)
         layer_cache = kv_cache.layers[self.layer_idx]
         k, v, bm, block_written, active_blocks, block_size = layer_cache.upsert(
-            torch.stack([k, v], dim=0), pos_ids, kv_cache._is_frozen
+            torch.stack([k, v], dim=0), pos_ids, kv_cache._is_frozen, frame_idx_int=frame_idx
         )
 
         meta = AttnMeta(
