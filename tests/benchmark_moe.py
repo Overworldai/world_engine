@@ -26,10 +26,17 @@ def _frame_debug_summary(frame: torch.Tensor) -> str:
 
 def prewarm_custom_moe_kernels(engine: WorldEngine) -> None:
     from world_engine.kernels import index_shuffling, scatter_add_dense_tokens
-    from world_engine.model.world_model import HAS_FBGEMM
 
     cfg = engine.model_cfg
-    if HAS_FBGEMM or not getattr(cfg, "moe", False):
+    has_fbgemm = False
+    try:
+        import fbgemm_gpu.experimental.gen_ai.moe.gather_scatter  # noqa
+        from fbgemm_gpu.experimental.gen_ai.moe import index_shuffling as _fbgemm_index_shuffling  # noqa
+        has_fbgemm = _fbgemm_index_shuffling is not None
+    except ImportError:
+        has_fbgemm = False
+
+    if has_fbgemm or not getattr(cfg, "moe", False):
         return
 
     n_tokens = cfg.tokens_per_frame

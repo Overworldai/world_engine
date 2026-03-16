@@ -10,10 +10,8 @@ try:
     from fbgemm_gpu.experimental.gen_ai.moe import index_shuffling as fbgemm_index_shuffling
     import fbgemm_gpu.experimental.gen_ai.moe.gather_scatter  # noqa
     print("FBGEMM found for MoE kernels! :)")
-    HAS_FBGEMM = True
 except ImportError:
-    print("FBGEMM not found, expected on windows platforms, continuing.")
-    HAS_FBGEMM = False
+    fbgemm_index_shuffling = None
 
 from ..kernels import grouped_gemm as custom_grouped_gemm
 from ..kernels import index_shuffling as custom_index_shuffling
@@ -206,6 +204,8 @@ class MoEFBGEMM(nn.Module):
         logits = self.router(x) if gate is None else gate.reshape(-1, gate.size(-1))
 
         logits32 = logits.float()
+        if fbgemm_index_shuffling is None:
+            raise RuntimeError("FBGEMM index_shuffling is not available in this environment")
         token_counts, expert_sorted, src = fbgemm_index_shuffling(logits32, top_k=self.top_k)
         offs = token_counts[: self.expert_in_proj.size(0)].cumsum(0).to(torch.int32)
 
