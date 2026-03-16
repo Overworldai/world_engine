@@ -40,16 +40,13 @@ def prewarm_custom_moe_kernels(engine: WorldEngine) -> None:
     scores = torch.randn((n_tokens, n_experts), device=engine.device, dtype=torch.float32)
     _, _, src = index_shuffling(scores, top_k=top_k)
 
-    out_tokens = torch.zeros((n_tokens, d_model), device=engine.device, dtype=engine.dtype)
     in_tokens = torch.randn((n_tokens * top_k, d_model), device=engine.device, dtype=engine.dtype)
-    scatter_add_dense_tokens(out_tokens, in_tokens, src)
+    scatter_add_dense_tokens(in_tokens, src, n_tokens=n_tokens)
     torch.cuda.synchronize()
 
 
 def log_moe_runtime_path(engine: WorldEngine) -> None:
     from world_engine.model import world_model as world_model_module
-
-    has_fbgemm = world_model_module.HAS_FBGEMM
 
     mlp_types = sorted(
         {
@@ -60,7 +57,6 @@ def log_moe_runtime_path(engine: WorldEngine) -> None:
     )
     print(
         "moe_runtime_path "
-        f"HAS_FBGEMM={has_fbgemm} "
         f"moe={getattr(engine.model_cfg, 'moe', False)} "
         f"moe_n_experts={getattr(engine.model_cfg, 'moe_n_experts', None)} "
         f"moe_top_k={getattr(engine.model_cfg, 'moe_top_k', None)} "
@@ -111,7 +107,11 @@ def print_env_info():
 
 @pytest.fixture(scope="session", autouse=True)
 def _compact_benchmark_table(request):
-    request.config._benchmarksession.columns = ["median", "max", "mean", "stddev", "rounds", "iterations"]
+    benchmark_session = getattr(request.config, "_benchmarksession", None)
+    if benchmark_session is None:
+        return
+
+    benchmark_session.columns = ["median", "max", "mean", "stddev", "rounds", "iterations"]
 
     import pytest_benchmark.session as pb_session
     import pytest_benchmark.table as pb_table

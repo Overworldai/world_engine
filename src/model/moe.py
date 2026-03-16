@@ -97,7 +97,7 @@ class MoETorchBaseline(nn.Module):
         y_grouped = _slow_grouped_mm(h, self.expert_out_proj, offsets)[:-1]
         y = torch.empty_like(y_grouped).index_copy_(0, sort_idx, y_grouped).view(x.size(0), self.top_k, -1)
         out = (y * weights.unsqueeze(-1)).sum(dim=1)
-        return out.reshape(orig_shape)
+        return out.to(x.dtype).reshape(orig_shape)
 
 
 class MoECustomKernels(nn.Module):
@@ -172,7 +172,8 @@ class MoECustomKernels(nn.Module):
         # scatter accumulation must stay fp32. lower-precision accumulation is
         # too noisy for MoE, so the kernel itself allocates an fp32 destination.
         out = custom_scatter_add_dense_tokens(weighted, src, n_tokens=x.size(0))
-        return out.reshape(orig_shape)
+        # recast fp32 out buffer back to input dtype
+        return out.to(x.dtype).reshape(orig_shape)
 
 
 class MoEFBGEMM(nn.Module):
@@ -227,4 +228,4 @@ class MoEFBGEMM(nn.Module):
         # into the provided destination buffer
         out = torch.zeros_like(x, dtype=torch.float32)
         torch.ops.fbgemm.scatter_add_dense_tokens(out, (yg * w.unsqueeze(-1)).contiguous(), src)
-        return out.reshape(orig)
+        return out.to(x.dtype).reshape(orig)
