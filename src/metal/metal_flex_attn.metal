@@ -593,6 +593,331 @@ kernel void metal_flex_attn_forward_dh64_bs4_single(
     out[out_offset + d_pair + 1u] = half(acc_out.y * inv_l);
 }
 
+kernel void metal_flex_attn_forward_dh64_bs4_gqa1_single(
+    device const half*         q,
+    device const half*         k,
+    device const half*         v,
+    device const int*          active_blocks,
+    device half*               out,
+    constant uint&             B,
+    constant uint&             Hq,
+    constant uint&             T,
+    constant uint&             L,
+    constant uint&             Dh,
+    constant uint&             block_size,
+    constant uint&             active_count,
+    constant uint&             causal,
+    constant uint&             Hkv,
+    constant uint&             fp16_accum,
+    uint                       tid        [[thread_position_in_grid]],
+    uint                       lane_id    [[thread_index_in_simdgroup]]
+) {
+    if (Dh != 64u || block_size != 4u || Hq != Hkv) {
+        return;
+    }
+
+    const uint total_queries = B * Hq * T;
+    const uint qid = tid >> 5; // /32
+    if (qid >= total_queries) {
+        return;
+    }
+
+    const uint bh = qid / T;
+    const uint t = qid % T;
+    const uint b = bh / Hq;
+    const uint hq = bh % Hq;
+    const uint hkv = hq;
+
+    const uint q_offset = (((b * Hq + hq) * T + t) * 64u);
+    const uint kv_base = (((b * Hkv + hkv) * L) * 64u);
+    const uint out_offset = q_offset;
+    const float inv_sqrt_dh = 0.125f;
+    const uint d_pair = lane_id << 1;
+    const uint q_start = (L > T) ? (L - T) : 0u;
+    const uint kv_limit = (causal != 0) ? min((uint)L, q_start + t + 1u) : (uint)L;
+    if (kv_limit == 0u) {
+        out[out_offset + d_pair + 0u] = half(0.0h);
+        out[out_offset + d_pair + 1u] = half(0.0h);
+        return;
+    }
+
+    const float2 q2 = float2(
+        (float)q[q_offset + d_pair + 0u],
+        (float)q[q_offset + d_pair + 1u]
+    );
+
+    float m = -INFINITY;
+    float l_acc = 0.0f;
+    const bool use_fp16_accum = (fp16_accum != 0u);
+    float2 acc2 = float2(0.0f);
+    half2 acc2_h = half2((half)0.0h);
+
+    for (uint ai = 0; ai < active_count; ++ai) {
+        const uint block_start = ((uint)active_blocks[ai]) << 2;
+        if (block_start >= kv_limit) {
+            break;
+        }
+
+        const uint kv0 = block_start + 0u;
+        if (kv0 < kv_limit) {
+            const uint k0 = kv_base + kv0 * 64u;
+            const float2 k20 = float2((float)k[k0 + d_pair + 0u], (float)k[k0 + d_pair + 1u]);
+            const float dot0 = simd_sum(q2.x * k20.x + q2.y * k20.y);
+            const float s0 = dot0 * inv_sqrt_dh;
+            const float m0 = max(m, s0);
+            const float a0 = fast::exp(m - m0);
+            const float b0 = fast::exp(s0 - m0);
+            const uint v0 = kv_base + kv0 * 64u;
+            if (use_fp16_accum) {
+                const half2 v20_h = half2(v[v0 + d_pair + 0u], v[v0 + d_pair + 1u]);
+                acc2_h = acc2_h * half(a0) + v20_h * half(b0);
+            } else {
+                const float2 v20 = float2((float)v[v0 + d_pair + 0u], (float)v[v0 + d_pair + 1u]);
+                acc2 = acc2 * a0 + v20 * b0;
+            }
+            l_acc = l_acc * a0 + b0;
+            m = m0;
+        }
+
+        const uint kv1 = block_start + 1u;
+        if (kv1 < kv_limit) {
+            const uint k1 = kv_base + kv1 * 64u;
+            const float2 k21 = float2((float)k[k1 + d_pair + 0u], (float)k[k1 + d_pair + 1u]);
+            const float dot1 = simd_sum(q2.x * k21.x + q2.y * k21.y);
+            const float s1 = dot1 * inv_sqrt_dh;
+            const float m1 = max(m, s1);
+            const float a1 = fast::exp(m - m1);
+            const float b1 = fast::exp(s1 - m1);
+            const uint v1 = kv_base + kv1 * 64u;
+            if (use_fp16_accum) {
+                const half2 v21_h = half2(v[v1 + d_pair + 0u], v[v1 + d_pair + 1u]);
+                acc2_h = acc2_h * half(a1) + v21_h * half(b1);
+            } else {
+                const float2 v21 = float2((float)v[v1 + d_pair + 0u], (float)v[v1 + d_pair + 1u]);
+                acc2 = acc2 * a1 + v21 * b1;
+            }
+            l_acc = l_acc * a1 + b1;
+            m = m1;
+        }
+
+        const uint kv2 = block_start + 2u;
+        if (kv2 < kv_limit) {
+            const uint k2 = kv_base + kv2 * 64u;
+            const float2 k22 = float2((float)k[k2 + d_pair + 0u], (float)k[k2 + d_pair + 1u]);
+            const float dot2 = simd_sum(q2.x * k22.x + q2.y * k22.y);
+            const float s2 = dot2 * inv_sqrt_dh;
+            const float m2 = max(m, s2);
+            const float a2 = fast::exp(m - m2);
+            const float b2 = fast::exp(s2 - m2);
+            const uint v2 = kv_base + kv2 * 64u;
+            if (use_fp16_accum) {
+                const half2 v22_h = half2(v[v2 + d_pair + 0u], v[v2 + d_pair + 1u]);
+                acc2_h = acc2_h * half(a2) + v22_h * half(b2);
+            } else {
+                const float2 v22 = float2((float)v[v2 + d_pair + 0u], (float)v[v2 + d_pair + 1u]);
+                acc2 = acc2 * a2 + v22 * b2;
+            }
+            l_acc = l_acc * a2 + b2;
+            m = m2;
+        }
+
+        const uint kv3 = block_start + 3u;
+        if (kv3 < kv_limit) {
+            const uint k3 = kv_base + kv3 * 64u;
+            const float2 k23 = float2((float)k[k3 + d_pair + 0u], (float)k[k3 + d_pair + 1u]);
+            const float dot3 = simd_sum(q2.x * k23.x + q2.y * k23.y);
+            const float s3 = dot3 * inv_sqrt_dh;
+            const float m3 = max(m, s3);
+            const float a3 = fast::exp(m - m3);
+            const float b3 = fast::exp(s3 - m3);
+            const uint v3 = kv_base + kv3 * 64u;
+            if (use_fp16_accum) {
+                const half2 v23_h = half2(v[v3 + d_pair + 0u], v[v3 + d_pair + 1u]);
+                acc2_h = acc2_h * half(a3) + v23_h * half(b3);
+            } else {
+                const float2 v23 = float2((float)v[v3 + d_pair + 0u], (float)v[v3 + d_pair + 1u]);
+                acc2 = acc2 * a3 + v23 * b3;
+            }
+            l_acc = l_acc * a3 + b3;
+            m = m3;
+        }
+    }
+
+    if (!(l_acc > 0.0f)) {
+        out[out_offset + d_pair + 0u] = half(0.0h);
+        out[out_offset + d_pair + 1u] = half(0.0h);
+        return;
+    }
+    const float inv_l = 1.0f / l_acc;
+    const float2 acc_out = use_fp16_accum ? float2(acc2_h) : acc2;
+    out[out_offset + d_pair + 0u] = half(acc_out.x * inv_l);
+    out[out_offset + d_pair + 1u] = half(acc_out.y * inv_l);
+}
+
+kernel void metal_flex_attn_forward_dh64_bs4_gqa1_block_written(
+    device const half*         q,
+    device const half*         k,
+    device const half*         v,
+    device const uchar*        block_written,
+    device half*               out,
+    constant uint&             B,
+    constant uint&             Hq,
+    constant uint&             T,
+    constant uint&             L,
+    constant uint&             Dh,
+    constant uint&             block_size,
+    constant uint&             kv_blocks,
+    constant uint&             causal,
+    constant uint&             Hkv,
+    constant uint&             fp16_accum,
+    uint                       tid        [[thread_position_in_grid]],
+    uint                       lane_id    [[thread_index_in_simdgroup]]
+) {
+    if (Dh != 64u || block_size != 4u || Hq != Hkv) {
+        return;
+    }
+
+    const uint total_queries = B * Hq * T;
+    const uint qid = tid >> 5;
+    if (qid >= total_queries) {
+        return;
+    }
+
+    const uint bh = qid / T;
+    const uint t = qid % T;
+    const uint b = bh / Hq;
+    const uint hq = bh % Hq;
+    const uint hkv = hq;
+
+    const uint q_offset = (((b * Hq + hq) * T + t) * 64u);
+    const uint kv_base = (((b * Hkv + hkv) * L) * 64u);
+    const uint out_offset = q_offset;
+    const float inv_sqrt_dh = 0.125f;
+    const uint d_pair = lane_id << 1;
+    const uint q_start = (L > T) ? (L - T) : 0u;
+    const uint kv_limit = (causal != 0) ? min((uint)L, q_start + t + 1u) : (uint)L;
+    if (kv_limit == 0u) {
+        out[out_offset + d_pair + 0u] = half(0.0h);
+        out[out_offset + d_pair + 1u] = half(0.0h);
+        return;
+    }
+
+    const float2 q2 = float2(
+        (float)q[q_offset + d_pair + 0u],
+        (float)q[q_offset + d_pair + 1u]
+    );
+
+    float m = -INFINITY;
+    float l_acc = 0.0f;
+    const bool use_fp16_accum = (fp16_accum != 0u);
+    float2 acc2 = float2(0.0f);
+    half2 acc2_h = half2((half)0.0h);
+
+    for (uint bidx = 0; bidx < kv_blocks; ++bidx) {
+        if (block_written[bidx] == 0) {
+            continue;
+        }
+        const uint block_start = bidx << 2;
+        if (block_start >= kv_limit) {
+            break;
+        }
+
+        const uint kv0 = block_start + 0u;
+        if (kv0 < kv_limit) {
+            const uint k0 = kv_base + kv0 * 64u;
+            const float2 k20 = float2((float)k[k0 + d_pair + 0u], (float)k[k0 + d_pair + 1u]);
+            const float dot0 = simd_sum(q2.x * k20.x + q2.y * k20.y);
+            const float s0 = dot0 * inv_sqrt_dh;
+            const float m0 = max(m, s0);
+            const float a0 = fast::exp(m - m0);
+            const float b0 = fast::exp(s0 - m0);
+            const uint v0 = kv_base + kv0 * 64u;
+            if (use_fp16_accum) {
+                const half2 v20_h = half2(v[v0 + d_pair + 0u], v[v0 + d_pair + 1u]);
+                acc2_h = acc2_h * half(a0) + v20_h * half(b0);
+            } else {
+                const float2 v20 = float2((float)v[v0 + d_pair + 0u], (float)v[v0 + d_pair + 1u]);
+                acc2 = acc2 * a0 + v20 * b0;
+            }
+            l_acc = l_acc * a0 + b0;
+            m = m0;
+        }
+
+        const uint kv1 = block_start + 1u;
+        if (kv1 < kv_limit) {
+            const uint k1 = kv_base + kv1 * 64u;
+            const float2 k21 = float2((float)k[k1 + d_pair + 0u], (float)k[k1 + d_pair + 1u]);
+            const float dot1 = simd_sum(q2.x * k21.x + q2.y * k21.y);
+            const float s1 = dot1 * inv_sqrt_dh;
+            const float m1 = max(m, s1);
+            const float a1 = fast::exp(m - m1);
+            const float b1 = fast::exp(s1 - m1);
+            const uint v1 = kv_base + kv1 * 64u;
+            if (use_fp16_accum) {
+                const half2 v21_h = half2(v[v1 + d_pair + 0u], v[v1 + d_pair + 1u]);
+                acc2_h = acc2_h * half(a1) + v21_h * half(b1);
+            } else {
+                const float2 v21 = float2((float)v[v1 + d_pair + 0u], (float)v[v1 + d_pair + 1u]);
+                acc2 = acc2 * a1 + v21 * b1;
+            }
+            l_acc = l_acc * a1 + b1;
+            m = m1;
+        }
+
+        const uint kv2 = block_start + 2u;
+        if (kv2 < kv_limit) {
+            const uint k2 = kv_base + kv2 * 64u;
+            const float2 k22 = float2((float)k[k2 + d_pair + 0u], (float)k[k2 + d_pair + 1u]);
+            const float dot2 = simd_sum(q2.x * k22.x + q2.y * k22.y);
+            const float s2 = dot2 * inv_sqrt_dh;
+            const float m2 = max(m, s2);
+            const float a2 = fast::exp(m - m2);
+            const float b2 = fast::exp(s2 - m2);
+            const uint v2 = kv_base + kv2 * 64u;
+            if (use_fp16_accum) {
+                const half2 v22_h = half2(v[v2 + d_pair + 0u], v[v2 + d_pair + 1u]);
+                acc2_h = acc2_h * half(a2) + v22_h * half(b2);
+            } else {
+                const float2 v22 = float2((float)v[v2 + d_pair + 0u], (float)v[v2 + d_pair + 1u]);
+                acc2 = acc2 * a2 + v22 * b2;
+            }
+            l_acc = l_acc * a2 + b2;
+            m = m2;
+        }
+
+        const uint kv3 = block_start + 3u;
+        if (kv3 < kv_limit) {
+            const uint k3 = kv_base + kv3 * 64u;
+            const float2 k23 = float2((float)k[k3 + d_pair + 0u], (float)k[k3 + d_pair + 1u]);
+            const float dot3 = simd_sum(q2.x * k23.x + q2.y * k23.y);
+            const float s3 = dot3 * inv_sqrt_dh;
+            const float m3 = max(m, s3);
+            const float a3 = fast::exp(m - m3);
+            const float b3 = fast::exp(s3 - m3);
+            const uint v3 = kv_base + kv3 * 64u;
+            if (use_fp16_accum) {
+                const half2 v23_h = half2(v[v3 + d_pair + 0u], v[v3 + d_pair + 1u]);
+                acc2_h = acc2_h * half(a3) + v23_h * half(b3);
+            } else {
+                const float2 v23 = float2((float)v[v3 + d_pair + 0u], (float)v[v3 + d_pair + 1u]);
+                acc2 = acc2 * a3 + v23 * b3;
+            }
+            l_acc = l_acc * a3 + b3;
+            m = m3;
+        }
+    }
+
+    if (!(l_acc > 0.0f)) {
+        out[out_offset + d_pair + 0u] = half(0.0h);
+        out[out_offset + d_pair + 1u] = half(0.0h);
+        return;
+    }
+    const float inv_l = 1.0f / l_acc;
+    const float2 acc_out = use_fp16_accum ? float2(acc2_h) : acc2;
+    out[out_offset + d_pair + 0u] = half(acc_out.x * inv_l);
+    out[out_offset + d_pair + 1u] = half(acc_out.y * inv_l);
+}
+
 kernel void metal_flex_attn_forward_dh64_bs4_gqa2_single(
     device const half*         q,
     device const half*         k,

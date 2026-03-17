@@ -91,6 +91,11 @@ def _using_metal_backend() -> bool:
     return os.environ.get("WORLD_ATTENTION_BACKEND", "flex").lower() == "metal"
 
 
+def _normal_tensor(factory):
+    with torch.inference_mode(False):
+        return factory()
+
+
 class LayerKVCache(nn.Module):
     """
     Ring-buffer KV cache with fixed capacity L (tokens) for history plus
@@ -123,12 +128,15 @@ class LayerKVCache(nn.Module):
         self._block_written = nn.Buffer(torch.empty(0, dtype=torch.uint8), persistent=False)
         self._all_blocks_i32 = nn.Buffer(torch.empty(0, dtype=torch.int32), persistent=False)
         self._tmp_block_written = nn.Buffer(torch.empty(0, dtype=torch.uint8), persistent=False)
+        self._compile_active_blocks = nn.Buffer(torch.empty(0, dtype=torch.int32), persistent=False)
+        self._compile_active_count = nn.Buffer(torch.zeros((), dtype=torch.int32), persistent=False)
         self._metal_bs_cache = 0
         self._blocks_per_frame = 0
         self._seen_slots: set[int] = set()
         self._seen_slots_ordered: list[int] = []
         self._slot_block_ranges: list[torch.Tensor] = []
         self._tail_block_range: torch.Tensor | None = None
+        self._all_blocks_except_slot: list[torch.Tensor] = []
         self._can_build_active_without_nonzero = False
 
         # Precompute indices:
@@ -150,11 +158,17 @@ class LayerKVCache(nn.Module):
         self._seen_slots_ordered = []
         self._slot_block_ranges = []
         self._tail_block_range = None
+        self._all_blocks_except_slot = []
         self._can_build_active_without_nonzero = False
         if self._block_written.numel() > 0:
             self._block_written.zero_()
         if self._all_blocks_i32.numel() > 0:
-            self._all_blocks_i32 = self._all_blocks_i32.new_empty((0,), dtype=torch.int32)
+            self._all_blocks_i32 = _normal_tensor(lambda: self._all_blocks_i32.new_empty((0,), dtype=torch.int32))
+        if self._compile_active_blocks.numel() > 0:
+            self._compile_active_blocks = _normal_tensor(
+                lambda: self._compile_active_blocks.new_empty((0,), dtype=torch.int32)
+            )
+        self._compile_active_count.zero_()
         if self._tmp_block_written.numel() > 0:
             self._tmp_block_written.zero_()
 
@@ -162,24 +176,54 @@ class LayerKVCache(nn.Module):
         if self._metal_bs_cache == metal_bs and self._block_written.numel() > 0:
             return
         block_any = _block_any_for_size(self.written, metal_bs).to(torch.uint8).contiguous()
-        self._block_written = block_any
+        self._block_written = _normal_tensor(lambda: block_any.clone())
         if self._tmp_block_written.numel() != block_any.numel():
-            self._tmp_block_written = torch.empty_like(block_any)
-        self._all_blocks_i32 = torch.arange(block_any.numel(), device=block_any.device, dtype=torch.int32)
+            self._tmp_block_written = _normal_tensor(lambda: torch.empty_like(block_any))
+        self._all_blocks_i32 = _normal_tensor(
+            lambda: torch.arange(block_any.numel(), device=block_any.device, dtype=torch.int32)
+        )
+        self._compile_active_blocks = _normal_tensor(lambda: torch.empty_like(self._all_blocks_i32))
+        self._compile_active_count.zero_()
         self._metal_bs_cache = metal_bs
         self._blocks_per_frame = (self.tpf + metal_bs - 1) // metal_bs
         self._slot_block_ranges = []
         self._tail_block_range = None
+        self._all_blocks_except_slot = []
         self._can_build_active_without_nonzero = False
         if (self.tpf % metal_bs) == 0 and (self.L % metal_bs) == 0:
             frame_blocks = self.tpf // metal_bs
-            base = torch.arange(frame_blocks, device=block_any.device, dtype=torch.int32)
+            base = _normal_tensor(lambda: torch.arange(frame_blocks, device=block_any.device, dtype=torch.int32))
             self._slot_block_ranges = [
-                (base + (slot * frame_blocks)).contiguous()
+                _normal_tensor(lambda slot=slot: (base + (slot * frame_blocks)).contiguous())
                 for slot in range(self.num_buckets)
             ]
-            self._tail_block_range = (base + (self.L // metal_bs)).contiguous()
+            self._tail_block_range = _normal_tensor(lambda: (base + (self.L // metal_bs)).contiguous())
+            self._all_blocks_except_slot = []
+            for slot in range(self.num_buckets):
+                start = slot * frame_blocks
+                end = start + frame_blocks
+                left = self._all_blocks_i32.narrow(0, 0, start)
+                right = self._all_blocks_i32.narrow(0, end, self._all_blocks_i32.numel() - end)
+                if left.numel() == 0:
+                    self._all_blocks_except_slot.append(_normal_tensor(lambda right=right: right.contiguous()))
+                elif right.numel() == 0:
+                    self._all_blocks_except_slot.append(_normal_tensor(lambda left=left: left.contiguous()))
+                else:
+                    self._all_blocks_except_slot.append(
+                        _normal_tensor(lambda left=left, right=right: torch.cat((left, right), dim=0).contiguous())
+                    )
             self._can_build_active_without_nonzero = True
+        self._refresh_compile_active_blocks()
+
+    def _refresh_compile_active_blocks(self):
+        if self._all_blocks_i32.numel() == 0:
+            return
+        active = torch.nonzero(self._block_written, as_tuple=False).flatten().to(torch.int32).contiguous()
+        count = int(active.numel())
+        self._compile_active_blocks.zero_()
+        if count > 0:
+            self._compile_active_blocks.narrow(0, 0, count).copy_(active)
+        self._compile_active_count.fill_(count)
 
     def rebuild_seen_slots(self):
         ring_tokens = self.num_buckets * self.tpf
@@ -195,6 +239,12 @@ class LayerKVCache(nn.Module):
         ring_block_start: int,
         slot: int,
     ) -> torch.Tensor:
+        if len(self._seen_slots) == self.num_buckets:
+            if not write_step:
+                return self._all_blocks_i32
+            if self._all_blocks_except_slot:
+                return self._all_blocks_except_slot[slot]
+
         if self._can_build_active_without_nonzero and self._tail_block_range is not None:
             parts: list[torch.Tensor] = []
             for seen_slot in self._seen_slots_ordered:
@@ -206,34 +256,37 @@ class LayerKVCache(nn.Module):
                 return parts[0]
             return torch.cat(parts, dim=0).contiguous()
 
-        # In steady state, ring blocks are fully written and mask updates are
-        # contiguous; build active indices arithmetically to avoid nonzero sync.
-        if len(self._seen_slots) == self.num_buckets:
-            all_blocks = self._all_blocks_i32
-            if not write_step:
-                return all_blocks
-            start = ring_block_start
-            end = min(start + self._blocks_per_frame, all_blocks.numel())
-            if start <= 0:
-                return all_blocks.narrow(0, end, all_blocks.numel() - end).contiguous()
-            if end >= all_blocks.numel():
-                return all_blocks.narrow(0, 0, start).contiguous()
-            left = all_blocks.narrow(0, 0, start)
-            right = all_blocks.narrow(0, end, all_blocks.numel() - end)
-            return torch.cat((left, right), dim=0).contiguous()
         return torch.nonzero(block_written, as_tuple=False).flatten().to(torch.int32).contiguous()
 
-    def upsert(self, kv: Tensor, pos_ids: TensorDict, is_frozen: bool, frame_idx_int: int | None = None):
+    def _upsert_frozen_compiled(self, k: Tensor, v: Tensor):
+        T = self.tpf
+        self.kv[0].narrow(2, self.L, T).copy_(k)
+        self.kv[1].narrow(2, self.L, T).copy_(v)
+        k_out, v_out = self.kv.unbind(0)
+        return (
+            k_out, v_out, None, self._block_written,
+            self._compile_active_blocks, self._compile_active_count,
+            self._configured_metal_bs,
+        )
+
+    def _upsert_impl(self, k: Tensor, v: Tensor, pos_ids: TensorDict, is_frozen: bool, frame_idx_int: int | None = None):
         """
-        kv: [2, B, H, T, Dh] for a single frame (T = tokens_per_frame)
+        k, v: [B, H, T, Dh] for a single frame (T = tokens_per_frame)
         t_pos: [B, T], all equal per frame (ignoring -1)
         """
+        compiling = torch.compiler.is_compiling()
+
+        if compiling and self._metal_backend and is_frozen:
+            self._ensure_block_written(self._configured_metal_bs)
+            return self._upsert_frozen_compiled(k, v)
+
         T = self.tpf
         f_pos = pos_ids["f_pos"]
 
-        if _kv_runtime_checks_enabled() and not torch.compiler.is_compiling():
-            torch._check(kv.size(3) == self.tpf, "KV cache expects exactly one frame per upsert")
-            torch._check(f_pos.shape == (kv.size(1), T), "t_pos must be [B, T]")
+        if _kv_runtime_checks_enabled() and not compiling:
+            torch._check(k.size(2) == self.tpf, "KV cache expects exactly one frame per upsert")
+            torch._check(k.shape == v.shape, "k and v must match for KV cache upsert")
+            torch._check(f_pos.shape == (k.size(0), T), "t_pos must be [B, T]")
             torch._check(self.tpf <= self.L, "frame longer than KV ring capacity")
             torch._check(self.L % self.tpf == 0, f"L ({self.L}) must be a multiple of tokens_per_frame ({self.tpf})")
             torch._check(self.kv.size(3) == self.capacity, "KV buffer too long (expected L + tokens_per_frame)")
@@ -242,7 +295,6 @@ class LayerKVCache(nn.Module):
 
         frame_idx = int(f_pos[0, 0].item()) if frame_idx_int is None else int(frame_idx_int)
 
-        # map frame_t to a bucket, each bucket owns T contiguous slots
         bucket = (frame_idx + (self.pinned_dilation - 1)) // self.pinned_dilation
         slot = (bucket & self._num_buckets_mask) if self._num_buckets_mask >= 0 else (bucket % self.num_buckets)
         base = slot * T
@@ -250,9 +302,8 @@ class LayerKVCache(nn.Module):
         ring_start = int(base)
         ring_end = ring_start + T
 
-        # Always write current frame into the tail slice [L, L+T):
-        # this is the "self-attention component" for the current frame.
-        self.kv.narrow(3, self.L, T).copy_(kv)
+        self.kv[0].narrow(2, self.L, T).copy_(k)
+        self.kv[1].narrow(2, self.L, T).copy_(v)
 
         bm = None
         metal_bs = self._configured_metal_bs
@@ -262,29 +313,28 @@ class LayerKVCache(nn.Module):
             self._ensure_block_written(metal_bs)
             ring_block_start = ring_start // metal_bs
             if write_step:
-                block_written = self._tmp_block_written
-                block_written.copy_(self._block_written)
+                block_written = _normal_tensor(lambda: self._block_written.clone())
                 block_written.narrow(0, ring_block_start, self._blocks_per_frame).zero_()
             else:
                 block_written = self._block_written
         else:
-            mask_written = self._mask_written
-            mask_written.copy_(self.written)
+            mask_written = _normal_tensor(lambda: self.written.clone())
             if write_step:
                 mask_written.narrow(0, ring_start, T).fill_(False)
             bm, _ = make_block_mask(T, self.capacity, mask_written)
-            block_written = _block_any_for_size(mask_written, metal_bs).to(torch.uint8).contiguous()
+            block_written = _normal_tensor(
+                lambda: _block_any_for_size(mask_written, metal_bs).to(torch.uint8).contiguous()
+            )
         active_blocks = None
+        active_count = None
         if need_active_metadata:
             ring_block_start = ring_start // metal_bs
             active_blocks = self._active_blocks_for_block_written(block_written, write_step, ring_block_start, slot)
 
-        # Persist current frame into the ring for future queries when unfrozen.
         if not is_frozen:
-            # Persist current frame into the ring for future queries.
-            # If write_step is false, current frame remains only in tail.
             if write_step:
-                self.kv.narrow(3, ring_start, T).copy_(kv)
+                self.kv[0].narrow(2, ring_start, T).copy_(k)
+                self.kv[1].narrow(2, ring_start, T).copy_(v)
                 first_write_for_slot = (slot not in self._seen_slots)
                 if first_write_for_slot:
                     self.written.narrow(0, ring_start, T).fill_(True)
@@ -296,9 +346,16 @@ class LayerKVCache(nn.Module):
                     if self._metal_backend:
                         ring_block_start = ring_start // metal_bs
                         self._block_written.narrow(0, ring_block_start, self._blocks_per_frame).fill_(1)
+                        self._refresh_compile_active_blocks()
 
         k, v = self.kv.unbind(0)
-        return k, v, bm, block_written, active_blocks, metal_bs
+        return k, v, bm, block_written, active_blocks, active_count, metal_bs
+
+    def upsert(self, kv: Tensor, pos_ids: TensorDict, is_frozen: bool, frame_idx_int: int | None = None):
+        return self._upsert_impl(kv[0], kv[1], pos_ids, is_frozen, frame_idx_int=frame_idx_int)
+
+    def upsert_separate(self, k: Tensor, v: Tensor, pos_ids: TensorDict, is_frozen: bool, frame_idx_int: int | None = None):
+        return self._upsert_impl(k, v, pos_ids, is_frozen, frame_idx_int=frame_idx_int)
 
 
 class StaticKVCache(nn.Module):
@@ -377,5 +434,4 @@ class StaticKVCache(nn.Module):
         return self._cached_fpos_value
 
     def upsert(self, k: Tensor, v: Tensor, pos_ids: TensorDict, layer: int, frame_idx_int: int | None = None):
-        kv = torch.stack([k, v], dim=0)
-        return self.layers[layer].upsert(kv, pos_ids, self._is_frozen, frame_idx_int=frame_idx_int)
+        return self.layers[layer].upsert_separate(k, v, pos_ids, self._is_frozen, frame_idx_int=frame_idx_int)

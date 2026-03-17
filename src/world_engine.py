@@ -104,10 +104,11 @@ class WorldEngine:
             self.scheduler_dsigmas = self.scheduler_sigmas.diff().contiguous()
             self.scheduler_step_sigmas = self.scheduler_sigmas[:-1].contiguous()
             n_steps = self.scheduler_dsigmas.numel()
-            self._step_sigmas_11 = [self.scheduler_step_sigmas[i].view(1, 1).contiguous() for i in range(n_steps)]
-            self._dsigmas_scalar = [self.scheduler_dsigmas[i] for i in range(n_steps)]
+            # Keep sigma tensors in a single contiguous layout to reduce compile guard churn.
+            self._step_sigmas_bt = self.scheduler_step_sigmas.view(n_steps, 1, 1).contiguous()
+            self._dsigmas_bt = self.scheduler_dsigmas.view(n_steps, 1, 1, 1, 1).contiguous()
             self._n_denoise_steps = n_steps
-            self._sigma_zero = torch.zeros((1, 1), dtype=dtype)
+            self._sigma_zero = torch.zeros((1, 1), dtype=dtype).contiguous()
 
             pH, pW = getattr(self.model_cfg, "patch", [1, 1])
             self.frm_shape = 1, 1, self.model_cfg.channels, self.model_cfg.height * pH, self.model_cfg.width * pW
@@ -127,13 +128,17 @@ class WorldEngine:
                 "frame_timestamp": torch.empty((1, 1), dtype=torch.long),
                 "frame_idx": torch.empty((1, 1), dtype=torch.long),
             }
+            self._ctrl_values = torch.zeros((1, 1, 3), dtype=dtype)
 
             self._prompt_ctx = {"prompt_emb": None, "prompt_pad_mask": None}
             metal_runtime = str(self.device).startswith("mps") and os.getenv("WORLD_ATTENTION_BACKEND", "flex").lower() == "metal"
+            metal_in_graph_attention = os.getenv("WORLD_METAL_ALLOW_IN_GRAPH_OP", "0") == "1"
             if (force_compile_metal or hybrid_compile_metal) and metal_runtime:
                 # Allow graph breaks around custom Metal ops while still compiling dense surrounding math.
-                self._cache_pass_fn = self._cache_pass_mixed
-                self._denoise_pass_fn = self._denoise_pass_mixed
+                # Keep cache updates eager when in-graph Metal attention is enabled; the
+                # side-effect-heavy cache path has shown pathological compile startup cost.
+                self._cache_pass_fn = self._cache_pass_eager if metal_in_graph_attention else self._cache_pass_mixed
+                self._denoise_pass_fn = self._denoise_pass_stepwise if metal_in_graph_attention else self._denoise_pass_mixed
             else:
                 self._cache_pass_fn = self._cache_pass_eager if self._disable_compile else self._cache_pass
                 self._denoise_pass_fn = self._denoise_pass_eager if self._disable_compile else self._denoise_pass
@@ -186,10 +191,9 @@ class WorldEngine:
         return (self.vae.decode(x0.squeeze(1)) if return_img else x0.squeeze(1))
 
     @torch.compile
-    def _prep_inputs(self, mouse_x: float, mouse_y: float, scroll_wheel: float):
-        self._ctx["mouse"][0, 0, 0] = mouse_x
-        self._ctx["mouse"][0, 0, 1] = mouse_y
-        self._ctx["scroll"][0, 0, 0] = scroll_wheel
+    def _prep_inputs(self, ctrl_values: Tensor):
+        self._ctx["mouse"].copy_(ctrl_values[..., :2])
+        self._ctx["scroll"].copy_(ctrl_values[..., 2:])
 
         self._ctx["frame_idx"].copy_(self.frame_ts)
         self._ctx["frame_timestamp"].copy_(self.frame_ts).mul_(self.ts_mult)
@@ -211,7 +215,10 @@ class WorldEngine:
             scroll_wheel = -1.0
         else:
             scroll_wheel = 0.0
-        ctx = self._prep_inputs(mouse_x, mouse_y, scroll_wheel)
+        self._ctrl_values[0, 0, 0] = mouse_x
+        self._ctrl_values[0, 0, 1] = mouse_y
+        self._ctrl_values[0, 0, 2] = scroll_wheel
+        ctx = self._prep_inputs(self._ctrl_values)
         # Thread a cheap Python-side frame index hint to avoid per-layer scalar syncs.
         self.kv_cache.set_frame_idx_int(self._frame_idx_int)
         self._frame_idx_int += 1
@@ -227,23 +234,51 @@ class WorldEngine:
     def _denoise_pass(self, x, ctx: Dict[str, Tensor], kv_cache):
         kv_cache.set_frozen(True)
         for i in range(self._n_denoise_steps):
-            v = self.model(x, self._step_sigmas_11[i], **ctx, kv_cache=kv_cache, ctrl_cond=True, prompt_cond=True)
-            x = x + self._dsigmas_scalar[i] * v
+            sigma_i = self._step_sigmas_bt[i]
+            v = self.model(x, sigma_i, **ctx, kv_cache=kv_cache, ctrl_cond=True, prompt_cond=True)
+            x = x + self._dsigmas_bt[i] * v
         return x
 
     def _denoise_pass_eager(self, x, ctx: Dict[str, Tensor], kv_cache):
         kv_cache.set_frozen(True)
         for i in range(self._n_denoise_steps):
-            v = self.model(x, self._step_sigmas_11[i], **ctx, kv_cache=kv_cache, ctrl_cond=True, prompt_cond=True)
-            x = x + self._dsigmas_scalar[i] * v
+            sigma_i = self._step_sigmas_bt[i]
+            v = self.model(x, sigma_i, **ctx, kv_cache=kv_cache, ctrl_cond=True, prompt_cond=True)
+            x = x + self._dsigmas_bt[i] * v
         return x
 
     @torch.compile(dynamic=False, options=COMPILE_OPTIONS)
     def _denoise_pass_mixed(self, x, ctx: Dict[str, Tensor], kv_cache):
         kv_cache.set_frozen(True)
         for i in range(self._n_denoise_steps):
-            v = self.model(x, self._step_sigmas_11[i], **ctx, kv_cache=kv_cache, ctrl_cond=True, prompt_cond=True)
-            x = x + self._dsigmas_scalar[i] * v
+            sigma_i = self._step_sigmas_bt[i]
+            v = self.model(x, sigma_i, **ctx, kv_cache=kv_cache, ctrl_cond=True, prompt_cond=True)
+            x = x + self._dsigmas_bt[i] * v
+        return x
+
+    @torch.compile(mode="reduce-overhead", dynamic=False)
+    def _denoise_pass_ingraph(self, x, ctx: Dict[str, Tensor], kv_cache):
+        kv_cache.set_frozen(True)
+        for i in range(self._n_denoise_steps):
+            sigma_i = self._step_sigmas_bt[i]
+            v = self.model(x, sigma_i, **ctx, kv_cache=kv_cache, ctrl_cond=True, prompt_cond=True)
+            x = x + self._dsigmas_bt[i] * v
+        return x
+
+    @torch.compile(dynamic=False, options=COMPILE_OPTIONS)
+    def _denoise_step(self, x, sigma_i: Tensor, dsigma_i: Tensor, ctx: Dict[str, Tensor], kv_cache):
+        v = self.model(x, sigma_i, **ctx, kv_cache=kv_cache, ctrl_cond=True, prompt_cond=True)
+        return x + dsigma_i * v
+
+    @torch.compile(mode="reduce-overhead", dynamic=False)
+    def _denoise_step_ingraph(self, x, sigma_i: Tensor, dsigma_i: Tensor, ctx: Dict[str, Tensor], kv_cache):
+        v = self.model(x, sigma_i, **ctx, kv_cache=kv_cache, ctrl_cond=True, prompt_cond=True)
+        return x + dsigma_i * v
+
+    def _denoise_pass_stepwise(self, x, ctx: Dict[str, Tensor], kv_cache):
+        kv_cache.set_frozen(True)
+        for i in range(self._n_denoise_steps):
+            x = self._denoise_step_ingraph(x, self._step_sigmas_bt[i], self._dsigmas_bt[i], ctx, kv_cache)
         return x
 
     @torch.compile(fullgraph=True, dynamic=False, options=COMPILE_OPTIONS)

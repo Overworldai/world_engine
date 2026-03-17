@@ -1,3 +1,4 @@
+import os
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
@@ -87,17 +88,16 @@ class CachedCondHead(nn.Module):
         return tuple(g.unbind(0))                                                  # (s0,b0,g0,s1,b1,g1)
 
 
+def _metal_in_graph_attention_enabled() -> bool:
+    return os.environ.get("WORLD_METAL_ALLOW_IN_GRAPH_OP", "0") == "1"
+
+
 def patch_cached_noise_conditioning(model, dtype: torch.dtype) -> None:
     # Call after model dtype/device are finalized.
     cached_denoise_step_emb = CachedDenoiseStepEmb(model.denoise_step_emb, model.config.scheduler_sigmas, dtype=dtype)
     model.denoise_step_emb = cached_denoise_step_emb
     for blk in model.transformer.blocks:
         blk.cond_head = CachedCondHead(blk.cond_head, cached_denoise_step_emb)
-
-
-@torch._dynamo.disable
-def _world_flex_attn_eager(q, k, v, meta, cfg):
-    return world_flex_attn_forward(q, k, v, meta, cfg)
 
 
 class MergedQKVAttn(Attn):
@@ -109,6 +109,7 @@ class MergedQKVAttn(Attn):
 
         self.q_out = self.n_heads * self.d_head
         self.kv_out = self.n_kv_heads * self.d_head
+        self._layer_idx_const = int(src.layer_idx)
 
         self.qkv_proj = nn.Linear(
             self.q_proj.in_features,
@@ -124,11 +125,11 @@ class MergedQKVAttn(Attn):
 
         del self.q_proj, self.k_proj, self.v_proj
 
-    def _stateful_attention(self, q, k, v, pos_ids, kv_cache):
-        frame_idx = kv_cache.get_frame_idx(pos_ids)
-        layer_cache = kv_cache.layers[self.layer_idx]
-        k, v, bm, block_written, active_blocks, block_size = layer_cache.upsert(
-            torch.stack([k, v], dim=0), pos_ids, kv_cache._is_frozen, frame_idx_int=frame_idx
+    def _stateful_attention_impl(self, q, k, v, pos_ids, kv_cache, layer_cache=None):
+        layer_cache = kv_cache.layers[self._layer_idx_const] if layer_cache is None else layer_cache
+        frame_idx = 0 if torch.compiler.is_compiling() else kv_cache.get_frame_idx(pos_ids)
+        k, v, bm, block_written, active_blocks, active_count, block_size = layer_cache.upsert_separate(
+            k, v, pos_ids, kv_cache._is_frozen, frame_idx_int=frame_idx
         )
         meta = AttnMeta(
             flex_block_mask=bm,
@@ -136,34 +137,50 @@ class MergedQKVAttn(Attn):
             kv_len=k.size(2),
             block_written=block_written,
             active_blocks=active_blocks,
+            active_count=active_count,
             block_size=block_size,
         )
         cfg = AttnConfig(causal=True, enable_gqa=self.enable_gqa)
-        # Keep only the custom op call on eager side to reduce graph-break scope.
-        return _world_flex_attn_eager(q, k, v, meta, cfg)
+        return world_flex_attn_forward(q, k, v, meta, cfg)
 
-    def forward(self, x, pos_ids, rope_angles, v1, kv_cache):
+    @torch._dynamo.disable
+    def _stateful_attention_eager(self, q, k, v, pos_ids, kv_cache, layer_cache=None):
+        return self._stateful_attention_impl(q, k, v, pos_ids, kv_cache, layer_cache=layer_cache)
+
+    def _stateful_attention(self, q, k, v, pos_ids, kv_cache, layer_cache=None):
+        if _metal_in_graph_attention_enabled():
+            return self._stateful_attention_impl(q, k, v, pos_ids, kv_cache, layer_cache=layer_cache)
+        return self._stateful_attention_eager(q, k, v, pos_ids, kv_cache, layer_cache=layer_cache)
+
+    def _project_qkv(self, x):
         q, k, v = self.qkv_proj(x).split((self.q_out, self.kv_out, self.kv_out), dim=-1)
-
         B, T = x.shape[:2]
-        q = q.reshape(B, T, self.n_heads, self.d_head).transpose(1, 2)
-        k = k.reshape(B, T, self.n_kv_heads, self.d_head).transpose(1, 2)
-        v = v.reshape(B, T, self.n_kv_heads, self.d_head).transpose(1, 2)
+        q = q.reshape(B, T, self.n_heads, self.d_head).transpose(1, 2).contiguous()
+        k = k.reshape(B, T, self.n_kv_heads, self.d_head).transpose(1, 2).contiguous()
+        v = v.reshape(B, T, self.n_kv_heads, self.d_head).transpose(1, 2).contiguous()
+        return q, k, v
 
-        if self.value_residual:
-            v1 = v if v1 is None else v1
-            v = torch.lerp(v, v1.view_as(v), self.v_lamb)
-
+    def _finish_attention(self, x, q, k, v, pos_ids, rope_angles, kv_cache, layer_cache=None):
+        B, T = x.shape[:2]
         q, k = rms_norm(q), rms_norm(k)
         q, k = self.rope(q, rope_angles), self.rope(k, rope_angles)
-        y = self._stateful_attention(q, k, v, pos_ids, kv_cache)
-
+        y = self._stateful_attention(q, k, v, pos_ids, kv_cache, layer_cache=layer_cache)
         if self.gated_attn:
             gates = torch.sigmoid(self.gate_proj(x[..., : self.n_heads]))
             y = y * gates.permute(0, 2, 1).unsqueeze(-1)
-
         y = y.transpose(1, 2).reshape(B, T, -1)
-        y = self.out_proj(y)
+        return self.out_proj(y)
+
+    def forward_first(self, x, pos_ids, rope_angles, kv_cache, layer_cache=None):
+        q, k, v = self._project_qkv(x)
+        y = self._finish_attention(x, q, k, v, pos_ids, rope_angles, kv_cache, layer_cache=layer_cache)
+        return y, v
+
+    def forward_with_residual(self, x, pos_ids, rope_angles, v1, kv_cache, layer_cache=None):
+        q, k, v = self._project_qkv(x)
+        if self.value_residual:
+            v = torch.lerp(v, v1.view_as(v), self.v_lamb)
+        y = self._finish_attention(x, q, k, v, pos_ids, rope_angles, kv_cache, layer_cache=layer_cache)
         return y, v1
 
 

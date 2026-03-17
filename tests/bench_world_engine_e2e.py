@@ -141,6 +141,20 @@ def main():
     cache_ms = []
     decode_ms = []
 
+    def _first_second_steady(values):
+        if not values:
+            return {"first": 0.0, "second": 0.0, "steady_mean": 0.0, "steady_count": 0}
+        first = float(values[0])
+        second = float(values[1]) if len(values) > 1 else float(values[0])
+        steady = values[2:] if len(values) > 2 else []
+        steady_mean = float(sum(steady) / len(steady)) if steady else float(second)
+        return {
+            "first": first,
+            "second": second,
+            "steady_mean": steady_mean,
+            "steady_count": len(steady),
+        }
+
     def _step(ctrl):
         with torch.inference_mode():
             x = torch.randn(engine.frm_shape, device=engine.device, dtype=engine.dtype)
@@ -257,6 +271,13 @@ def main():
                 "p50": 1000.0 / max(total_p50, 1e-9),
                 "p95": 1000.0 / max(total_p95, 1e-9),
                 "mean": 1000.0 / max(total_mean, 1e-9),
+            },
+            "startup_profile_ms": {
+                "total": _first_second_steady(totals_ms),
+                "prep": _first_second_steady(prep_ms),
+                "denoise": _first_second_steady(denoise_ms),
+                "cache": _first_second_steady(cache_ms),
+                "decode": _first_second_steady(decode_ms),
             },
         }
         Path(args.json_out).parent.mkdir(parents=True, exist_ok=True)

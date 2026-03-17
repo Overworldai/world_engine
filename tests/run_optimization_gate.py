@@ -8,8 +8,21 @@ from pathlib import Path
 import torch
 
 
-def _run(cmd: list[str], env: dict[str, str]) -> None:
-    subprocess.run(cmd, check=True, env=env)
+def _run(
+    cmd: list[str],
+    env: dict[str, str],
+    log_path: Path | None = None,
+    check: bool = True,
+) -> None:
+    if log_path is None:
+        subprocess.run(cmd, check=check, env=env)
+        return
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.run(cmd, check=False, env=env, capture_output=True, text=True)
+    blob = f"$ {' '.join(cmd)}\n{proc.stdout}\n{proc.stderr}"
+    log_path.write_text(blob, encoding="utf-8")
+    if check and proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd, output=proc.stdout, stderr=proc.stderr)
 
 
 def _load_json(path: Path) -> dict:
@@ -82,10 +95,13 @@ def main():
     parser.add_argument("--output-dir", default="diagnostics/out/optimization_gate_run")
     parser.add_argument("--config", default="tests/optimization_gate_config.json")
     parser.add_argument("--strict", action="store_true")
-    parser.add_argument("--visual-review-on-fail", action="store_true")
+    parser.add_argument("--visual-review-on-fail", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--visual-review-frames", type=int, default=32)
     parser.add_argument("--hybrid-compile", action="store_true")
     parser.add_argument("--force-compile", action="store_true")
+    parser.add_argument("--capture-recompiles", action="store_true")
+    parser.add_argument("--preclean-python", action="store_true")
+    parser.add_argument("--isolate-ext-build", action="store_true")
     args = parser.parse_args()
 
     defaults = _preset_defaults(args.preset)
@@ -123,6 +139,18 @@ def main():
     env.setdefault("PYTHONPATH", ".")
     env["WORLD_HYBRID_COMPILE_METAL"] = "1" if args.hybrid_compile else "0"
     env["WORLD_FORCE_COMPILE_METAL"] = "1" if args.force_compile else "0"
+    if args.preclean_python:
+        subprocess.run(["pkill", "-9", "-f", "/opt/homebrew/Cellar/python@3.14"], check=False)
+        subprocess.run(["pkill", "-9", "-f", "/Users/louiscastricato/overworld/world_engine/.venv/bin/python"], check=False)
+    if args.isolate_ext_build:
+        ext_dir = output_dir / "torch_extensions"
+        ext_dir.mkdir(parents=True, exist_ok=True)
+        env["TORCH_EXTENSIONS_DIR"] = str(ext_dir)
+        env.setdefault("NINJA", "/Users/louiscastricato/overworld/world_engine/.venv/bin/ninja")
+    recompile_dir = output_dir / "recompile_logs"
+    if args.capture_recompiles:
+        env["TORCH_LOGS"] = "recompiles"
+        env.setdefault("TORCHDYNAMO_VERBOSE", "1")
 
     py = sys.executable
     profile_script = "tests/profile_and_dump_variant_metal.py"
@@ -164,6 +192,7 @@ def main():
                 f"optimization_gate_perf_run_{i:02d}",
             ],
             env,
+            (recompile_dir / f"perf_run_{i:02d}.log") if args.capture_recompiles else None,
         )
         perf_reports.append(_load_json(run_dir / "profile_report.json"))
 
@@ -203,6 +232,7 @@ def main():
             str(latent_json),
         ],
         env,
+        (recompile_dir / "bench_latent.log") if args.capture_recompiles else None,
     )
     _run(
         [
@@ -225,6 +255,7 @@ def main():
             str(decoded_json),
         ],
         env,
+        (recompile_dir / "bench_decoded.log") if args.capture_recompiles else None,
     )
 
     # 2) Dump run + module timing
@@ -255,6 +286,7 @@ def main():
             "optimization_gate_dump",
         ],
         env,
+        (recompile_dir / "dump.log") if args.capture_recompiles else None,
     )
 
     # 2.5) Hotspot ranking summary from profiler + module timing.
@@ -272,6 +304,7 @@ def main():
             "10",
         ],
         env,
+        (recompile_dir / "hotspots.log") if args.capture_recompiles else None,
     )
 
     # 3) Quick compare gate (sentinel modules)
@@ -299,6 +332,8 @@ def main():
             str(compare_quick_dir),
         ],
         env,
+        (recompile_dir / "compare_quick.log") if args.capture_recompiles else None,
+        check=False,
     )
 
     # 4) Full compare gate
@@ -324,6 +359,8 @@ def main():
             str(compare_full_dir),
         ],
         env,
+        (recompile_dir / "compare_full.log") if args.capture_recompiles else None,
+        check=False,
     )
 
     base_perf = _load_json(Path(args.baseline_perf_report))
@@ -375,6 +412,7 @@ def main():
                 visual_review_video,
             ],
             env,
+            (recompile_dir / "visual_review.log") if args.capture_recompiles else None,
         )
 
     report = {
@@ -418,6 +456,7 @@ def main():
         },
         "safety": safety,
         "visual_review_video": visual_review_video,
+        "recompile_log_dir": str(recompile_dir) if args.capture_recompiles else "",
         "thresholds": cfg,
     }
 

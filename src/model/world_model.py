@@ -260,36 +260,108 @@ class WorldDiTBlock(nn.Module):
         do_ctrl_cond = config.ctrl_conditioning_period is not None and layer_idx % config.ctrl_conditioning_period == 0
         self.ctrl_mlpfusion = MLPFusion(config) if do_ctrl_cond else None
 
-    def forward(self, x, pos_ids, rope_angles, cond, ctx, v, kv_cache=None):
-        """
-        0) Causal Frame Attention
-        1) Frame->CTX Cross Attention
-        2) MLP
-        """
+        if do_prompt_cond and do_ctrl_cond:
+            self.forward_first = self._forward_first_prompt_ctrl
+            self.forward_with_residual = self._forward_with_residual_prompt_ctrl
+        elif do_prompt_cond:
+            self.forward_first = self._forward_first_prompt_only
+            self.forward_with_residual = self._forward_with_residual_prompt_only
+        elif do_ctrl_cond:
+            self.forward_first = self._forward_first_ctrl_only
+            self.forward_with_residual = self._forward_with_residual_ctrl_only
+        else:
+            self.forward_first = self._forward_first_plain
+            self.forward_with_residual = self._forward_with_residual_plain
+
+    def _self_attend_first(self, x, pos_ids, rope_angles, cond, kv_cache=None, layer_cache=None):
         s0, b0, g0, s1, b1, g1 = self.cond_head(cond)
-
-        # Self / Causal Attention
-        residual = x
+        residual = x.contiguous()
         x = ada_rmsnorm(x, s0, b0)
-        x, v = self.attn(x, pos_ids, rope_angles, v, kv_cache=kv_cache)
-        x = ada_gate(x, g0) + residual
+        x, v = self.attn.forward_first(x, pos_ids, rope_angles, kv_cache=kv_cache, layer_cache=layer_cache)
+        x = (ada_gate(x, g0) + residual).contiguous()
+        return x, v, s1, b1, g1
 
-        # Cross Attention Prompt Conditioning
-        if self.prompt_cross_attn is not None:
-            x = self.prompt_cross_attn(
-                rms_norm(x),
-                context=rms_norm(ctx["prompt_emb"]),
-                context_pad_mask=ctx["prompt_pad_mask"],
-            ) + x
+    def _self_attend_with_residual(self, x, pos_ids, rope_angles, cond, v, kv_cache=None, layer_cache=None):
+        s0, b0, g0, s1, b1, g1 = self.cond_head(cond)
+        residual = x.contiguous()
+        x = ada_rmsnorm(x, s0, b0)
+        x, v = self.attn.forward_with_residual(x, pos_ids, rope_angles, v, kv_cache=kv_cache, layer_cache=layer_cache)
+        x = (ada_gate(x, g0) + residual).contiguous()
+        return x, v, s1, b1, g1
 
-        # MLPFusion Controller Conditioning
-        if self.ctrl_mlpfusion is not None:
-            x = self.ctrl_mlpfusion(rms_norm(x), rms_norm(ctx["ctrl_emb"])) + x
-
-        # MLP
+    def _finish_mlp(self, x, s1, b1, g1):
         x = ada_gate(self.mlp(ada_rmsnorm(x, s1, b1)), g1) + x
+        return x.contiguous()
 
-        return x, v
+    def _apply_prompt(self, x, ctx):
+        return self.prompt_cross_attn(
+            rms_norm(x),
+            context=rms_norm(ctx["prompt_emb"]),
+            context_pad_mask=ctx["prompt_pad_mask"],
+        ) + x
+
+    def _apply_ctrl(self, x, ctx):
+        return self.ctrl_mlpfusion(rms_norm(x), rms_norm(ctx["ctrl_emb"])) + x
+
+    def _forward_first_plain(self, x, pos_ids, rope_angles, cond, ctx, kv_cache=None, layer_cache=None):
+        x, v, s1, b1, g1 = self._self_attend_first(
+            x, pos_ids, rope_angles, cond, kv_cache=kv_cache, layer_cache=layer_cache
+        )
+        return self._finish_mlp(x, s1, b1, g1), v
+
+    def _forward_first_prompt_only(self, x, pos_ids, rope_angles, cond, ctx, kv_cache=None, layer_cache=None):
+        x, v, s1, b1, g1 = self._self_attend_first(
+            x, pos_ids, rope_angles, cond, kv_cache=kv_cache, layer_cache=layer_cache
+        )
+        x = self.prompt_cross_attn(
+            rms_norm(x),
+            context=rms_norm(ctx["prompt_emb"]),
+            context_pad_mask=ctx["prompt_pad_mask"],
+        ) + x
+        return self._finish_mlp(x, s1, b1, g1), v
+
+    def _forward_first_ctrl_only(self, x, pos_ids, rope_angles, cond, ctx, kv_cache=None, layer_cache=None):
+        x, v, s1, b1, g1 = self._self_attend_first(
+            x, pos_ids, rope_angles, cond, kv_cache=kv_cache, layer_cache=layer_cache
+        )
+        x = self._apply_ctrl(x, ctx)
+        return self._finish_mlp(x, s1, b1, g1), v
+
+    def _forward_first_prompt_ctrl(self, x, pos_ids, rope_angles, cond, ctx, kv_cache=None, layer_cache=None):
+        x, v, s1, b1, g1 = self._self_attend_first(
+            x, pos_ids, rope_angles, cond, kv_cache=kv_cache, layer_cache=layer_cache
+        )
+        x = self._apply_prompt(x, ctx)
+        x = self._apply_ctrl(x, ctx)
+        return self._finish_mlp(x, s1, b1, g1), v
+
+    def _forward_with_residual_plain(self, x, pos_ids, rope_angles, cond, ctx, v, kv_cache=None, layer_cache=None):
+        x, v, s1, b1, g1 = self._self_attend_with_residual(
+            x, pos_ids, rope_angles, cond, v, kv_cache=kv_cache, layer_cache=layer_cache
+        )
+        return self._finish_mlp(x, s1, b1, g1), v
+
+    def _forward_with_residual_prompt_only(self, x, pos_ids, rope_angles, cond, ctx, v, kv_cache=None, layer_cache=None):
+        x, v, s1, b1, g1 = self._self_attend_with_residual(
+            x, pos_ids, rope_angles, cond, v, kv_cache=kv_cache, layer_cache=layer_cache
+        )
+        x = self._apply_prompt(x, ctx)
+        return self._finish_mlp(x, s1, b1, g1), v
+
+    def _forward_with_residual_ctrl_only(self, x, pos_ids, rope_angles, cond, ctx, v, kv_cache=None, layer_cache=None):
+        x, v, s1, b1, g1 = self._self_attend_with_residual(
+            x, pos_ids, rope_angles, cond, v, kv_cache=kv_cache, layer_cache=layer_cache
+        )
+        x = self._apply_ctrl(x, ctx)
+        return self._finish_mlp(x, s1, b1, g1), v
+
+    def _forward_with_residual_prompt_ctrl(self, x, pos_ids, rope_angles, cond, ctx, v, kv_cache=None, layer_cache=None):
+        x, v, s1, b1, g1 = self._self_attend_with_residual(
+            x, pos_ids, rope_angles, cond, v, kv_cache=kv_cache, layer_cache=layer_cache
+        )
+        x = self._apply_prompt(x, ctx)
+        x = self._apply_ctrl(x, ctx)
+        return self._finish_mlp(x, s1, b1, g1), v
 
 
 class WorldDiT(nn.Module):
@@ -307,9 +379,17 @@ class WorldDiT(nn.Module):
 
     def forward(self, x, pos_ids, cond, ctx, kv_cache=None):
         rope_angles = self.rope_angles(pos_ids)
-        v = None
-        for i, block in enumerate(self.blocks):
-            x, v = block(x, pos_ids, rope_angles, cond, ctx, v, kv_cache=kv_cache)
+        if not self.blocks:
+            return x
+        layer_iter = zip(self.blocks, kv_cache.layers)
+        first_block, first_layer_cache = next(layer_iter)
+        x, v = first_block.forward_first(
+            x, pos_ids, rope_angles, cond, ctx, kv_cache=kv_cache, layer_cache=first_layer_cache
+        )
+        for block, layer_cache in layer_iter:
+            x, v = block.forward_with_residual(
+                x, pos_ids, rope_angles, cond, ctx, v, kv_cache=kv_cache, layer_cache=layer_cache
+            )
         return x
 
 

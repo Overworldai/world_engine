@@ -101,6 +101,7 @@ class AttnMeta:
     kv_len: Optional[int] = None
     block_written: Optional[Tensor] = None
     active_blocks: Optional[Tensor] = None
+    active_count: Optional[Tensor] = None
     block_size: Optional[int] = None
 
     # Future fields for the Metal backend (block size, bucket indices, validity
@@ -143,6 +144,17 @@ def world_flex_attn_forward(
         mode = _metal_impl_mode()
         use_causal = _metal_use_causal(cfg)
         if mode == "fast":
+            # Keep compile signatures stable: `active_blocks` grows with history,
+            # while `block_written` has fixed per-layer shape.
+            if torch.compiler.is_compiling() and meta is not None and meta.block_size is not None:
+                if meta.active_blocks is not None and meta.active_count is not None:
+                    return torch.ops.world.flex_attn_metal_fast_active_counted(
+                        q, k, v, meta.active_blocks, meta.active_count, int(meta.block_size), use_causal
+                    )
+                if meta.block_written is not None:
+                    return torch.ops.world.flex_attn_metal_fast_blocks_direct(
+                        q, k, v, meta.block_written, int(meta.block_size), use_causal
+                    )
             if meta is not None and meta.active_blocks is not None and meta.block_size is not None:
                 return torch.ops.world.flex_attn_metal_fast_active(
                     q, k, v, meta.active_blocks, int(meta.block_size), use_causal

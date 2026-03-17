@@ -110,7 +110,7 @@ class Attn(nn.Module):
 
         # Update KV-cache in-place; pass frame index once to avoid per-layer scalar extraction.
         frame_idx = kv_cache.get_frame_idx(pos_ids)
-        k, v, bm, block_written, active_blocks, block_size = kv_cache.upsert(
+        k, v, bm, block_written, active_blocks, active_count, block_size = kv_cache.upsert(
             k, v, pos_ids, self.layer_idx, frame_idx_int=frame_idx
         )
 
@@ -121,6 +121,7 @@ class Attn(nn.Module):
             kv_len=k.size(2),
             block_written=block_written,
             active_blocks=active_blocks,
+            active_count=active_count,
             block_size=block_size,
         )
         cfg = AttnConfig(causal=True, enable_gqa=self.enable_gqa)
