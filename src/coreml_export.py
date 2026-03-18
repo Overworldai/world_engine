@@ -160,8 +160,6 @@ class _Block(nn.Module):
                 self.ctrl_fc1_c.weight.copy_(Wc)
                 self.ctrl_fc2.weight.copy_(ctrl.mlp.fc2.weight)
 
-        # States are fp32 for scatter_ compatibility (MIL promotes scatter updates to fp32).
-        # Reads are cast to fp16 for computation.
         self.register_buffer("k_cache", torch.zeros(1, N_KV_HEADS, kv_capacity, D_HEAD))
         self.register_buffer("v_cache", torch.zeros(1, N_KV_HEADS, kv_capacity, D_HEAD))
         written = torch.zeros(kv_capacity)
@@ -233,35 +231,27 @@ class _Block(nn.Module):
         effective_write = icw * write_step
         stale_factor = write_step * (1 - icw)
 
-        # -- Attention mask (reads state, casts to fp16, no scatter) --
-        ring_pos = ((self._pos_arange >= ring_start) & (self._pos_arange < ring_start + T))
-        ring_pos_f = ring_pos.to(q.dtype)  # fp16
-        w_eff = self.written.to(q.dtype) * (1 - ring_pos_f * stale_factor.to(q.dtype))
+        # -- Attention mask --
+        ring_pos = ((self._pos_arange >= ring_start) & (self._pos_arange < ring_start + T)).float()
+        w_eff = self.written * (1 - ring_pos * stale_factor)
         attn_bias = w_eff.unsqueeze(0).unsqueeze(0).unsqueeze(0) * 1e4 - 1e4
 
-        # SDPA requires q/k/v same dtype. States are fp32; MIL may promote q to fp32
-        # via rms_norm. Cast everything to state dtype for SDPA, then back to fp16.
-        q_att = q.to(self.k_cache.dtype)
-        attn_bias_att = attn_bias.to(self.k_cache.dtype)
-        y = F.scaled_dot_product_attention(q_att, self.k_cache, self.v_cache, attn_mask=attn_bias_att)
-        y = y.half()
+        y = F.scaled_dot_product_attention(q, self.k_cache, self.v_cache, attn_mask=attn_bias)
 
-        # -- Ring buffer copy (fp32 throughout to match state dtype) --
+        # -- Ring buffer copy --
         ring_idx_kv = ring_idx.view(1, 1, T, 1).expand(1, N_KV_HEADS, T, D_HEAD)
-        ew = effective_write.to(self.k_cache.dtype)  # fp32
 
-        cur_k = self.k_cache.gather(2, ring_idx_kv)       # fp32 from fp32 state
-        k_tail = self.k_cache[:, :, L:cap, :]              # fp32 from fp32 state
-        self.k_cache.scatter_(2, ring_idx_kv, cur_k + (k_tail - cur_k) * ew)  # all fp32
+        cur_k = self.k_cache.gather(2, ring_idx_kv)
+        k_tail = self.k_cache[:, :, L:cap, :]
+        self.k_cache.scatter_(2, ring_idx_kv, cur_k + (k_tail - cur_k) * effective_write)
 
         cur_v = self.v_cache.gather(2, ring_idx_kv)
         v_tail = self.v_cache[:, :, L:cap, :]
-        self.v_cache.scatter_(2, ring_idx_kv, cur_v + (v_tail - cur_v) * ew)
+        self.v_cache.scatter_(2, ring_idx_kv, cur_v + (v_tail - cur_v) * effective_write)
 
-        ew_w = effective_write.to(self.written.dtype)  # fp32
-        w_cur = self.written.gather(0, ring_idx)       # fp32
-        ones_w = torch.ones_like(w_cur)                # fp32
-        self.written.scatter_(0, ring_idx, w_cur + (ones_w - w_cur) * ew_w.expand(T))
+        w_cur = self.written.gather(0, ring_idx)
+        ones_w = torch.ones_like(w_cur)
+        self.written.scatter_(0, ring_idx, w_cur + (ones_w - w_cur) * effective_write.expand(T))
 
         # -- Rest of block --
         y = y.transpose(1, 2).reshape(1, T, N_HEADS * D_HEAD)
@@ -288,22 +278,13 @@ def _patch_rms_norm_globally():
     attn_mod.rms_norm = _rms_norm_d
 
 
-def build_model(model_uri: str, device="cpu", dtype=torch.float16):
+def build_model(model_uri: str, device="cpu", dtype=torch.float32):
+    """Build model in fp32. coremltools handles fp16 conversion via compute_precision."""
     from .model import WorldModel
     _patch_rms_norm_globally()
     cfg = WorldModel.load_config(model_uri)
     model = WorldModel.from_pretrained(model_uri, cfg=cfg, device=device, dtype=dtype).eval()
-    stateful = StatefulWorldModel(model, cfg).eval()
-    # Cast model weights to fp16, but leave state buffers (k_cache, v_cache, written) as fp32
-    state_names = {"k_cache", "v_cache", "written"}
-    for p in stateful.parameters():
-        p.data = p.data.to(dtype=dtype)
-    for name, buf in stateful.named_buffers():
-        if buf.is_floating_point():
-            is_state = any(s in name for s in state_names)
-            if not is_state:
-                buf.data = buf.data.to(dtype=dtype)
-    return stateful, cfg
+    return StatefulWorldModel(model, cfg).eval(), cfg
 
 
 def convert_to_coreml(model_uri: str, out_path: str, device: str = "cpu"):
@@ -318,18 +299,18 @@ def convert_to_coreml(model_uri: str, out_path: str, device: str = "cpu"):
     period = cfg.global_attn_period
     off = getattr(cfg, "global_attn_offset", 0) % period
 
-    # All trace inputs are fp16 — no fp32 anywhere
-    x = torch.randn(1, 1, C, HP * PH, WP * PW, dtype=torch.float16)
-    cond = torch.randn(1, 1, D_MODEL, dtype=torch.float16)
-    rope_cos = torch.randn(1, 1, T, D_ROPE, dtype=torch.float16)
-    rope_sin = torch.randn(1, 1, T, D_ROPE, dtype=torch.float16)
-    mouse = torch.zeros(1, 1, 2, dtype=torch.float16)
-    button = torch.zeros(1, 1, N_BUTTONS, dtype=torch.float16)
-    scroll = torch.zeros(1, 1, 1, dtype=torch.float16)
-    is_cache_write = torch.zeros(1, dtype=torch.float16)
-    ring_start_local = torch.zeros(1, dtype=torch.float16)
-    ring_start_global = torch.zeros(1, dtype=torch.float16)
-    write_step_global = torch.ones(1, dtype=torch.float16)
+    # Trace in fp32; compute_precision=FLOAT16 handles all conversion uniformly
+    x = torch.randn(1, 1, C, HP * PH, WP * PW)
+    cond = torch.randn(1, 1, D_MODEL)
+    rope_cos = torch.randn(1, 1, T, D_ROPE)
+    rope_sin = torch.randn(1, 1, T, D_ROPE)
+    mouse = torch.zeros(1, 1, 2)
+    button = torch.zeros(1, 1, N_BUTTONS)
+    scroll = torch.zeros(1, 1, 1)
+    is_cache_write = torch.zeros(1)
+    ring_start_local = torch.zeros(1)
+    ring_start_global = torch.zeros(1)
+    write_step_global = torch.ones(1)
 
     print("[export] Forward test...")
     with torch.no_grad():
@@ -389,6 +370,7 @@ def convert_to_coreml(model_uri: str, out_path: str, device: str = "cpu"):
         compute_precision=ct.precision.FLOAT16,
         minimum_deployment_target=ct.target.iOS18,
     )
+
     print("[export] Done.")
     mlmodel.save(out_path)
     print(f"[export] Saved to {out_path}")
