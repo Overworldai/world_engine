@@ -212,6 +212,10 @@ def quantize_model(model: nn.Module, quant: str):
 from torchao.quantization import (quantize_, 
                                   Int4WeightOnlyConfig, 
                                   Int8WeightOnlyConfig, 
+                                  Int8DynamicActivationInt8WeightConfig,
+                                #   NVFP4DynamicActivationNVFP4WeightConfig,
+                                  Float8DynamicActivationInt4WeightConfig,
+                                  Int8DynamicActivationIntxWeightConfig,
                                   Float8WeightOnlyConfig,
                                   Float8DynamicActivationFloat8WeightConfig,
                                   PerTensor, PerRow)
@@ -222,7 +226,8 @@ from torchao.quantization.qat import (QATConfig,
 
 _LAYER_FILTERS = {
     "mlp":       lambda mod, fqn: isinstance(mod, torch.nn.Linear) and "transformer.blocks" in fqn and ".mlp." in fqn,
-    "attention": lambda mod, fqn: isinstance(mod, torch.nn.Linear) and ".attn." in fqn,
+    "attn": lambda mod, fqn: isinstance(mod, torch.nn.Linear) and ".attn." in fqn,\
+    "mlp_and_attn": lambda mod, fqn: isinstance(mod, torch.nn.Linear) and "transformer.blocks" in fqn and (".mlp." in fqn or ".attn." in fqn),
     "all":       lambda mod, fqn: isinstance(mod, torch.nn.Linear),
 }
 
@@ -234,10 +239,18 @@ def apply_ptq_model(model, config: str, layers: str = "mlp"):
         qconfig = Int4WeightOnlyConfig(group_size=32, int4_packing_format="tile_packed_to_4d", int4_choose_qparams_algorithm="hqq")
     elif config == "int8_weights":
         qconfig = Int8WeightOnlyConfig()
+    elif config == "int_w8a8":
+        qconfig = Int8DynamicActivationInt8WeightConfig()
+    elif config == "int4w_int8a":
+        qconfig = Int8DynamicActivationIntxWeightConfig(weight_dtype=torch.int4)
+    elif config == "int4w_fp8a":
+        qconfig = Float8DynamicActivationInt4WeightConfig()
+    elif config == "fp_w8a8":
+        qconfig = Float8DynamicActivationFloat8WeightConfig(granularity=PerTensor())
+    # elif config == "fp_w4a4":
+    #     qconfig = NVFP4DynamicActivationNVFP4WeightConfig()
     elif config == "fp8_weights":
         qconfig = Float8WeightOnlyConfig()
-    elif config == "f8aw":
-        qconfig = Float8DynamicActivationFloat8WeightConfig(granularity=PerTensor   ())
     else:
         raise ValueError(f"Unknown quant_config: {config!r}")
     quantize_(model, qconfig, filter_fn=filter_fn)

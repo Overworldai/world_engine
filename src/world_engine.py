@@ -72,9 +72,9 @@ class WorldEngine:
             if quant is not None:
                 print(f"Applying {quant} PTQ...")
                 # apply_qat(self.model, quant_config="bf16", layers="mlp", step="convert")
-                quantize_model(self.model, quant)
+                # quantize_model(self.model, quant)
                 # apply_qat(self.model, quant_config=quant, layers="all", step="convert")
-                # apply_ptq_model(self.model, quant, layers="all")
+                apply_ptq_model(self.model, quant, layers="mlp_and_attn")
 
             self.kv_cache = StaticKVCache(self.model_cfg, batch_size=1, dtype=dtype)
 
