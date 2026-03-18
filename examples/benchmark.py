@@ -54,14 +54,16 @@ def get_warm_engine(model_uri, model_overrides=None):
         "patch": [2, 2],
         "temporal_compression": 4,
         "inference_fps": 60,
-        "quant": "int4_weights",
+        # "quant": "int8_weights",
+        "quant": None,
         "taehv_ae": True,
     }
     model_config_overrides.update(model_overrides or {})
     engine = WorldEngine(
         model_uri,
         model_config_overrides=model_config_overrides,
-        quant=model_config_overrides.get("quant"),
+        # quant=model_config_overrides.get("quant"),
+        quant="w8a8",
         device="cuda",
         load_weights=False
     )
@@ -73,7 +75,7 @@ def get_warm_engine(model_uri, model_overrides=None):
 
 
 @pytest.fixture(scope="session")
-def engine(model_uri="Overworld-Models/anm-WP-Mini-Distill-int4-mlp-no_ckpt"):
+def engine(model_uri="Overworld-Models/anm-WP-Mini-Distill-bf16"):
     return get_warm_engine(model_uri)
 
 
@@ -101,7 +103,7 @@ MODEL_OVERRIDES = [None]
     ids=lambda d: (",".join(f"{k}={v}" for k, v in d.items()) or "") if d else ""
 )
 def test_ar_rollout(benchmark, dit_only, n_frames, model_overrides):
-    engine = get_warm_engine("Overworld-Models/anm-WP-Mini-Distill-int4-mlp-no_ckpt", model_overrides=model_overrides)
+    engine = get_warm_engine("Overworld-Models/anm-WP-Mini-Distill-bf16", model_overrides=model_overrides)
 
     def setup():
         engine.reset()

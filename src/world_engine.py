@@ -70,9 +70,11 @@ class WorldEngine:
             ).eval()
             apply_inference_patches(self.model)
             if quant is not None:
-                # apply_ptq_model(self.model, quant, layers="mlp")
-                apply_qat(self.model, quant_config=quant, layers="mlp", step="convert")
-
+                print(f"Applying {quant} PTQ...")
+                # apply_qat(self.model, quant_config="bf16", layers="mlp", step="convert")
+                quantize_model(self.model, quant)
+                # apply_qat(self.model, quant_config=quant, layers="all", step="convert")
+                # apply_ptq_model(self.model, quant, layers="all")
 
             self.kv_cache = StaticKVCache(self.model_cfg, batch_size=1, dtype=dtype)
 
