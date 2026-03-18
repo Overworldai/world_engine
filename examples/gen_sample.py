@@ -17,15 +17,19 @@ model_config_overrides = {"ae_uri": "Overworld-Models/taehv1_5",
                           "patch": [2, 2],
                           "temporal_compression": 4,
                           "inference_fps": 60,
-                          "quant": "int4_weights",
+                        #   "quant": "int8_weights",
+                          "quant": None,
                           "taehv_ae": True}
 
 model_config_overrides.update({})
 engine = WorldEngine(sys.argv[1], 
                      model_config_overrides=model_config_overrides,
-                     quant="int4_weights",
+                    #  quant="int4_weights",
+                     quant=None,
                      device="cuda")
 
+total_linear_params = sum(mod.weight.numel() for _, mod in engine.model.named_modules() if isinstance(mod, torch.nn.Linear))
+print(f"Total linear layer parameters: {total_linear_params:,}")
 
 # Define sequence of controller inputs applied
 controller_sequence = [
