@@ -1,14 +1,17 @@
 """
 Core ML export for the WorldModel with stateful KV cache.
 
+Ring buffer management and stale-slot masking are handled INSIDE the model
+to avoid expensive host-side state.read_state()/write_state() round-trips.
+
+The host precomputes ring slot positions (trivial integer math) and passes
+them as fp16 inputs, keeping the entire model graph in fp16.
+
 Architecture per frame:
-  1. Host: compute cond (fp32 NoiseConditioner), RoPE angles (fp32)
-  2. Host: mask stale ring slots in written state (for denoise only)
-  3. CoreML predict x4: denoise steps
-  4. Host: restore written state
-  5. CoreML predict x1: cache write (sigma=0, same model)
-  6. Host: copy tail -> ring slot in KV state, update written state
-  7. Host: VAE decode
+  1. Host: compute cond (fp32), RoPE (fp32), ring positions (int math)
+  2. CoreML predict x4: denoise steps (is_cache_write=0)
+  3. CoreML predict x1: cache write  (is_cache_write=1)
+  4. Host: VAE decode
 
 Usage:
     PYTHONPATH=. .venv312/bin/python -m src.coreml_export \
@@ -55,7 +58,7 @@ PW = 2
 N_BUTTONS = 256
 
 
-class StatefulWorldModelV3(nn.Module):
+class StatefulWorldModel(nn.Module):
     def __init__(self, model, cfg):
         super().__init__()
 
@@ -72,8 +75,9 @@ class StatefulWorldModelV3(nn.Module):
         self.blocks = nn.ModuleList()
         for i, blk in enumerate(model.transformer.blocks):
             is_global = ((i - off) % period == 0)
-            cap = (global_L if is_global else local_L) + T
-            self.blocks.append(_Block(blk, cfg, cap))
+            L = global_L if is_global else local_L
+            cap = L + T
+            self.blocks.append(_Block(blk, cfg, cap, L, is_global))
 
     def _ada_ln(self, x: Tensor, cond: Tensor) -> Tensor:
         y = F.silu(cond)
@@ -91,8 +95,12 @@ class StatefulWorldModelV3(nn.Module):
         mouse: Tensor,
         button: Tensor,
         scroll: Tensor,
+        is_cache_write: Tensor,
+        ring_start_local: Tensor,
+        ring_start_global: Tensor,
+        write_step_global: Tensor,
     ) -> Tensor:
-        ctrl_emb = self.ctrl_emb(mouse, button, scroll) + 1e-7  # prevent all-zeros for CoreML rms_norm
+        ctrl_emb = self.ctrl_emb(mouse, button, scroll) + 1e-7
 
         x_2d = x.reshape(1, C, HP * PH, WP * PW)
         x_pat = self.patchify(x_2d)
@@ -105,6 +113,8 @@ class StatefulWorldModelV3(nn.Module):
                 x_seq, cond, ctrl_emb,
                 rope_cos, rope_sin,
                 None if first else v1,
+                is_cache_write,
+                ring_start_local, ring_start_global, write_step_global,
             )
             first = False
 
@@ -117,9 +127,11 @@ class StatefulWorldModelV3(nn.Module):
 
 
 class _Block(nn.Module):
-    def __init__(self, blk, cfg, kv_capacity: int):
+    def __init__(self, blk, cfg, kv_capacity: int, L: int, is_global: bool):
         super().__init__()
         self.kv_capacity = kv_capacity
+        self.L = L
+        self.is_global = is_global
 
         attn = blk.attn
         self.q_proj = attn.q_proj
@@ -148,11 +160,15 @@ class _Block(nn.Module):
                 self.ctrl_fc1_c.weight.copy_(Wc)
                 self.ctrl_fc2.weight.copy_(ctrl.mlp.fc2.weight)
 
+        # States are fp32 for scatter_ compatibility (MIL promotes scatter updates to fp32).
+        # Reads are cast to fp16 for computation.
         self.register_buffer("k_cache", torch.zeros(1, N_KV_HEADS, kv_capacity, D_HEAD))
         self.register_buffer("v_cache", torch.zeros(1, N_KV_HEADS, kv_capacity, D_HEAD))
-        written = torch.zeros(kv_capacity, dtype=torch.float16)
+        written = torch.zeros(kv_capacity)
         written[kv_capacity - T:] = 1.0
         self.register_buffer("written", written)
+        self.register_buffer("_frame_offsets", torch.arange(T, dtype=torch.long))
+        self.register_buffer("_pos_arange", torch.arange(kv_capacity, dtype=torch.long))
 
     def _cond(self, cond: Tensor):
         c = cond + self.cond_bias_in if self.cond_bias_in is not None else cond
@@ -171,6 +187,9 @@ class _Block(nn.Module):
     def forward(
         self, x: Tensor, cond: Tensor, ctrl_emb: Tensor,
         rope_cos: Tensor, rope_sin: Tensor, v1_in: Tensor,
+        is_cache_write: Tensor,
+        ring_start_local: Tensor, ring_start_global: Tensor,
+        write_step_global: Tensor,
     ) -> Tuple[Tensor, Tensor]:
         s0, b0, g0, s1, b1, g1 = self._cond(cond)
 
@@ -184,7 +203,7 @@ class _Block(nn.Module):
         if self.value_residual and v1_in is not None:
             v1_r = v1_in.view(1, N_KV_HEADS, T, D_HEAD)
             v_new = v_new + self.v_lamb * (v1_r - v_new)
-            v1_out = v1_in  # propagate first layer's raw v unchanged
+            v1_out = v1_in
         else:
             v1_out = v_new
 
@@ -193,20 +212,60 @@ class _Block(nn.Module):
         q = _ortho_rope(q, rope_cos, rope_sin)
         k_new = _ortho_rope(k_new, rope_cos, rope_sin)
 
+        # -- Write KV to tail (always) --
         cap = self.kv_capacity
+        L = self.L
         self.k_cache[:, :, cap - T:cap, :] = k_new
         self.v_cache[:, :, cap - T:cap, :] = v_new
 
-        # Use float additive mask: 0.0 for written positions, -1e4 for unwritten.
-        # Boolean masks may not convert correctly through CoreML.
-        w = self.written.unsqueeze(0).unsqueeze(0).unsqueeze(0).to(q.dtype)
-        attn_bias = w * 1e4 - 1e4  # written=1 → 0.0, written=0 → -1e4
+        # -- Pick precomputed ring_start and write_step for this layer type --
+        if self.is_global:
+            ring_start = ring_start_global.reshape(-1).long()
+            write_step = write_step_global.reshape(-1)
+        else:
+            ring_start = ring_start_local.reshape(-1).long()
+            write_step = torch.ones_like(is_cache_write.reshape(-1))
 
-        y = F.scaled_dot_product_attention(q, self.k_cache, self.v_cache, attn_mask=attn_bias)
+        ring_idx = self._frame_offsets + ring_start  # [T]
 
+        # -- Effective flags --
+        icw = is_cache_write.reshape(-1)
+        effective_write = icw * write_step
+        stale_factor = write_step * (1 - icw)
+
+        # -- Attention mask (reads state, casts to fp16, no scatter) --
+        ring_pos = ((self._pos_arange >= ring_start) & (self._pos_arange < ring_start + T))
+        ring_pos_f = ring_pos.to(q.dtype)  # fp16
+        w_eff = self.written.to(q.dtype) * (1 - ring_pos_f * stale_factor.to(q.dtype))
+        attn_bias = w_eff.unsqueeze(0).unsqueeze(0).unsqueeze(0) * 1e4 - 1e4
+
+        # SDPA requires q/k/v same dtype. States are fp32; MIL may promote q to fp32
+        # via rms_norm. Cast everything to state dtype for SDPA, then back to fp16.
+        q_att = q.to(self.k_cache.dtype)
+        attn_bias_att = attn_bias.to(self.k_cache.dtype)
+        y = F.scaled_dot_product_attention(q_att, self.k_cache, self.v_cache, attn_mask=attn_bias_att)
+        y = y.half()
+
+        # -- Ring buffer copy (fp32 throughout to match state dtype) --
+        ring_idx_kv = ring_idx.view(1, 1, T, 1).expand(1, N_KV_HEADS, T, D_HEAD)
+        ew = effective_write.to(self.k_cache.dtype)  # fp32
+
+        cur_k = self.k_cache.gather(2, ring_idx_kv)       # fp32 from fp32 state
+        k_tail = self.k_cache[:, :, L:cap, :]              # fp32 from fp32 state
+        self.k_cache.scatter_(2, ring_idx_kv, cur_k + (k_tail - cur_k) * ew)  # all fp32
+
+        cur_v = self.v_cache.gather(2, ring_idx_kv)
+        v_tail = self.v_cache[:, :, L:cap, :]
+        self.v_cache.scatter_(2, ring_idx_kv, cur_v + (v_tail - cur_v) * ew)
+
+        ew_w = effective_write.to(self.written.dtype)  # fp32
+        w_cur = self.written.gather(0, ring_idx)       # fp32
+        ones_w = torch.ones_like(w_cur)                # fp32
+        self.written.scatter_(0, ring_idx, w_cur + (ones_w - w_cur) * ew_w.expand(T))
+
+        # -- Rest of block --
         y = y.transpose(1, 2).reshape(1, T, N_HEADS * D_HEAD)
         y = self.out_proj(y)
-
         x = self._ada_gate(y, g0) + residual
 
         if self.has_ctrl:
@@ -234,12 +293,16 @@ def build_model(model_uri: str, device="cpu", dtype=torch.float16):
     _patch_rms_norm_globally()
     cfg = WorldModel.load_config(model_uri)
     model = WorldModel.from_pretrained(model_uri, cfg=cfg, device=device, dtype=dtype).eval()
-    stateful = StatefulWorldModelV3(model, cfg).eval()
+    stateful = StatefulWorldModel(model, cfg).eval()
+    # Cast model weights to fp16, but leave state buffers (k_cache, v_cache, written) as fp32
+    state_names = {"k_cache", "v_cache", "written"}
     for p in stateful.parameters():
         p.data = p.data.to(dtype=dtype)
     for name, buf in stateful.named_buffers():
         if buf.is_floating_point():
-            buf.data = buf.data.to(dtype=dtype)
+            is_state = any(s in name for s in state_names)
+            if not is_state:
+                buf.data = buf.data.to(dtype=dtype)
     return stateful, cfg
 
 
@@ -255,6 +318,7 @@ def convert_to_coreml(model_uri: str, out_path: str, device: str = "cpu"):
     period = cfg.global_attn_period
     off = getattr(cfg, "global_attn_offset", 0) % period
 
+    # All trace inputs are fp16 — no fp32 anywhere
     x = torch.randn(1, 1, C, HP * PH, WP * PW, dtype=torch.float16)
     cond = torch.randn(1, 1, D_MODEL, dtype=torch.float16)
     rope_cos = torch.randn(1, 1, T, D_ROPE, dtype=torch.float16)
@@ -262,15 +326,25 @@ def convert_to_coreml(model_uri: str, out_path: str, device: str = "cpu"):
     mouse = torch.zeros(1, 1, 2, dtype=torch.float16)
     button = torch.zeros(1, 1, N_BUTTONS, dtype=torch.float16)
     scroll = torch.zeros(1, 1, 1, dtype=torch.float16)
+    is_cache_write = torch.zeros(1, dtype=torch.float16)
+    ring_start_local = torch.zeros(1, dtype=torch.float16)
+    ring_start_global = torch.zeros(1, dtype=torch.float16)
+    write_step_global = torch.ones(1, dtype=torch.float16)
 
     print("[export] Forward test...")
     with torch.no_grad():
-        out = model(x, cond, rope_cos, rope_sin, mouse, button, scroll)
+        out = model(x, cond, rope_cos, rope_sin, mouse, button, scroll,
+                    is_cache_write, ring_start_local, ring_start_global, write_step_global)
     print(f"[export] Output: {out.shape}")
 
     print("[export] Tracing...")
     with torch.no_grad():
-        traced = torch.jit.trace(model, (x, cond, rope_cos, rope_sin, mouse, button, scroll), strict=False)
+        traced = torch.jit.trace(
+            model,
+            (x, cond, rope_cos, rope_sin, mouse, button, scroll,
+             is_cache_write, ring_start_local, ring_start_global, write_step_global),
+            strict=False,
+        )
     print("[export] Trace done.")
 
     inputs = [
@@ -281,6 +355,10 @@ def convert_to_coreml(model_uri: str, out_path: str, device: str = "cpu"):
         ct.TensorType(name="mouse", shape=(1, 1, 2)),
         ct.TensorType(name="button", shape=(1, 1, N_BUTTONS)),
         ct.TensorType(name="scroll", shape=(1, 1, 1)),
+        ct.TensorType(name="is_cache_write", shape=(1,)),
+        ct.TensorType(name="ring_start_local", shape=(1,)),
+        ct.TensorType(name="ring_start_global", shape=(1,)),
+        ct.TensorType(name="write_step_global", shape=(1,)),
     ]
 
     states = []
