@@ -25,7 +25,6 @@ url = random.choice([
     "https://gist.github.com/user-attachments/assets/68c943a4-008a-4c25-948c-c81ab4c47d21",
 ])
 frame = cv2.imdecode(np.frombuffer(urllib.request.urlopen(url).read(), np.uint8), cv2.IMREAD_COLOR)
-frame = cv2.resize(frame, (1024, 512))[:, :, ::-1]
 engine.append_frame(torch.from_numpy(np.repeat(frame[None], 4, axis=0)))
 
 

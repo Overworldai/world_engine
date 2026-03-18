@@ -46,7 +46,9 @@ class WorldEngine:
         """
         model_uri: HF URI or local folder containing model.safetensors and config.yaml
         quant: None | w8a8 | nvfp4
+
         model_config_overrides: Dict to override model config values
+        - auto_aspect_ratio: set to False to work in ae raw space, otherwise in/out are 720p or 360p
         """
         self.device = torch.get_default_device() if device is None else device
         self.dtype = torch.get_default_dtype() if dtype is None else dtype
@@ -60,9 +62,10 @@ class WorldEngine:
             # Load Model / Modules
             self.vae = get_ae(
                 self.model_cfg.ae_uri,
-                getattr(self.model_cfg, "taehv_ae", False),
+                is_taehv_ae=getattr(self.model_cfg, "taehv_ae", False),
                 auto_aspect_ratio=getattr(self.model_cfg, "auto_aspect_ratio", True),
-                dtype=dtype
+                dtype=dtype,
+                device=device,
             )
 
             self.prompt_encoder = None
