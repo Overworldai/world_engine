@@ -1,19 +1,20 @@
 """
-Generate video using the Core ML WorldModel with stateful KV cache.
+Generate video using optimized Core ML WorldModel pipeline.
 
-Ring buffer management and stale-slot masking are handled inside the model.
-The host computes noise conditioning, RoPE, and ring positions, then calls
-predict() with no state round-trips needed.
+Uses two separate models that share KV cache state:
+  - Unrolled denoise model (stripped, no ring buffer ops) — 4 Euler steps in 1 call
+  - Cache write model (full, with ring buffer) — 1 call for KV cache update
 
 Per-frame pipeline:
   1. Host: compute RoPE angles (fp32), ring positions (int math)
-  2. CoreML predict x4: denoise steps (is_cache_write=0)
-  3. CoreML predict x1: cache write  (is_cache_write=1)
+  2. CoreML predict x1: unrolled denoise (stripped model, 4 steps)
+  3. CoreML predict x1: cache write (full model, ring buffer copy)
   4. Host: VAE decode
 
 Usage:
     PYTHONPATH=. .venv312/bin/python -m src.coreml_gen_video \
-        --model diagnostics/out/world_model.mlpackage \
+        --denoise-model diagnostics/out/denoise_unrolled.mlpackage \
+        --cache-model diagnostics/out/cache_write.mlpackage \
         --out diagnostics/out/coreml_output.mp4 \
         --frames 60
 """
@@ -39,8 +40,6 @@ SEED_URLS = [
 ]
 
 SIGMAS = [1.0, 0.9, 0.75, 0.3, 0.0]
-DSIGMAS = [SIGMAS[i+1] - SIGMAS[i] for i in range(4)]
-
 T = 512
 N_LAYERS = 24
 
@@ -66,75 +65,60 @@ def compute_rope_host(frame_idx, ts_mult, rope_xy, rope_inv_t, cfg):
 
 
 def compute_ring_positions(frame_idx, cfg):
-    """Compute ring buffer positions on the host (trivial integer math)."""
-    # Local layers: dilation=1, num_buckets = local_window
-    local_num_buckets = cfg.local_window  # L/T/dil = (16*512)/512/1 = 16
+    local_num_buckets = cfg.local_window
     ring_start_local = (frame_idx % local_num_buckets) * T
-
-    # Global layers: dilation=8, num_buckets = global_window/dilation = 128/8 = 16
     global_dilation = cfg.global_pinned_dilation
-    global_num_buckets = cfg.global_window // global_dilation  # 128/8 = 16
+    global_num_buckets = cfg.global_window // global_dilation
     bucket_global = (frame_idx + (global_dilation - 1)) // global_dilation
     ring_start_global = (bucket_global % global_num_buckets) * T
-
     write_step_global = 1.0 if (frame_idx % global_dilation) == 0 else 0.0
-
     return (np.array([float(ring_start_local)], dtype=np.float16),
             np.array([float(ring_start_global)], dtype=np.float16),
             np.array([write_step_global], dtype=np.float16))
 
 
-def model_predict(mlmodel, state, x, cond_np, rope_cos_np, rope_sin_np,
-                  is_cache_write, ring_start_local, ring_start_global, write_step_global,
-                  mouse=(0, 0), buttons=None, scroll=0):
-    inputs = {
-        "x": np.array(x, dtype=np.float16),
-        "cond": cond_np,
-        "rope_cos": rope_cos_np,
-        "rope_sin": rope_sin_np,
-        "mouse": np.array([[[float(mouse[0]), float(mouse[1])]]], dtype=np.float16),
-        "button": np.zeros((1, 1, 256), dtype=np.float16),
-        "scroll": np.array([[[float(scroll)]]], dtype=np.float16),
-        "is_cache_write": np.array([float(is_cache_write)], dtype=np.float16),
-        "ring_start_local": ring_start_local,
-        "ring_start_global": ring_start_global,
-        "write_step_global": write_step_global,
-    }
+def _make_ctrl_inputs(mouse, buttons, scroll):
+    m = np.array([[[float(mouse[0]), float(mouse[1])]]], dtype=np.float16)
+    b = np.zeros((1, 1, 256), dtype=np.float16)
     if buttons:
-        for b in buttons:
-            if 0 <= b < 256:
-                inputs["button"][0, 0, b] = 1.0
-    return mlmodel.predict(inputs, state=state)
+        for btn in buttons:
+            if 0 <= btn < 256:
+                b[0, 0, btn] = 1.0
+    s = np.array([[[float(scroll)]]], dtype=np.float16)
+    return m, b, s
 
 
-def unrolled_denoise_predict(mlmodel, state, x, cond_list, rope_cos_np, rope_sin_np,
-                             ring_start_local, ring_start_global, write_step_global,
-                             mouse=(0, 0), buttons=None, scroll=0):
-    """Single predict call that runs all 4 denoise steps internally."""
+def denoise_predict(denoise_model, state, x, cond_list, rope_cos, rope_sin,
+                    rsl, rsg, wsg, mouse=(0,0), buttons=None, scroll=0):
+    m, b, s = _make_ctrl_inputs(mouse, buttons, scroll)
     inputs = {
         "x": np.array(x, dtype=np.float16),
         "cond0": cond_list[0], "cond1": cond_list[1],
         "cond2": cond_list[2], "cond3": cond_list[3],
-        "rope_cos": rope_cos_np, "rope_sin": rope_sin_np,
-        "mouse": np.array([[[float(mouse[0]), float(mouse[1])]]], dtype=np.float16),
-        "button": np.zeros((1, 1, 256), dtype=np.float16),
-        "scroll": np.array([[[float(scroll)]]], dtype=np.float16),
-        "is_cache_write": np.array([0.0], dtype=np.float16),
-        "ring_start_local": ring_start_local,
-        "ring_start_global": ring_start_global,
-        "write_step_global": write_step_global,
+        "rope_cos": rope_cos, "rope_sin": rope_sin,
+        "mouse": m, "button": b, "scroll": s,
+        "ring_start_local": rsl, "ring_start_global": rsg, "write_step_global": wsg,
     }
-    if buttons:
-        for b in buttons:
-            if 0 <= b < 256:
-                inputs["button"][0, 0, b] = 1.0
-    return mlmodel.predict(inputs, state=state)
+    return denoise_model.predict(inputs, state=state)
+
+
+def cache_write_predict(cache_model, state, x, cond_0, rope_cos, rope_sin,
+                        rsl, rsg, wsg, mouse=(0,0), buttons=None, scroll=0):
+    m, b, s = _make_ctrl_inputs(mouse, buttons, scroll)
+    inputs = {
+        "x": np.array(x, dtype=np.float16),
+        "cond": cond_0,
+        "rope_cos": rope_cos, "rope_sin": rope_sin,
+        "mouse": m, "button": b, "scroll": s,
+        "ring_start_local": rsl, "ring_start_global": rsg, "write_step_global": wsg,
+    }
+    return cache_model.predict(inputs, state=state)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", required=True)
-    parser.add_argument("--unrolled-model", default=None, help="Path to unrolled denoise model")
+    parser.add_argument("--denoise-model", required=True)
+    parser.add_argument("--cache-model", required=True)
     parser.add_argument("--out", default="diagnostics/out/coreml_output.mp4")
     parser.add_argument("--seed-url", default="")
     parser.add_argument("--frames", type=int, default=60)
@@ -157,16 +141,15 @@ def main():
 
     print("[gen] Precomputing noise conditioning (fp32)...")
     cond_cache = {s: compute_cond_host(s, noise_cond) for s in SIGMAS}
+    cond_list = [cond_cache[s] for s in SIGMAS[:4]]
+    cond_0 = cond_cache[0.0]
 
-    print("[gen] Loading Core ML model (single-step)...")
-    mlmodel = ct.models.MLModel(args.model, compute_units=ct.ComputeUnit.ALL)
-    state = mlmodel.make_state()
+    print("[gen] Loading Core ML models...")
+    denoise_model = ct.models.MLModel(args.denoise_model, compute_units=ct.ComputeUnit.ALL)
+    cache_model = ct.models.MLModel(args.cache_model, compute_units=ct.ComputeUnit.ALL)
 
-    unrolled_model = None
-    if args.unrolled_model:
-        print("[gen] Loading Core ML model (unrolled denoise)...")
-        unrolled_model = ct.models.MLModel(args.unrolled_model, compute_units=ct.ComputeUnit.ALL)
-    use_unrolled = unrolled_model is not None
+    # Both models share the same state (same buffer names)
+    state = cache_model.make_state()
 
     # Initialize written state: tail must be 1.0
     print("[gen] Initializing written state...")
@@ -205,12 +188,10 @@ def main():
 
     # append_frame: cache write with seed latent
     frame_idx = 0
-    cond_0 = cond_cache[0.0]
     rope_cos, rope_sin = compute_rope_host(frame_idx, ts_mult, rope_xy, rope_inv_t, cfg)
     rsl, rsg, wsg = compute_ring_positions(frame_idx, cfg)
     print("[gen] append_frame: cache write with seed latent...")
-    model_predict(mlmodel, state, seed_np, cond_0, rope_cos, rope_sin,
-                  is_cache_write=1.0, ring_start_local=rsl, ring_start_global=rsg, write_step_global=wsg)
+    cache_write_predict(cache_model, state, seed_np, cond_0, rope_cos, rope_sin, rsl, rsg, wsg)
     frame_idx += 1
 
     ctrl_seq = [
@@ -240,27 +221,17 @@ def main():
         rope_cos, rope_sin = compute_rope_host(frame_idx, ts_mult, rope_xy, rope_inv_t, cfg)
         rsl, rsg, wsg = compute_ring_positions(frame_idx, cfg)
 
-        # Denoise pass
+        # Denoise: 1 call (4 steps unrolled, stripped — no ring buffer ops)
         x = np.random.randn(1, 1, 32, 32, 64).astype(np.float16)
-        if use_unrolled:
-            cond_list = [cond_cache[s] for s in SIGMAS[:4]]
-            pred = unrolled_denoise_predict(
-                unrolled_model, state, x, cond_list, rope_cos, rope_sin,
-                rsl, rsg, wsg, mouse=mouse, buttons=buttons, scroll=scroll)
-            x = pred[list(pred.keys())[0]]
-        else:
-            for step in range(4):
-                pred = model_predict(mlmodel, state, x, cond_cache[SIGMAS[step]], rope_cos, rope_sin,
-                                     is_cache_write=0.0, ring_start_local=rsl, ring_start_global=rsg,
-                                     write_step_global=wsg, mouse=mouse, buttons=buttons, scroll=scroll)
-                x = x + DSIGMAS[step] * pred[list(pred.keys())[0]]
+        pred = denoise_predict(denoise_model, state, x, cond_list, rope_cos, rope_sin,
+                               rsl, rsg, wsg, mouse=mouse, buttons=buttons, scroll=scroll)
+        x = pred[list(pred.keys())[0]]
 
         all_latents.append(x)
 
-        # Cache write pass
-        model_predict(mlmodel, state, x, cond_0, rope_cos, rope_sin,
-                      is_cache_write=1.0, ring_start_local=rsl, ring_start_global=rsg,
-                      write_step_global=wsg, mouse=mouse, buttons=buttons, scroll=scroll)
+        # Cache write: 1 call (full model with ring buffer)
+        cache_write_predict(cache_model, state, x, cond_0, rope_cos, rope_sin,
+                           rsl, rsg, wsg, mouse=mouse, buttons=buttons, scroll=scroll)
 
         dt = (time.perf_counter() - t0) * 1000
         frame_times.append(dt)

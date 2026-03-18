@@ -1,22 +1,20 @@
 """
 Core ML export for the WorldModel with stateful KV cache.
 
-Ring buffer management and stale-slot masking are handled INSIDE the model
-to avoid expensive host-side state.read_state()/write_state() round-trips.
+Exports THREE model variants that share the same KV cache state:
+  1. DenoiseModel (stripped) — no ring buffer ops, fast denoise-only inference
+  2. UnrolledDenoiseModel — 4 Euler steps in one call using DenoiseModel
+  3. CacheWriteModel (full) — includes ring buffer gather/scatter for cache updates
 
-The host precomputes ring slot positions (trivial integer math) and passes
-them as fp16 inputs, keeping the entire model graph in fp16.
-
-Architecture per frame:
+Per-frame pipeline:
   1. Host: compute cond (fp32), RoPE (fp32), ring positions (int math)
-  2. CoreML predict x4: denoise steps (is_cache_write=0)
-  3. CoreML predict x1: cache write  (is_cache_write=1)
+  2. CoreML predict x1: unrolled denoise (4 steps, no ring buffer ops)
+  3. CoreML predict x1: cache write (with ring buffer copy)
   4. Host: VAE decode
 
 Usage:
     PYTHONPATH=. .venv312/bin/python -m src.coreml_export \
-        --model-uri Overworld-Models/Lapp0-WP-Mini-1.4.5-BL-Distill \
-        --out diagnostics/out/world_model.mlpackage
+        --model-uri Overworld-Models/Lapp0-WP-Mini-1.4.5-BL-Distill
 """
 import argparse
 from typing import Tuple
@@ -48,7 +46,7 @@ D_MODEL = 2048
 N_HEADS = 32
 N_KV_HEADS = 32
 D_HEAD = 64
-D_ROPE = D_HEAD // 2  # 32
+D_ROPE = D_HEAD // 2
 T = 512
 C = 32
 HP = 16
@@ -56,77 +54,16 @@ WP = 32
 PH = 2
 PW = 2
 N_BUTTONS = 256
+DSIGMAS = [-0.1, -0.15, -0.45, -0.3]
 
 
-class StatefulWorldModel(nn.Module):
-    def __init__(self, model, cfg):
-        super().__init__()
+# ---------------------------------------------------------------------------
+# Shared block base: weights + state buffers (same names for state sharing)
+# ---------------------------------------------------------------------------
 
-        self.patchify = model.patchify
-        self.unpatchify = model.unpatchify
-        self.out_norm_fc = model.out_norm.fc
-        self.ctrl_emb = model.ctrl_emb
+class _BlockBase(nn.Module):
+    """Shared init for denoise and cache-write blocks. State buffer names match."""
 
-        local_L = cfg.local_window * T
-        global_L = cfg.global_window * T
-        period = cfg.global_attn_period
-        off = getattr(cfg, "global_attn_offset", 0) % period
-
-        self.blocks = nn.ModuleList()
-        for i, blk in enumerate(model.transformer.blocks):
-            is_global = ((i - off) % period == 0)
-            L = global_L if is_global else local_L
-            cap = L + T
-            self.blocks.append(_Block(blk, cfg, cap, L, is_global))
-
-    def _ada_ln(self, x: Tensor, cond: Tensor) -> Tensor:
-        y = F.silu(cond)
-        ab = self.out_norm_fc(y)
-        ab = ab.unsqueeze(2).expand(-1, -1, T, -1).reshape(1, T, 2 * D_MODEL)
-        a, b_ = ab.chunk(2, dim=-1)
-        return _rms_norm_d(x) * (1 + a) + b_
-
-    def forward(
-        self,
-        x: Tensor,
-        cond: Tensor,
-        rope_cos: Tensor,
-        rope_sin: Tensor,
-        mouse: Tensor,
-        button: Tensor,
-        scroll: Tensor,
-        is_cache_write: Tensor,
-        ring_start_local: Tensor,
-        ring_start_global: Tensor,
-        write_step_global: Tensor,
-    ) -> Tensor:
-        ctrl_emb = self.ctrl_emb(mouse, button, scroll) + 1e-7
-
-        x_2d = x.reshape(1, C, HP * PH, WP * PW)
-        x_pat = self.patchify(x_2d)
-        x_seq = x_pat.permute(0, 2, 3, 1).reshape(1, T, D_MODEL)
-
-        v1 = torch.zeros(1, N_KV_HEADS, T, D_HEAD, device=x.device, dtype=x.dtype)
-        first = True
-        for blk in self.blocks:
-            x_seq, v1 = blk(
-                x_seq, cond, ctrl_emb,
-                rope_cos, rope_sin,
-                None if first else v1,
-                is_cache_write,
-                ring_start_local, ring_start_global, write_step_global,
-            )
-            first = False
-
-        x_seq = F.silu(self._ada_ln(x_seq, cond))
-
-        v_out = self.unpatchify(x_seq)
-        v_out = v_out.view(1, HP, WP, C, PH, PW)
-        v_out = v_out.permute(0, 3, 1, 4, 2, 5).reshape(1, 1, C, HP * PH, WP * PW)
-        return v_out
-
-
-class _Block(nn.Module):
     def __init__(self, blk, cfg, kv_capacity: int, L: int, is_global: bool):
         super().__init__()
         self.kv_capacity = kv_capacity
@@ -182,18 +119,7 @@ class _Block(nn.Module):
         x4 = x.view(1, 1, T, D_MODEL)
         return (x4 * gate.unsqueeze(2)).reshape(1, T, D_MODEL)
 
-    def forward(
-        self, x: Tensor, cond: Tensor, ctrl_emb: Tensor,
-        rope_cos: Tensor, rope_sin: Tensor, v1_in: Tensor,
-        is_cache_write: Tensor,
-        ring_start_local: Tensor, ring_start_global: Tensor,
-        write_step_global: Tensor,
-    ) -> Tuple[Tensor, Tensor]:
-        s0, b0, g0, s1, b1, g1 = self._cond(cond)
-
-        residual = x
-        x_n = self._ada_rmsnorm(x, s0, b0)
-
+    def _project_qkv(self, x_n, rope_cos, rope_sin, v1_in):
         q = self.q_proj(x_n).reshape(1, T, N_HEADS, D_HEAD).transpose(1, 2)
         k_new = self.k_proj(x_n).reshape(1, T, N_KV_HEADS, D_HEAD).transpose(1, 2)
         v_new = self.v_proj(x_n).reshape(1, T, N_KV_HEADS, D_HEAD).transpose(1, 2)
@@ -209,51 +135,9 @@ class _Block(nn.Module):
         k_new = _rms_norm_h(k_new)
         q = _ortho_rope(q, rope_cos, rope_sin)
         k_new = _ortho_rope(k_new, rope_cos, rope_sin)
+        return q, k_new, v_new, v1_out
 
-        # -- Write KV to tail (always) --
-        cap = self.kv_capacity
-        L = self.L
-        self.k_cache[:, :, cap - T:cap, :] = k_new
-        self.v_cache[:, :, cap - T:cap, :] = v_new
-
-        # -- Pick precomputed ring_start and write_step for this layer type --
-        if self.is_global:
-            ring_start = ring_start_global.reshape(-1).long()
-            write_step = write_step_global.reshape(-1)
-        else:
-            ring_start = ring_start_local.reshape(-1).long()
-            write_step = torch.ones_like(is_cache_write.reshape(-1))
-
-        ring_idx = self._frame_offsets + ring_start  # [T]
-
-        # -- Effective flags --
-        icw = is_cache_write.reshape(-1)
-        effective_write = icw * write_step
-        stale_factor = write_step * (1 - icw)
-
-        # -- Attention mask --
-        ring_pos = ((self._pos_arange >= ring_start) & (self._pos_arange < ring_start + T)).float()
-        w_eff = self.written * (1 - ring_pos * stale_factor)
-        attn_bias = w_eff.unsqueeze(0).unsqueeze(0).unsqueeze(0) * 1e4 - 1e4
-
-        y = F.scaled_dot_product_attention(q, self.k_cache, self.v_cache, attn_mask=attn_bias)
-
-        # -- Ring buffer copy --
-        ring_idx_kv = ring_idx.view(1, 1, T, 1).expand(1, N_KV_HEADS, T, D_HEAD)
-
-        cur_k = self.k_cache.gather(2, ring_idx_kv)
-        k_tail = self.k_cache[:, :, L:cap, :]
-        self.k_cache.scatter_(2, ring_idx_kv, cur_k + (k_tail - cur_k) * effective_write)
-
-        cur_v = self.v_cache.gather(2, ring_idx_kv)
-        v_tail = self.v_cache[:, :, L:cap, :]
-        self.v_cache.scatter_(2, ring_idx_kv, cur_v + (v_tail - cur_v) * effective_write)
-
-        w_cur = self.written.gather(0, ring_idx)
-        ones_w = torch.ones_like(w_cur)
-        self.written.scatter_(0, ring_idx, w_cur + (ones_w - w_cur) * effective_write.expand(T))
-
-        # -- Rest of block --
+    def _post_attn(self, y, g0, residual, s1, b1, g1, ctrl_emb):
         y = y.transpose(1, 2).reshape(1, T, N_HEADS * D_HEAD)
         y = self.out_proj(y)
         x = self._ada_gate(y, g0) + residual
@@ -266,38 +150,206 @@ class _Block(nn.Module):
             x = self.ctrl_fc2(h).flatten(1, 2) + x
 
         x = self._ada_gate(self.mlp(self._ada_rmsnorm(x, s1, b1)), g1) + x
+        return x
+
+
+# ---------------------------------------------------------------------------
+# Denoise block: NO ring buffer gather/scatter. Stale masking only.
+# ---------------------------------------------------------------------------
+
+class _DenoiseBlock(_BlockBase):
+    def forward(
+        self, x: Tensor, cond: Tensor, ctrl_emb: Tensor,
+        rope_cos: Tensor, rope_sin: Tensor, v1_in: Tensor,
+        ring_start_local: Tensor, ring_start_global: Tensor,
+        write_step_global: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
+        s0, b0, g0, s1, b1, g1 = self._cond(cond)
+        residual = x
+        x_n = self._ada_rmsnorm(x, s0, b0)
+        q, k_new, v_new, v1_out = self._project_qkv(x_n, rope_cos, rope_sin, v1_in)
+
+        cap = self.kv_capacity
+        self.k_cache[:, :, cap - T:cap, :] = k_new
+        self.v_cache[:, :, cap - T:cap, :] = v_new
+
+        # Stale-slot masking (no ring buffer copy)
+        if self.is_global:
+            ring_start = ring_start_global.reshape(-1).long()
+            write_step = write_step_global.reshape(-1)
+        else:
+            ring_start = ring_start_local.reshape(-1).long()
+            write_step = torch.ones(1, dtype=x.dtype, device=x.device)
+
+        ring_pos = ((self._pos_arange >= ring_start) & (self._pos_arange < ring_start + T)).float()
+        w_eff = self.written * (1 - ring_pos * write_step)
+        attn_bias = w_eff.unsqueeze(0).unsqueeze(0).unsqueeze(0) * 1e4 - 1e4
+
+        y = F.scaled_dot_product_attention(q, self.k_cache, self.v_cache, attn_mask=attn_bias)
+
+        x = self._post_attn(y, g0, residual, s1, b1, g1, ctrl_emb)
         return x, v1_out
 
 
-DSIGMAS = [-0.1, -0.15, -0.45, -0.3]  # sigma diffs: [0.9-1.0, 0.75-0.9, 0.3-0.75, 0.0-0.3]
+# ---------------------------------------------------------------------------
+# Cache-write block: FULL model with ring buffer gather/scatter.
+# ---------------------------------------------------------------------------
 
-
-class UnrolledDenoiseModel(StatefulWorldModel):
-    """Extends StatefulWorldModel to run 4 Euler denoise steps in one forward pass.
-    Inherits directly so buffer names (blocks.{i}.k_cache etc.) match the single-step model."""
-
-    def _single_step(self, x, cond, rope_cos, rope_sin, mouse, button, scroll,
-                     is_cache_write, ring_start_local, ring_start_global, write_step_global):
-        return super().forward(x, cond, rope_cos, rope_sin, mouse, button, scroll,
-                               is_cache_write, ring_start_local, ring_start_global, write_step_global)
-
+class _CacheWriteBlock(_BlockBase):
     def forward(
-        self,
-        x: Tensor,
-        cond0: Tensor, cond1: Tensor, cond2: Tensor, cond3: Tensor,
-        rope_cos: Tensor, rope_sin: Tensor,
-        mouse: Tensor, button: Tensor, scroll: Tensor,
-        is_cache_write: Tensor,
-        ring_start_local: Tensor, ring_start_global: Tensor, write_step_global: Tensor,
-    ) -> Tensor:
+        self, x: Tensor, cond: Tensor, ctrl_emb: Tensor,
+        rope_cos: Tensor, rope_sin: Tensor, v1_in: Tensor,
+        ring_start_local: Tensor, ring_start_global: Tensor,
+        write_step_global: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
+        s0, b0, g0, s1, b1, g1 = self._cond(cond)
+        residual = x
+        x_n = self._ada_rmsnorm(x, s0, b0)
+        q, k_new, v_new, v1_out = self._project_qkv(x_n, rope_cos, rope_sin, v1_in)
+
+        cap = self.kv_capacity
+        L = self.L
+        self.k_cache[:, :, cap - T:cap, :] = k_new
+        self.v_cache[:, :, cap - T:cap, :] = v_new
+
+        if self.is_global:
+            ring_start = ring_start_global.reshape(-1).long()
+            write_step = write_step_global.reshape(-1)
+        else:
+            ring_start = ring_start_local.reshape(-1).long()
+            write_step = torch.ones(1, dtype=x.dtype, device=x.device)
+
+        ring_idx = self._frame_offsets + ring_start
+
+        # Attention mask (no stale masking needed for cache write)
+        attn_bias = self.written.unsqueeze(0).unsqueeze(0).unsqueeze(0) * 1e4 - 1e4
+        y = F.scaled_dot_product_attention(q, self.k_cache, self.v_cache, attn_mask=attn_bias)
+
+        # Ring buffer copy
+        ring_idx_kv = ring_idx.view(1, 1, T, 1).expand(1, N_KV_HEADS, T, D_HEAD)
+
+        cur_k = self.k_cache.gather(2, ring_idx_kv)
+        k_tail = self.k_cache[:, :, L:cap, :]
+        self.k_cache.scatter_(2, ring_idx_kv, cur_k + (k_tail - cur_k) * write_step)
+
+        cur_v = self.v_cache.gather(2, ring_idx_kv)
+        v_tail = self.v_cache[:, :, L:cap, :]
+        self.v_cache.scatter_(2, ring_idx_kv, cur_v + (v_tail - cur_v) * write_step)
+
+        w_cur = self.written.gather(0, ring_idx)
+        ones_w = torch.ones_like(w_cur)
+        self.written.scatter_(0, ring_idx, w_cur + (ones_w - w_cur) * write_step.expand(T))
+
+        x = self._post_attn(y, g0, residual, s1, b1, g1, ctrl_emb)
+        return x, v1_out
+
+
+# ---------------------------------------------------------------------------
+# Top-level models
+# ---------------------------------------------------------------------------
+
+class _ModelBase(nn.Module):
+    """Shared model shell: patchify, unpatchify, ctrl_emb, ada_ln."""
+
+    def __init__(self, model, cfg, block_cls):
+        super().__init__()
+        self.patchify = model.patchify
+        self.unpatchify = model.unpatchify
+        self.out_norm_fc = model.out_norm.fc
+        self.ctrl_emb = model.ctrl_emb
+
+        local_L = cfg.local_window * T
+        global_L = cfg.global_window * T
+        period = cfg.global_attn_period
+        off = getattr(cfg, "global_attn_offset", 0) % period
+
+        self.blocks = nn.ModuleList()
+        for i, blk in enumerate(model.transformer.blocks):
+            is_global = ((i - off) % period == 0)
+            L = global_L if is_global else local_L
+            cap = L + T
+            self.blocks.append(block_cls(blk, cfg, cap, L, is_global))
+
+    def _ada_ln(self, x: Tensor, cond: Tensor) -> Tensor:
+        y = F.silu(cond)
+        ab = self.out_norm_fc(y)
+        ab = ab.unsqueeze(2).expand(-1, -1, T, -1).reshape(1, T, 2 * D_MODEL)
+        a, b_ = ab.chunk(2, dim=-1)
+        return _rms_norm_d(x) * (1 + a) + b_
+
+    def _run_blocks(self, x_seq, cond, ctrl_emb, rope_cos, rope_sin,
+                    ring_start_local, ring_start_global, write_step_global):
+        v1 = torch.zeros(1, N_KV_HEADS, T, D_HEAD, device=x_seq.device, dtype=x_seq.dtype)
+        first = True
+        for blk in self.blocks:
+            x_seq, v1 = blk(
+                x_seq, cond, ctrl_emb, rope_cos, rope_sin,
+                None if first else v1,
+                ring_start_local, ring_start_global, write_step_global,
+            )
+            first = False
+        return x_seq
+
+    def _encode_decode(self, x, cond, rope_cos, rope_sin, mouse, button, scroll,
+                       ring_start_local, ring_start_global, write_step_global):
+        ctrl_emb = self.ctrl_emb(mouse, button, scroll) + 1e-7
+        x_2d = x.reshape(1, C, HP * PH, WP * PW)
+        x_pat = self.patchify(x_2d)
+        x_seq = x_pat.permute(0, 2, 3, 1).reshape(1, T, D_MODEL)
+
+        x_seq = self._run_blocks(x_seq, cond, ctrl_emb, rope_cos, rope_sin,
+                                 ring_start_local, ring_start_global, write_step_global)
+
+        x_seq = F.silu(self._ada_ln(x_seq, cond))
+        v_out = self.unpatchify(x_seq)
+        v_out = v_out.view(1, HP, WP, C, PH, PW)
+        v_out = v_out.permute(0, 3, 1, 4, 2, 5).reshape(1, 1, C, HP * PH, WP * PW)
+        return v_out
+
+
+class DenoiseModel(_ModelBase):
+    """Stripped model for denoise steps. No ring buffer ops."""
+
+    def __init__(self, model, cfg):
+        super().__init__(model, cfg, _DenoiseBlock)
+
+    def forward(self, x, cond, rope_cos, rope_sin, mouse, button, scroll,
+                ring_start_local, ring_start_global, write_step_global):
+        return self._encode_decode(x, cond, rope_cos, rope_sin, mouse, button, scroll,
+                                   ring_start_local, ring_start_global, write_step_global)
+
+
+class UnrolledDenoiseModel(DenoiseModel):
+    """4 Euler steps in one call. No ring buffer ops."""
+
+    def forward(self, x, cond0, cond1, cond2, cond3,
+                rope_cos, rope_sin, mouse, button, scroll,
+                ring_start_local, ring_start_global, write_step_global):
         args = (rope_cos, rope_sin, mouse, button, scroll,
-                is_cache_write, ring_start_local, ring_start_global, write_step_global)
-        v = self._single_step(x, cond0, *args); x = x + DSIGMAS[0] * v
-        v = self._single_step(x, cond1, *args); x = x + DSIGMAS[1] * v
-        v = self._single_step(x, cond2, *args); x = x + DSIGMAS[2] * v
-        v = self._single_step(x, cond3, *args); x = x + DSIGMAS[3] * v
+                ring_start_local, ring_start_global, write_step_global)
+        ed = self._encode_decode
+        v = ed(x, cond0, *args); x = x + DSIGMAS[0] * v
+        v = ed(x, cond1, *args); x = x + DSIGMAS[1] * v
+        v = ed(x, cond2, *args); x = x + DSIGMAS[2] * v
+        v = ed(x, cond3, *args); x = x + DSIGMAS[3] * v
         return x
 
+
+class CacheWriteModel(_ModelBase):
+    """Full model with ring buffer for cache writes."""
+
+    def __init__(self, model, cfg):
+        super().__init__(model, cfg, _CacheWriteBlock)
+
+    def forward(self, x, cond, rope_cos, rope_sin, mouse, button, scroll,
+                ring_start_local, ring_start_global, write_step_global):
+        return self._encode_decode(x, cond, rope_cos, rope_sin, mouse, button, scroll,
+                                   ring_start_local, ring_start_global, write_step_global)
+
+
+# ---------------------------------------------------------------------------
+# Export utilities
+# ---------------------------------------------------------------------------
 
 def _patch_rms_norm_globally():
     from .model import nn as model_nn
@@ -308,28 +360,56 @@ def _patch_rms_norm_globally():
     attn_mod.rms_norm = _rms_norm_d
 
 
-def build_model(model_uri: str, device="cpu", dtype=torch.float32):
-    """Build model in fp32. coremltools handles fp16 conversion via compute_precision."""
+def _load_base_model(model_uri, device="cpu"):
     from .model import WorldModel
     _patch_rms_norm_globally()
     cfg = WorldModel.load_config(model_uri)
-    model = WorldModel.from_pretrained(model_uri, cfg=cfg, device=device, dtype=dtype).eval()
-    return StatefulWorldModel(model, cfg).eval(), cfg
+    model = WorldModel.from_pretrained(model_uri, cfg=cfg, device=device, dtype=torch.float32).eval()
+    return model, cfg
 
 
-def convert_to_coreml(model_uri: str, out_path: str, device: str = "cpu"):
-    import coremltools as ct
+def _get_states(cfg):
     import numpy as np
-
-    print("[export] Building model...")
-    model, cfg = build_model(model_uri, device=device)
-
     local_L = cfg.local_window * T
     global_L = cfg.global_window * T
     period = cfg.global_attn_period
     off = getattr(cfg, "global_attn_offset", 0) % period
+    import coremltools as ct
+    states = []
+    for i in range(N_LAYERS):
+        is_global = ((i - off) % period == 0)
+        cap = (global_L if is_global else local_L) + T
+        states.append(ct.StateType(wrapped_type=ct.TensorType(shape=(1, N_KV_HEADS, cap, D_HEAD)),
+                                   name=f"blocks.{i}.k_cache"))
+        states.append(ct.StateType(wrapped_type=ct.TensorType(shape=(1, N_KV_HEADS, cap, D_HEAD)),
+                                   name=f"blocks.{i}.v_cache"))
+        states.append(ct.StateType(wrapped_type=ct.TensorType(shape=(cap,)),
+                                   name=f"blocks.{i}.written"))
+    return states
 
-    # Trace in fp32; compute_precision=FLOAT16 handles all conversion uniformly
+
+def _convert(traced, inputs, states, out_path, label="export"):
+    import coremltools as ct
+    print(f"[{label}] {len(inputs)} inputs, {len(states)} states")
+    print(f"[{label}] Converting to Core ML...")
+    mlmodel = ct.convert(
+        traced, inputs=inputs, states=states,
+        convert_to="mlprogram", compute_units=ct.ComputeUnit.ALL,
+        compute_precision=ct.precision.FLOAT16,
+        minimum_deployment_target=ct.target.iOS18,
+    )
+    print(f"[{label}] Saving to {out_path}...")
+    mlmodel.save(out_path)
+    return mlmodel
+
+
+def export_all(model_uri: str, out_dir: str = "diagnostics/out", device: str = "cpu"):
+    import coremltools as ct
+    import os
+
+    base_model, cfg = _load_base_model(model_uri, device=device)
+
+    # Shared trace inputs (denoise model — no is_cache_write)
     x = torch.randn(1, 1, C, HP * PH, WP * PW)
     cond = torch.randn(1, 1, D_MODEL)
     rope_cos = torch.randn(1, 1, T, D_ROPE)
@@ -337,28 +417,11 @@ def convert_to_coreml(model_uri: str, out_path: str, device: str = "cpu"):
     mouse = torch.zeros(1, 1, 2)
     button = torch.zeros(1, 1, N_BUTTONS)
     scroll = torch.zeros(1, 1, 1)
-    is_cache_write = torch.zeros(1)
-    ring_start_local = torch.zeros(1)
-    ring_start_global = torch.zeros(1)
-    write_step_global = torch.ones(1)
+    rsl = torch.zeros(1)
+    rsg = torch.zeros(1)
+    wsg = torch.ones(1)
 
-    print("[export] Forward test...")
-    with torch.no_grad():
-        out = model(x, cond, rope_cos, rope_sin, mouse, button, scroll,
-                    is_cache_write, ring_start_local, ring_start_global, write_step_global)
-    print(f"[export] Output: {out.shape}")
-
-    print("[export] Tracing...")
-    with torch.no_grad():
-        traced = torch.jit.trace(
-            model,
-            (x, cond, rope_cos, rope_sin, mouse, button, scroll,
-             is_cache_write, ring_start_local, ring_start_global, write_step_global),
-            strict=False,
-        )
-    print("[export] Trace done.")
-
-    inputs = [
+    denoise_inputs_ct = [
         ct.TensorType(name="x", shape=(1, 1, C, HP * PH, WP * PW)),
         ct.TensorType(name="cond", shape=(1, 1, D_MODEL)),
         ct.TensorType(name="rope_cos", shape=(1, 1, T, D_ROPE)),
@@ -366,90 +429,22 @@ def convert_to_coreml(model_uri: str, out_path: str, device: str = "cpu"):
         ct.TensorType(name="mouse", shape=(1, 1, 2)),
         ct.TensorType(name="button", shape=(1, 1, N_BUTTONS)),
         ct.TensorType(name="scroll", shape=(1, 1, 1)),
-        ct.TensorType(name="is_cache_write", shape=(1,)),
         ct.TensorType(name="ring_start_local", shape=(1,)),
         ct.TensorType(name="ring_start_global", shape=(1,)),
         ct.TensorType(name="write_step_global", shape=(1,)),
     ]
 
-    states = []
-    for i in range(N_LAYERS):
-        is_global = ((i - off) % period == 0)
-        cap = (global_L if is_global else local_L) + T
-        states.append(ct.StateType(
-            wrapped_type=ct.TensorType(shape=(1, N_KV_HEADS, cap, D_HEAD)),
-            name=f"blocks.{i}.k_cache",
-        ))
-        states.append(ct.StateType(
-            wrapped_type=ct.TensorType(shape=(1, N_KV_HEADS, cap, D_HEAD)),
-            name=f"blocks.{i}.v_cache",
-        ))
-        states.append(ct.StateType(
-            wrapped_type=ct.TensorType(shape=(cap,)),
-            name=f"blocks.{i}.written",
-        ))
-
-    print(f"[export] {len(inputs)} inputs, {len(states)} states")
-    print("[export] Converting to Core ML...")
-    mlmodel = ct.convert(
-        traced,
-        inputs=inputs,
-        states=states,
-        convert_to="mlprogram",
-        compute_units=ct.ComputeUnit.ALL,
-        compute_precision=ct.precision.FLOAT16,
-        minimum_deployment_target=ct.target.iOS18,
-    )
-
-    print("[export] Done.")
-    mlmodel.save(out_path)
-    print(f"[export] Saved to {out_path}")
-    return mlmodel
-
-
-def convert_unrolled_to_coreml(model_uri: str, out_path: str, device: str = "cpu"):
-    """Export the 4-step unrolled denoise model. Use alongside the single-step model for cache writes."""
-    import coremltools as ct
-    import numpy as np
-
-    print("[export-unrolled] Building model...")
-    from .model import WorldModel
-    _patch_rms_norm_globally()
-    cfg = WorldModel.load_config(model_uri)
-    model = WorldModel.from_pretrained(model_uri, cfg=cfg, device=device, dtype=torch.float32).eval()
-    unrolled = UnrolledDenoiseModel(model, cfg).eval()
-
-    local_L = cfg.local_window * T
-    global_L = cfg.global_window * T
-    period = cfg.global_attn_period
-    off = getattr(cfg, "global_attn_offset", 0) % period
-
-    x = torch.randn(1, 1, C, HP * PH, WP * PW)
+    # --- 1. Unrolled Denoise (stripped, 4 steps) ---
+    print("\n=== UNROLLED DENOISE MODEL (stripped, 4 steps) ===")
+    unrolled = UnrolledDenoiseModel(base_model, cfg).eval()
     conds = [torch.randn(1, 1, D_MODEL) for _ in range(4)]
-    rope_cos = torch.randn(1, 1, T, D_ROPE)
-    rope_sin = torch.randn(1, 1, T, D_ROPE)
-    mouse = torch.zeros(1, 1, 2)
-    button = torch.zeros(1, 1, N_BUTTONS)
-    scroll = torch.zeros(1, 1, 1)
-    is_cache_write = torch.zeros(1)
-    ring_start_local = torch.zeros(1)
-    ring_start_global = torch.zeros(1)
-    write_step_global = torch.ones(1)
-
-    trace_inputs = (x, *conds, rope_cos, rope_sin, mouse, button, scroll,
-                    is_cache_write, ring_start_local, ring_start_global, write_step_global)
-
-    print("[export-unrolled] Forward test...")
+    trace_args = (x, *conds, rope_cos, rope_sin, mouse, button, scroll, rsl, rsg, wsg)
     with torch.no_grad():
-        out = unrolled(*trace_inputs)
-    print(f"[export-unrolled] Output: {out.shape}")
+        out = unrolled(*trace_args)
+        print(f"  Forward test: {out.shape}")
+        traced = torch.jit.trace(unrolled, trace_args, strict=False)
 
-    print("[export-unrolled] Tracing (this may use significant memory)...")
-    with torch.no_grad():
-        traced = torch.jit.trace(unrolled, trace_inputs, strict=False)
-    print("[export-unrolled] Trace done.")
-
-    inputs = [
+    unrolled_inputs = [
         ct.TensorType(name="x", shape=(1, 1, C, HP * PH, WP * PW)),
         ct.TensorType(name="cond0", shape=(1, 1, D_MODEL)),
         ct.TensorType(name="cond1", shape=(1, 1, D_MODEL)),
@@ -460,56 +455,34 @@ def convert_unrolled_to_coreml(model_uri: str, out_path: str, device: str = "cpu
         ct.TensorType(name="mouse", shape=(1, 1, 2)),
         ct.TensorType(name="button", shape=(1, 1, N_BUTTONS)),
         ct.TensorType(name="scroll", shape=(1, 1, 1)),
-        ct.TensorType(name="is_cache_write", shape=(1,)),
         ct.TensorType(name="ring_start_local", shape=(1,)),
         ct.TensorType(name="ring_start_global", shape=(1,)),
         ct.TensorType(name="write_step_global", shape=(1,)),
     ]
+    _convert(traced, unrolled_inputs, _get_states(cfg),
+             os.path.join(out_dir, "denoise_unrolled.mlpackage"), "denoise-unrolled")
+    del unrolled, traced
 
-    states = []
-    for i in range(N_LAYERS):
-        is_global = ((i - off) % period == 0)
-        cap = (global_L if is_global else local_L) + T
-        states.append(ct.StateType(
-            wrapped_type=ct.TensorType(shape=(1, N_KV_HEADS, cap, D_HEAD)),
-            name=f"blocks.{i}.k_cache",
-        ))
-        states.append(ct.StateType(
-            wrapped_type=ct.TensorType(shape=(1, N_KV_HEADS, cap, D_HEAD)),
-            name=f"blocks.{i}.v_cache",
-        ))
-        states.append(ct.StateType(
-            wrapped_type=ct.TensorType(shape=(cap,)),
-            name=f"blocks.{i}.written",
-        ))
+    # --- 2. Cache Write (full, with ring buffer) ---
+    print("\n=== CACHE WRITE MODEL (full, with ring buffer) ===")
+    cache_model = CacheWriteModel(base_model, cfg).eval()
+    trace_args = (x, cond, rope_cos, rope_sin, mouse, button, scroll, rsl, rsg, wsg)
+    with torch.no_grad():
+        out = cache_model(*trace_args)
+        print(f"  Forward test: {out.shape}")
+        traced = torch.jit.trace(cache_model, trace_args, strict=False)
 
-    print(f"[export-unrolled] {len(inputs)} inputs, {len(states)} states")
-    print("[export-unrolled] Converting to Core ML...")
-    mlmodel = ct.convert(
-        traced,
-        inputs=inputs,
-        states=states,
-        convert_to="mlprogram",
-        compute_units=ct.ComputeUnit.ALL,
-        compute_precision=ct.precision.FLOAT16,
-        minimum_deployment_target=ct.target.iOS18,
-    )
+    _convert(traced, denoise_inputs_ct, _get_states(cfg),
+             os.path.join(out_dir, "cache_write.mlpackage"), "cache-write")
+    del cache_model, traced
 
-    print("[export-unrolled] Done.")
-    mlmodel.save(out_path)
-    print(f"[export-unrolled] Saved to {out_path}")
-    return mlmodel
+    print("\n=== ALL EXPORTS COMPLETE ===")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-uri", required=True)
-    parser.add_argument("--out", default="diagnostics/out/world_model.mlpackage")
-    parser.add_argument("--mode", choices=["single", "unrolled", "both"], default="both")
+    parser.add_argument("--out-dir", default="diagnostics/out")
     parser.add_argument("--device", default="cpu")
     args = parser.parse_args()
-    if args.mode in ("single", "both"):
-        convert_to_coreml(args.model_uri, args.out, device=args.device)
-    if args.mode in ("unrolled", "both"):
-        unrolled_out = args.out.replace(".mlpackage", "_unrolled.mlpackage")
-        convert_unrolled_to_coreml(args.model_uri, unrolled_out, device=args.device)
+    export_all(args.model_uri, args.out_dir, device=args.device)
