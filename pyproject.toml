@@ -12,6 +12,7 @@ dependencies = [
   "torchvision==0.25.0",
   "torchaudio==2.10.0",
   "torchao==0.16.0",
+  "flashinfer-python==0.6.6",
   "fbgemm-gpu-genai==1.5.0; sys_platform == 'linux'",
   "einops",
   "rotary-embedding-torch>=0.8.8",
