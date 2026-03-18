@@ -269,6 +269,36 @@ class _Block(nn.Module):
         return x, v1_out
 
 
+DSIGMAS = [-0.1, -0.15, -0.45, -0.3]  # sigma diffs: [0.9-1.0, 0.75-0.9, 0.3-0.75, 0.0-0.3]
+
+
+class UnrolledDenoiseModel(StatefulWorldModel):
+    """Extends StatefulWorldModel to run 4 Euler denoise steps in one forward pass.
+    Inherits directly so buffer names (blocks.{i}.k_cache etc.) match the single-step model."""
+
+    def _single_step(self, x, cond, rope_cos, rope_sin, mouse, button, scroll,
+                     is_cache_write, ring_start_local, ring_start_global, write_step_global):
+        return super().forward(x, cond, rope_cos, rope_sin, mouse, button, scroll,
+                               is_cache_write, ring_start_local, ring_start_global, write_step_global)
+
+    def forward(
+        self,
+        x: Tensor,
+        cond0: Tensor, cond1: Tensor, cond2: Tensor, cond3: Tensor,
+        rope_cos: Tensor, rope_sin: Tensor,
+        mouse: Tensor, button: Tensor, scroll: Tensor,
+        is_cache_write: Tensor,
+        ring_start_local: Tensor, ring_start_global: Tensor, write_step_global: Tensor,
+    ) -> Tensor:
+        args = (rope_cos, rope_sin, mouse, button, scroll,
+                is_cache_write, ring_start_local, ring_start_global, write_step_global)
+        v = self._single_step(x, cond0, *args); x = x + DSIGMAS[0] * v
+        v = self._single_step(x, cond1, *args); x = x + DSIGMAS[1] * v
+        v = self._single_step(x, cond2, *args); x = x + DSIGMAS[2] * v
+        v = self._single_step(x, cond3, *args); x = x + DSIGMAS[3] * v
+        return x
+
+
 def _patch_rms_norm_globally():
     from .model import nn as model_nn
     from .model import world_model as wm_mod
@@ -377,10 +407,109 @@ def convert_to_coreml(model_uri: str, out_path: str, device: str = "cpu"):
     return mlmodel
 
 
+def convert_unrolled_to_coreml(model_uri: str, out_path: str, device: str = "cpu"):
+    """Export the 4-step unrolled denoise model. Use alongside the single-step model for cache writes."""
+    import coremltools as ct
+    import numpy as np
+
+    print("[export-unrolled] Building model...")
+    from .model import WorldModel
+    _patch_rms_norm_globally()
+    cfg = WorldModel.load_config(model_uri)
+    model = WorldModel.from_pretrained(model_uri, cfg=cfg, device=device, dtype=torch.float32).eval()
+    unrolled = UnrolledDenoiseModel(model, cfg).eval()
+
+    local_L = cfg.local_window * T
+    global_L = cfg.global_window * T
+    period = cfg.global_attn_period
+    off = getattr(cfg, "global_attn_offset", 0) % period
+
+    x = torch.randn(1, 1, C, HP * PH, WP * PW)
+    conds = [torch.randn(1, 1, D_MODEL) for _ in range(4)]
+    rope_cos = torch.randn(1, 1, T, D_ROPE)
+    rope_sin = torch.randn(1, 1, T, D_ROPE)
+    mouse = torch.zeros(1, 1, 2)
+    button = torch.zeros(1, 1, N_BUTTONS)
+    scroll = torch.zeros(1, 1, 1)
+    is_cache_write = torch.zeros(1)
+    ring_start_local = torch.zeros(1)
+    ring_start_global = torch.zeros(1)
+    write_step_global = torch.ones(1)
+
+    trace_inputs = (x, *conds, rope_cos, rope_sin, mouse, button, scroll,
+                    is_cache_write, ring_start_local, ring_start_global, write_step_global)
+
+    print("[export-unrolled] Forward test...")
+    with torch.no_grad():
+        out = unrolled(*trace_inputs)
+    print(f"[export-unrolled] Output: {out.shape}")
+
+    print("[export-unrolled] Tracing (this may use significant memory)...")
+    with torch.no_grad():
+        traced = torch.jit.trace(unrolled, trace_inputs, strict=False)
+    print("[export-unrolled] Trace done.")
+
+    inputs = [
+        ct.TensorType(name="x", shape=(1, 1, C, HP * PH, WP * PW)),
+        ct.TensorType(name="cond0", shape=(1, 1, D_MODEL)),
+        ct.TensorType(name="cond1", shape=(1, 1, D_MODEL)),
+        ct.TensorType(name="cond2", shape=(1, 1, D_MODEL)),
+        ct.TensorType(name="cond3", shape=(1, 1, D_MODEL)),
+        ct.TensorType(name="rope_cos", shape=(1, 1, T, D_ROPE)),
+        ct.TensorType(name="rope_sin", shape=(1, 1, T, D_ROPE)),
+        ct.TensorType(name="mouse", shape=(1, 1, 2)),
+        ct.TensorType(name="button", shape=(1, 1, N_BUTTONS)),
+        ct.TensorType(name="scroll", shape=(1, 1, 1)),
+        ct.TensorType(name="is_cache_write", shape=(1,)),
+        ct.TensorType(name="ring_start_local", shape=(1,)),
+        ct.TensorType(name="ring_start_global", shape=(1,)),
+        ct.TensorType(name="write_step_global", shape=(1,)),
+    ]
+
+    states = []
+    for i in range(N_LAYERS):
+        is_global = ((i - off) % period == 0)
+        cap = (global_L if is_global else local_L) + T
+        states.append(ct.StateType(
+            wrapped_type=ct.TensorType(shape=(1, N_KV_HEADS, cap, D_HEAD)),
+            name=f"blocks.{i}.k_cache",
+        ))
+        states.append(ct.StateType(
+            wrapped_type=ct.TensorType(shape=(1, N_KV_HEADS, cap, D_HEAD)),
+            name=f"blocks.{i}.v_cache",
+        ))
+        states.append(ct.StateType(
+            wrapped_type=ct.TensorType(shape=(cap,)),
+            name=f"blocks.{i}.written",
+        ))
+
+    print(f"[export-unrolled] {len(inputs)} inputs, {len(states)} states")
+    print("[export-unrolled] Converting to Core ML...")
+    mlmodel = ct.convert(
+        traced,
+        inputs=inputs,
+        states=states,
+        convert_to="mlprogram",
+        compute_units=ct.ComputeUnit.ALL,
+        compute_precision=ct.precision.FLOAT16,
+        minimum_deployment_target=ct.target.iOS18,
+    )
+
+    print("[export-unrolled] Done.")
+    mlmodel.save(out_path)
+    print(f"[export-unrolled] Saved to {out_path}")
+    return mlmodel
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-uri", required=True)
     parser.add_argument("--out", default="diagnostics/out/world_model.mlpackage")
+    parser.add_argument("--mode", choices=["single", "unrolled", "both"], default="both")
     parser.add_argument("--device", default="cpu")
     args = parser.parse_args()
-    convert_to_coreml(args.model_uri, args.out, device=args.device)
+    if args.mode in ("single", "both"):
+        convert_to_coreml(args.model_uri, args.out, device=args.device)
+    if args.mode in ("unrolled", "both"):
+        unrolled_out = args.out.replace(".mlpackage", "_unrolled.mlpackage")
+        convert_unrolled_to_coreml(args.model_uri, unrolled_out, device=args.device)

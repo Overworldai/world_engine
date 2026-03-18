@@ -107,9 +107,34 @@ def model_predict(mlmodel, state, x, cond_np, rope_cos_np, rope_sin_np,
     return mlmodel.predict(inputs, state=state)
 
 
+def unrolled_denoise_predict(mlmodel, state, x, cond_list, rope_cos_np, rope_sin_np,
+                             ring_start_local, ring_start_global, write_step_global,
+                             mouse=(0, 0), buttons=None, scroll=0):
+    """Single predict call that runs all 4 denoise steps internally."""
+    inputs = {
+        "x": np.array(x, dtype=np.float16),
+        "cond0": cond_list[0], "cond1": cond_list[1],
+        "cond2": cond_list[2], "cond3": cond_list[3],
+        "rope_cos": rope_cos_np, "rope_sin": rope_sin_np,
+        "mouse": np.array([[[float(mouse[0]), float(mouse[1])]]], dtype=np.float16),
+        "button": np.zeros((1, 1, 256), dtype=np.float16),
+        "scroll": np.array([[[float(scroll)]]], dtype=np.float16),
+        "is_cache_write": np.array([0.0], dtype=np.float16),
+        "ring_start_local": ring_start_local,
+        "ring_start_global": ring_start_global,
+        "write_step_global": write_step_global,
+    }
+    if buttons:
+        for b in buttons:
+            if 0 <= b < 256:
+                inputs["button"][0, 0, b] = 1.0
+    return mlmodel.predict(inputs, state=state)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
+    parser.add_argument("--unrolled-model", default=None, help="Path to unrolled denoise model")
     parser.add_argument("--out", default="diagnostics/out/coreml_output.mp4")
     parser.add_argument("--seed-url", default="")
     parser.add_argument("--frames", type=int, default=60)
@@ -133,9 +158,15 @@ def main():
     print("[gen] Precomputing noise conditioning (fp32)...")
     cond_cache = {s: compute_cond_host(s, noise_cond) for s in SIGMAS}
 
-    print("[gen] Loading Core ML model...")
+    print("[gen] Loading Core ML model (single-step)...")
     mlmodel = ct.models.MLModel(args.model, compute_units=ct.ComputeUnit.ALL)
     state = mlmodel.make_state()
+
+    unrolled_model = None
+    if args.unrolled_model:
+        print("[gen] Loading Core ML model (unrolled denoise)...")
+        unrolled_model = ct.models.MLModel(args.unrolled_model, compute_units=ct.ComputeUnit.ALL)
+    use_unrolled = unrolled_model is not None
 
     # Initialize written state: tail must be 1.0
     print("[gen] Initializing written state...")
@@ -209,14 +240,20 @@ def main():
         rope_cos, rope_sin = compute_rope_host(frame_idx, ts_mult, rope_xy, rope_inv_t, cfg)
         rsl, rsg, wsg = compute_ring_positions(frame_idx, cfg)
 
-        # Denoise pass (4 steps)
+        # Denoise pass
         x = np.random.randn(1, 1, 32, 32, 64).astype(np.float16)
-        for step in range(4):
-            pred = model_predict(mlmodel, state, x, cond_cache[SIGMAS[step]], rope_cos, rope_sin,
-                                 is_cache_write=0.0, ring_start_local=rsl, ring_start_global=rsg,
-                                 write_step_global=wsg, mouse=mouse, buttons=buttons, scroll=scroll)
-            v_key = list(pred.keys())[0]
-            x = x + DSIGMAS[step] * pred[v_key]
+        if use_unrolled:
+            cond_list = [cond_cache[s] for s in SIGMAS[:4]]
+            pred = unrolled_denoise_predict(
+                unrolled_model, state, x, cond_list, rope_cos, rope_sin,
+                rsl, rsg, wsg, mouse=mouse, buttons=buttons, scroll=scroll)
+            x = pred[list(pred.keys())[0]]
+        else:
+            for step in range(4):
+                pred = model_predict(mlmodel, state, x, cond_cache[SIGMAS[step]], rope_cos, rope_sin,
+                                     is_cache_write=0.0, ring_start_local=rsl, ring_start_global=rsg,
+                                     write_step_global=wsg, mouse=mouse, buttons=buttons, scroll=scroll)
+                x = x + DSIGMAS[step] * pred[list(pred.keys())[0]]
 
         all_latents.append(x)
 
