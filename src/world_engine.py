@@ -58,7 +58,12 @@ class WorldEngine:
 
         with torch.device(self.device):
             # Load Model / Modules
-            self.vae = get_ae(self.model_cfg.ae_uri, getattr(self.model_cfg, "taehv_ae", False), dtype=dtype)
+            self.vae = get_ae(
+                self.model_cfg.ae_uri,
+                getattr(self.model_cfg, "taehv_ae", False),
+                auto_aspect_ratio=getattr(self.model_cfg, "auto_aspect_ratio", True),
+                dtype=dtype
+            )
 
             self.prompt_encoder = None
             if self.model_cfg.prompt_conditioning is not None:
