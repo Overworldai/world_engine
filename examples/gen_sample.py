@@ -1,6 +1,8 @@
-# python3 examples/gen_sample.py <model_uri>
-# e.g. python3 examples/gen_sample.py Overworld-Models/Lapp0-WP-Mini-1.4.5-BL-Distill
-
+"""
+Additional Dependencies: opencv-python imageio[pyav]
+Run: `python3 examples/gen_sample.py Overworld/Waypoint-1.5-1B`
+Run: `python3 examples/gen_sample.py <model URI>`
+"""
 import cv2
 import imageio.v3 as iio
 import random

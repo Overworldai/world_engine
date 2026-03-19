@@ -1,12 +1,17 @@
+"""
+Additional Dependencies: pytest-benchmark
+Run: `pytest ./examples/benchmark.py`
+Run: `MODEL_URI="Overworld/Waypoint-1.5-1B" pytest ./examples/benchmark.py`
+"""
+
+import os
 import pytest
 import torch
 
 from world_engine import WorldEngine
 
 
-# TODO
-# - benchmark encode img
-# - benchmark encode prompt
+MODEL_URI = os.environ.get("MODEL_URI", "Overworld/Waypoint-1-Small")
 
 
 def version_with_commit(pkg):
@@ -65,8 +70,8 @@ def get_warm_engine(model_uri, model_overrides=None):
 
 
 @pytest.fixture(scope="session")
-def engine(model_uri="Overworld/Waypoint-1-Small"):
-    return get_warm_engine(model_uri)
+def engine():
+    return get_warm_engine(MODEL_URI)
 
 
 @pytest.fixture(scope="session")
@@ -93,7 +98,14 @@ MODEL_OVERRIDES = [None]
     ids=lambda d: (",".join(f"{k}={v}" for k, v in d.items()) or "") if d else ""
 )
 def test_ar_rollout(benchmark, dit_only, n_frames, model_overrides):
-    engine = get_warm_engine("Overworld/Waypoint-1-Small", model_overrides=model_overrides)
+    engine = get_warm_engine(MODEL_URI, model_overrides=model_overrides)
+
+    try:
+        total_params = sum(p.numel() for p in engine.model.parameters())
+        active_params = int(engine.model.get_active_parameters())
+        benchmark.name = f"{benchmark.name} | params={total_params:,} | active={active_params:,}"
+    except Exception:
+        pass
 
     def setup():
         engine.reset()
