@@ -86,6 +86,8 @@ Whereas previously, `img` was a uint8 rgb array of shape `[Height, Width, 3]`, *
 
 Additionally, Waypoint-1.5 expects 720p inputs / outputs, therefore `img` is `[4, 720, 1280, 3]`.
 
+See [examples/gen_sample.py](./examples/gen_sample.py) for reference.
+
 ## Usage
 ```
 from world_engine import WorldEngine, CtrlInput
