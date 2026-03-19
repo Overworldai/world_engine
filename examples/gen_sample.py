@@ -25,7 +25,7 @@ model_config_overrides.update({})
 engine = WorldEngine(sys.argv[1], 
                      model_config_overrides=model_config_overrides,
                     #  quant="int4_weights",
-                     quant=None,
+                     quant="w8a8_gemlite",
                      device="cuda")
 
 total_linear_params = sum(mod.weight.numel() for _, mod in engine.model.named_modules() if isinstance(mod, torch.nn.Linear))
@@ -33,11 +33,11 @@ print(f"Total linear layer parameters: {total_linear_params:,}")
 
 # Set seed frame
 url = random.choice([
-    "https://gist.github.com/user-attachments/assets/d81c6d26-a838-4afe-9d13-fd67677043c3",
+    # "https://gist.github.com/user-attachments/assets/d81c6d26-a838-4afe-9d13-fd67677043c3",
     "https://gist.github.com/user-attachments/assets/b6d18c38-098e-43b0-8e61-66a16e5d8946",
-    "https://gist.github.com/user-attachments/assets/0734a8c1-3eb4-4ffe-8c37-5665c45ab559",
-    "https://gist.github.com/user-attachments/assets/f9c20d4d-7565-452d-8b02-42a85ea175ed",
-    "https://gist.github.com/user-attachments/assets/68c943a4-008a-4c25-948c-c81ab4c47d21",
+    # "https://gist.github.com/user-attachments/assets/0734a8c1-3eb4-4ffe-8c37-5665c45ab559",
+    # "https://gist.github.com/user-attachments/assets/f9c20d4d-7565-452d-8b02-42a85ea175ed",
+    # "https://gist.github.com/user-attachments/assets/68c943a4-008a-4c25-948c-c81ab4c47d21",
 ])
 frame = cv2.imdecode(np.frombuffer(urllib.request.urlopen(url).read(), np.uint8), cv2.IMREAD_COLOR)
 frame = cv2.resize(frame, (1024, 512))[:, :, ::-1]

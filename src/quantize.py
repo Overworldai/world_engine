@@ -12,6 +12,22 @@ try:
     QUANTS.append("nvfp4")
 except ImportError:
     pass
+try:
+    from sgl_kernel import int8_scaled_mm as sgl_int8_scaled_mm
+    if "w8a8" not in QUANTS:
+        QUANTS.append("w8a8")
+except ImportError:
+    sgl_int8_scaled_mm = None
+try:
+    from gemlite.helper import A8W8_INT8_dynamic
+    import gemlite
+    gemlite.set_autotune("max")
+except ImportError:
+    A8W8_INT8_dynamic = None
+try:
+    from lmdeploy.pytorch.models.q_modules import QLinear
+except ImportError:
+    QLinear = None
 
 
 @torch.library.custom_op("world_engine::fp4_linear", mutates_args=())
@@ -182,7 +198,171 @@ class FP8Linear(nn.Module):
         )
 
         return result.reshape(x.shape[:-1] + (-1,))
-    
+
+def _per_token_quant_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Local per-token symmetric int8 quantization matching SGLang's W8A8 flow:
+      scale = absmax / 127
+      x_q   = round(x / scale)
+    Returns:
+      x_q:    [..., K] int8
+      scales: [..., 1] float32
+    """
+    x_fp = x.float().nan_to_num()
+    scales = (x_fp.abs().amax(dim=-1, keepdim=True).clamp_min(1e-10) / 127.0).float()
+    x_q = torch.round(x_fp / scales).clamp(-127, 127).to(torch.int8)
+    return x_q, scales
+
+
+@torch.library.custom_op("world_engine::w8a8_int8_linear", mutates_args=())
+def w8a8_int8_linear(
+    a: torch.Tensor,
+    b_int8_T: torch.Tensor,
+    b_scale: torch.Tensor,
+    bias: torch.Tensor,
+) -> torch.Tensor:
+    if sgl_int8_scaled_mm is None:
+        raise ImportError("sgl-kernel is required for quant='w8a8'")
+
+    assert a.ndim == 2, "expected [M, K] input"
+    x_q, x_scale = _per_token_quant_int8(a.contiguous())
+
+    bias_arg = None if bias.numel() == 0 else bias
+    return sgl_int8_scaled_mm(
+        x_q,                 # [M, K] row-major int8
+        b_int8_T,            # [K, N] column-major int8 view
+        x_scale,             # [M, 1] float32
+        b_scale,             # [N, 1] float32
+        out_dtype=a.dtype,
+        bias=bias_arg,
+    )
+
+
+@w8a8_int8_linear.register_fake
+def _w8a8_int8_linear_fake(
+    a: torch.Tensor,
+    b_int8_T: torch.Tensor,
+    b_scale: torch.Tensor,
+    bias: torch.Tensor,
+) -> torch.Tensor:
+    return torch.empty(
+        (a.shape[0], b_int8_T.shape[1]),
+        device=a.device,
+        dtype=a.dtype,
+    )
+
+
+class W8A8Int8LinearSGLang(nn.Module):
+    """
+    INT8 W8A8 linear using sgl-kernel's int8_scaled_mm.
+    Weight path:
+      - static per-channel symmetric int8
+      - stored as a transposed [K, N] view (column-major for the kernel)
+    Activation path:
+      - dynamic per-token symmetric int8
+    """
+
+    __constants__ = ("in_features", "out_features")
+
+    def __init__(self, lin: nn.Linear):
+        super().__init__()
+
+        if sgl_int8_scaled_mm is None:
+            raise ImportError("sgl-kernel is required for quant='w8a8'")
+
+        self.in_features = lin.in_features
+        self.out_features = lin.out_features
+
+        # Your current eligible() already enforces % 32, which is stricter than needed.
+        w = lin.weight.detach()  # [N, K]
+
+        # Per-output-channel symmetric weight quantization.
+        w_scale = (
+            w.float()
+            .abs()
+            .nan_to_num()
+            .amax(dim=1, keepdim=True)
+            .clamp_min(1e-10)
+            / 127.0
+        ).float()  # [N, 1]
+
+        w_q = torch.round(w.float() / w_scale).clamp(-127, 127).to(torch.int8)  # [N, K]
+
+        # IMPORTANT: keep this as a transpose view, not contiguous().
+        # sgl-kernel expects mat_b to be column-major [K, N] with stride(0) == 1.
+        self.register_buffer("weight_int8_T", w_q.t())         # [K, N], column-major view
+        self.register_buffer("weight_scale", w_scale.contiguous())  # [N, 1]
+
+        if lin.bias is None:
+            self.register_buffer(
+                "bias",
+                torch.empty(0, device=w.device, dtype=lin.weight.dtype),
+            )
+        else:
+            self.register_buffer(
+                "bias",
+                lin.bias.detach().to(lin.weight.dtype).contiguous(),
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        assert x.is_cuda, "w8a8 requires CUDA"
+        assert x.dtype in (torch.float16, torch.bfloat16), \
+            "w8a8 expects fp16/bf16 activations"
+
+        s = x.shape
+        x2 = x.reshape(-1, s[-1]).contiguous()
+        bias = self.bias
+        if bias.numel() != 0 and bias.dtype != x2.dtype:
+            bias = bias.to(x2.dtype)
+        y = w8a8_int8_linear(
+            x2,
+            self.weight_int8_T,
+            self.weight_scale,
+            bias,
+        )
+        return y.reshape(*s[:-1], self.out_features)
+
+
+class INT8W8A8GemLite(nn.Module):
+    __constants__ = ("in_features", "out_features")
+
+    def __init__(self, lin: nn.Linear):
+        super().__init__()
+        if A8W8_INT8_dynamic is None:
+            raise ImportError("Install gemlite for quant='w8a8_gemlite'")
+
+        self.in_features = lin.in_features
+        self.out_features = lin.out_features
+
+        # Minimal wrapper: assumes the layer is already on the target CUDA device.
+        self.impl = A8W8_INT8_dynamic(
+            device=str(lin.weight.device),
+            dtype=lin.weight.dtype,
+        ).from_linear(lin)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        s = x.shape
+        y = self.impl(x.reshape(-1, s[-1]).contiguous())
+        return y.reshape(*s[:-1], self.out_features).to(x.dtype)
+
+
+class INT8W8A8LMDeploy(nn.Module):
+    __constants__ = ("in_features", "out_features")
+
+    def __init__(self, lin: nn.Linear):
+        super().__init__()
+        if QLinear is None:
+            raise ImportError("Install lmdeploy for quant='w8a8_lmdeploy'")
+
+        self.in_features = lin.in_features
+        self.out_features = lin.out_features
+        self.impl = QLinear.from_float(lin)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        s = x.shape
+        y = self.impl(x.reshape(-1, s[-1]).contiguous())
+        return y.reshape(*s[:-1], self.out_features).to(x.dtype)
+
 
 def quantize_model(model: nn.Module, quant: str):
     if quant is None:
@@ -198,7 +378,10 @@ def quantize_model(model: nn.Module, quant: str):
         return (o % 32 == 0) and (k % 32 == 0)
 
     new_linear = {
-        "w8a8": FP8W8A8Linear,
+        "w8a8_gemlite": INT8W8A8GemLite,
+        "w8a8_lmdeploy": INT8W8A8LMDeploy,
+        "w8a8_sglang": W8A8Int8LinearSGLang,
+        "fp8w8a8": FP8W8A8Linear,
         "nvfp4": FP4Linear,
         "fp8": FP8Linear,
     }[quant]
@@ -209,11 +392,11 @@ def quantize_model(model: nn.Module, quant: str):
         )
     return model
 
+
 from torchao.quantization import (quantize_, 
                                   Int4WeightOnlyConfig, 
                                   Int8WeightOnlyConfig, 
                                   Int8DynamicActivationInt8WeightConfig,
-                                #   NVFP4DynamicActivationNVFP4WeightConfig,
                                   Float8DynamicActivationInt4WeightConfig,
                                   Int8DynamicActivationIntxWeightConfig,
                                   Float8WeightOnlyConfig,
