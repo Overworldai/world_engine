@@ -24,7 +24,7 @@ model_config_overrides.update({})
 engine = WorldEngine(sys.argv[1], 
                      model_config_overrides=model_config_overrides,
                     #  quant="int4_weights",
-                     quant=None,
+                     quant="w8a8_gemlite",
                      device="cuda")
 
 total_linear_params = sum(mod.weight.numel() for _, mod in engine.model.named_modules() if isinstance(mod, torch.nn.Linear))

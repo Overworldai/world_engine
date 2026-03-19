@@ -57,7 +57,7 @@ def get_warm_engine(model_uri, model_overrides=None):
         model_uri,
         model_config_overrides=model_config_overrides,
         # quant=model_config_overrides.get("quant"),
-        quant=None,
+        quant="w8a8_gemlite",
         device="cuda",
         load_weights=False
     )
