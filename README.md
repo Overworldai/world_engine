@@ -60,7 +60,7 @@ export HF_TOKEN=<your access token>
 from world_engine import WorldEngine, CtrlInput
 
 # Create inference engine
-engine = WorldEngine("Overworld/Waypoint-1-Small", device="cuda")
+engine = WorldEngine("Overworld/Waypoint-1.5-1B", device="cuda")
 
 # Specify a prompt
 engine.set_prompt("A fun game")
@@ -77,6 +77,15 @@ for controller_input in [
 	img = engine.gen_frame(ctrl=controller_input)
 ```
 
+## Waypoint-1.5 Behavior
+All interfaces between Waypoint-1 (or 1.1) and Waypoint-1.5 **except** the following:
+
+In Waypoint-1.5, the `img` passed to `append_frame(...)` and returned by `gen_frame(...)` is now a sequence of 4 frames. Waypoint-1.5 applies temporal compression and generates 4 frames for every controller input.
+
+Whereas previously, `img` was a uint8 rgb array of shape `[Height, Width, 3]`, **in Waypoint-1.5 it is of shape `[4, Height, Width, 3]`**.
+
+Additionally, Waypoint-1.5 expects 720p inputs / outputs, therefore `img` is `[4, 720, 1280, 3]`.
+
 ## Usage
 ```
 from world_engine import WorldEngine, CtrlInput
@@ -84,7 +93,7 @@ from world_engine import WorldEngine, CtrlInput
 
 Load model to GPU
 ```
-engine = WorldEngine("Overworld/Waypoint-1-Small", device="cuda")
+engine = WorldEngine("Overworld/Waypoint-1.5-1B", device="cuda")
 ```
 
 Specify a prompt which will be used until this function is called again
@@ -118,11 +127,13 @@ Note: returned `img` is always on the same device as `engine.device`
 @dataclass
 class CtrlInput:
     button: Set[int] = field(default_factory=set)  # pressed button IDs
-    mouse: Tuple[float, float] = (0.0, 0.0)  # (x, y) position
+    mouse: Tuple[float, float] = (0.0, 0.0)  # (dx, dy) position change
+	scroll_wheel: int = 0  # down, stationary, or up -> (-1, 0, 1)
 ```
 
 - `button` keycodes are defined by [Owl-Control](https://github.com/Overworldai/owl-control/blob/main/src/system/keycode.rs)
-- `mouse` is the raw mouse velocity vector
+- `mouse` is the the amount the change in mouse since last frame
+- `scroll_wheel` is the ternary scroll wheel movement identifier
 
 
 ## Showcase and Examples
@@ -138,5 +149,5 @@ class CtrlInput:
 
 ### Examples and Reference Code
 
-- ["Hello (Over)World" client](./examples/simple_client.py)
+- ["Generate MP4 Sample Given Controller Inputs](./examples/gen_sample.py)
 - [Run Performance Benchmarks (`pytest examples/benchmark.py`)](./examples/benchmark.py)

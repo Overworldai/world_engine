@@ -1,7 +1,7 @@
 """
 Additional Dependencies: opencv-python imageio[pyav]
 Run: `python3 examples/gen_sample.py Overworld/Waypoint-1.5-1B`
-Run: `python3 examples/gen_sample.py <model URI>`
+Run: `python3 examples/gen_sample.py <WP1.5 model URI>`
 """
 import cv2
 import imageio.v3 as iio

@@ -29,8 +29,8 @@ COMPILE_OPTIONS = {
 @dataclass
 class CtrlInput:
     button: Set[int] = field(default_factory=set)  # pressed button IDs
-    mouse: Tuple[float, float] = (0.0, 0.0)  # (x, y) velocity
-    scroll_wheel: int = 0  # bwd, stationary, or fwd -> (-1, 0, 1)
+    mouse: Tuple[float, float] = (0.0, 0.0)  # (dx, dy) velocity
+    scroll_wheel: int = 0  # down, stationary, or up -> (-1, 0, 1)
 
 
 class WorldEngine:
