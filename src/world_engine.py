@@ -71,7 +71,7 @@ class WorldEngine:
             self.prompt_encoder = None
             if self.model_cfg.prompt_conditioning is not None:
                 pe_uri = getattr(self.model_cfg, "prompt_encoder_uri", "google/umt5-xl")
-                self.prompt_encoder = PromptEncoder(pe_uri, dtype=dtype).eval()
+                self.prompt_encoder = PromptEncoder(pe_uri, dtype=dtype, device=device).eval()
 
             self.model = WorldModel.from_pretrained(
                 model_uri, cfg=self.model_cfg, device=self.device, dtype=dtype, load_weights=load_weights
@@ -80,10 +80,10 @@ class WorldEngine:
             if quant is not None:
                 quantize_model(self.model, quant)
 
-            self.kv_cache = StaticKVCache(self.model_cfg, batch_size=1, dtype=dtype)
+            self.kv_cache = StaticKVCache(self.model_cfg, batch_size=1, dtype=dtype, device=device)
 
             # Inference Scheduler
-            self.scheduler_sigmas = torch.tensor(self.model_cfg.scheduler_sigmas, dtype=dtype)
+            self.scheduler_sigmas = torch.tensor(self.model_cfg.scheduler_sigmas, dtype=dtype, device=device)
 
             pH, pW = getattr(self.model_cfg, "patch", [1, 1])
             self.frm_shape = 1, 1, self.model_cfg.channels, self.model_cfg.height * pH, self.model_cfg.width * pW
