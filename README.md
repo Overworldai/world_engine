@@ -138,6 +138,21 @@ img = pipeline.append_frame(uint8_img)  # returns passed image
 
 Note: returned `img` is always on the same device as `engine.device`
 
+## Quantization 
+
+Model can be quantized by passing quant argument to WorldEngine
+```
+engine = WorldEngine("Overworld/Waypoint-1.5-1B", quant="intw8a8", device="cuda")
+```
+Supported inference quantization schemes are:
+
+| Config | Description | Supported GPUs |
+|--------|-------------|----------------|
+| `intw8a8` | INT8 weights + INT8 dynamic per-token activations | NVIDIA (30xx, 40xx, Ampere+) |
+| `fp8w8a8` | FP8 (e4m3) weights + FP8 per-tensor activations via `torch._scaled_mm` | NVIDIA Ada Lovelace / Hopper+ (RTX 40xx, H100) |
+| `nvfp4` | NVFP4 weights + FP4 activations via FlashInfer/CUTLASS | NVIDIA Blackwell (B100, B200, RTX 5090) |
+
+
 ### WorldEngine
 
 `WorldEngine` computes each new frame from past frames, the controls, and the current prompt, then appends it to the sequence so later frames stay aligned with what has already been generated.
