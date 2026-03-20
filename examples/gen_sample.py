@@ -1,8 +1,5 @@
-"""
-Additional Dependencies: opencv-python imageio[pyav]
-Run: `python3 examples/gen_sample.py Overworld/Waypoint-1.5-1B`
-Run: `python3 examples/gen_sample.py <WP1.5 model URI>`
-"""
+# uv run --dev examples/gen_sample.py Overworld/Waypoint-1.5-1B
+
 import cv2
 import imageio.v3 as iio
 import random

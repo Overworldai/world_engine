@@ -1,8 +1,4 @@
-"""
-Additional Dependencies: pytest-benchmark
-Run: `pytest ./examples/benchmark.py`
-Run: `MODEL_URI="Overworld/Waypoint-1.5-1B" pytest ./examples/benchmark.py`
-"""
+# MODEL_URI="Overworld/Waypoint-1.5-1B" uv run --dev pytest examples/benchmark.py Overworld/Waypoint-1.5-1B
 
 import os
 import pytest
