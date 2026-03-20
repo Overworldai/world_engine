@@ -49,6 +49,7 @@ controller_sequence += [CtrlInput()] * 10
 
 # Generate frames conditioned on controller inputs
 with iio.imopen("out.mp4", "w", plugin="pyav") as out:
-    out.write(engine.gen_frame().cpu().numpy(), fps=60, codec="libx264")
+    four_frames = engine.gen_frame().cpu().numpy()  # int8 [4, H, W, 3]
+    out.write(four_frames, fps=60, codec="libx264")
     for ctrl in controller_sequence:
         out.write(engine.gen_frame(ctrl=ctrl).cpu().numpy())
