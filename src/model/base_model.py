@@ -6,27 +6,6 @@ from safetensors.torch import load_file
 from torch import nn
 import torch
 
-from ..quantize import apply_qat
-
-MODEL_CONFIG_DEFAULTS = OmegaConf.create(
-    {
-        "auto_aspect_ratio": True,
-        "gated_attn": False,
-        "inference_fps": "${base_fps}",
-        "model_type": "waypoint-1",
-        "n_kv_heads": "${n_heads}",
-        "patch": [1, 1],
-        "prompt_conditioning": None,
-        "prompt_encoder_uri": "google/umt5-xl",
-        "rope_nyquist_frac": 0.8,
-        "rope_theta": 10000.0,
-        "taehv_ae": False,
-        "temporal_compression": 1,
-        "value_residual": False,
-    }
-)
-
-
 class BaseModel(nn.Module):
     @classmethod
     def from_pretrained(cls, path: str, cfg=None, device=None, dtype=None, load_weights: bool = True):
@@ -42,9 +21,6 @@ class BaseModel(nn.Module):
         if cfg is None:
             cfg = cls.load_config(path)
         model = cls(cfg).to(dtype=dtype, device=device)
-
-        if cfg.quant is not None:
-            apply_qat(model, quant_config=cfg.quant, layers="mlp", step="prepare")
 
         if load_weights:
             safetensors_path = os.path.join(path, "model.safetensors")
