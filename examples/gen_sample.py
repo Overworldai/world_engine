@@ -17,14 +17,11 @@ model_config_overrides = {"ae_uri": "Overworld-Models/taehv1_5",
                           "patch": [2, 2],
                           "temporal_compression": 4,
                           "inference_fps": 60,
-                        #   "quant": "int8_weights",
-                          "quant": None,
                           "taehv_ae": True}
 
 model_config_overrides.update({})
 engine = WorldEngine(sys.argv[1], 
                      model_config_overrides=model_config_overrides,
-                    #  quant="int4_weights",
                      quant="w8a8_gemlite",
                      device="cuda")
 
@@ -33,12 +30,13 @@ print(f"Total linear layer parameters: {total_linear_params:,}")
 
 # Set seed frame
 url = random.choice([
-    # "https://gist.github.com/user-attachments/assets/d81c6d26-a838-4afe-9d13-fd67677043c3",
+    "https://gist.github.com/user-attachments/assets/d81c6d26-a838-4afe-9d13-fd67677043c3",
     "https://gist.github.com/user-attachments/assets/b6d18c38-098e-43b0-8e61-66a16e5d8946",
-    # "https://gist.github.com/user-attachments/assets/0734a8c1-3eb4-4ffe-8c37-5665c45ab559",
-    # "https://gist.github.com/user-attachments/assets/f9c20d4d-7565-452d-8b02-42a85ea175ed",
-    # "https://gist.github.com/user-attachments/assets/68c943a4-008a-4c25-948c-c81ab4c47d21",
+    "https://gist.github.com/user-attachments/assets/0734a8c1-3eb4-4ffe-8c37-5665c45ab559",
+    "https://gist.github.com/user-attachments/assets/f9c20d4d-7565-452d-8b02-42a85ea175ed",
+    "https://gist.github.com/user-attachments/assets/68c943a4-008a-4c25-948c-c81ab4c47d21",
 ])
+
 frame = cv2.imdecode(np.frombuffer(urllib.request.urlopen(url).read(), np.uint8), cv2.IMREAD_COLOR)
 frame = cv2.resize(frame, (1024, 512))[:, :, ::-1]
 engine.append_frame(torch.from_numpy(np.repeat(frame[None], 4, axis=0)).to("cuda"))

@@ -45,7 +45,7 @@ class WorldEngine:
     ):
         """
         model_uri: HF URI or local folder containing model.safetensors and config.yaml
-        quant: None | fp8_weights | int8_weights | int4_weights 
+        quant: None | w8a8_gemlite | fp8w8a8 | nvfp4
         model_config_overrides: Dict to override model config values
         """
         self.device = torch.get_default_device() if device is None else device
@@ -70,11 +70,7 @@ class WorldEngine:
             ).eval()
             apply_inference_patches(self.model)
             if quant is not None:
-                print(f"Applying {quant} PTQ...")
-                # apply_qat(self.model, quant_config="bf16", layers="mlp", step="convert")
                 quantize_model(self.model, quant)
-                # apply_qat(self.model, quant_config=quant, layers="all", step="convert")
-                # apply_ptq_model(self.model, quant, layers="mlp_and_attn")
 
             self.kv_cache = StaticKVCache(self.model_cfg, batch_size=1, dtype=dtype)
 
