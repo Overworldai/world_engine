@@ -1,4 +1,4 @@
-# MODEL_URI="Overworld/Waypoint-1.5-1B" uv run --dev pytest examples/benchmark.py Overworld/Waypoint-1.5-1B
+# MODEL_URI="Overworld/Waypoint-1.5-1B" uv run --dev pytest examples/benchmark.py
 
 import os
 import pytest
