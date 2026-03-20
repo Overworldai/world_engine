@@ -80,7 +80,7 @@ class WorldEngine:
             if quant is not None:
                 quantize_model(self.model, quant)
 
-            self.kv_cache = StaticKVCache(self.model_cfg, batch_size=1, dtype=dtype, device=device)
+            self.kv_cache = StaticKVCache(self.model_cfg, batch_size=1, dtype=dtype).to(device=device)
 
             # Inference Scheduler
             self.scheduler_sigmas = torch.tensor(self.model_cfg.scheduler_sigmas, dtype=dtype, device=device)
