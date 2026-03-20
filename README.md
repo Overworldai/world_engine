@@ -78,7 +78,7 @@ for controller_input in [
 ```
 
 ## Waypoint-1.5 Behavior
-All interfaces between Waypoint-1 (or 1.1) and Waypoint-1.5 **except** the following:
+All interfaces and handling for Waypoint-1 (or 1.1) and Waypoint-1.5 remain the same **except** the following:
 
 In Waypoint-1.5, the `img` passed to `append_frame(...)` and returned by `gen_frame(...)` is now a sequence of 4 frames. Waypoint-1.5 applies temporal compression and generates 4 frames for every controller input.
 
