@@ -45,7 +45,7 @@ class WorldEngine:
     ):
         """
         model_uri: HF URI or local folder containing model.safetensors and config.yaml
-        quant: None | w8a8_gemlite | fp8w8a8 | nvfp4
+        quant: None | intw8a8 | fp8w8a8 | nvfp4
         model_config_overrides: Dict to override model config values
         - auto_aspect_ratio: set to False to work in ae raw space, otherwise in/out are 720p or 360p
         """
