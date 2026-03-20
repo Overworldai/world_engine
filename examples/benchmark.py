@@ -54,7 +54,7 @@ def print_env_info():
 
 
 def get_warm_engine(model_uri, model_overrides=None):
-    model_config_overrides = {"ae_uri": "OpenWorldLabs/owl_vae_f16_c16_distill_v0_nogan"}
+    model_config_overrides = {}
     model_config_overrides.update(model_overrides or {})
     engine = WorldEngine(
         model_uri,
