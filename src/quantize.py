@@ -13,21 +13,11 @@ try:
 except ImportError:
     pass
 try:
-    from sgl_kernel import int8_scaled_mm as sgl_int8_scaled_mm
-    if "w8a8" not in QUANTS:
-        QUANTS.append("w8a8")
-except ImportError:
-    sgl_int8_scaled_mm = None
-try:
     from gemlite.helper import A8W8_INT8_dynamic
     import gemlite
     gemlite.set_autotune("max")
 except ImportError:
     A8W8_INT8_dynamic = None
-try:
-    from lmdeploy.pytorch.models.q_modules import QLinear
-except ImportError:
-    QLinear = None
 
 
 @torch.library.custom_op("world_engine::fp4_linear", mutates_args=())
@@ -251,78 +241,6 @@ def _w8a8_int8_linear_fake(
         dtype=a.dtype,
     )
 
-
-class W8A8Int8LinearSGLang(nn.Module):
-    """
-    INT8 W8A8 linear using sgl-kernel's int8_scaled_mm.
-    Weight path:
-      - static per-channel symmetric int8
-      - stored as a transposed [K, N] view (column-major for the kernel)
-    Activation path:
-      - dynamic per-token symmetric int8
-    """
-
-    __constants__ = ("in_features", "out_features")
-
-    def __init__(self, lin: nn.Linear):
-        super().__init__()
-
-        if sgl_int8_scaled_mm is None:
-            raise ImportError("sgl-kernel is required for quant='w8a8'")
-
-        self.in_features = lin.in_features
-        self.out_features = lin.out_features
-
-        # Your current eligible() already enforces % 32, which is stricter than needed.
-        w = lin.weight.detach()  # [N, K]
-
-        # Per-output-channel symmetric weight quantization.
-        w_scale = (
-            w.float()
-            .abs()
-            .nan_to_num()
-            .amax(dim=1, keepdim=True)
-            .clamp_min(1e-10)
-            / 127.0
-        ).float()  # [N, 1]
-
-        w_q = torch.round(w.float() / w_scale).clamp(-127, 127).to(torch.int8)  # [N, K]
-
-        # IMPORTANT: keep this as a transpose view, not contiguous().
-        # sgl-kernel expects mat_b to be column-major [K, N] with stride(0) == 1.
-        self.register_buffer("weight_int8_T", w_q.t())         # [K, N], column-major view
-        self.register_buffer("weight_scale", w_scale.contiguous())  # [N, 1]
-
-        if lin.bias is None:
-            self.register_buffer(
-                "bias",
-                torch.empty(0, device=w.device, dtype=lin.weight.dtype),
-            )
-        else:
-            self.register_buffer(
-                "bias",
-                lin.bias.detach().to(lin.weight.dtype).contiguous(),
-            )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        assert x.is_cuda, "w8a8 requires CUDA"
-        assert x.dtype in (torch.float16, torch.bfloat16), \
-            "w8a8 expects fp16/bf16 activations"
-
-        s = x.shape
-        x2 = x.reshape(-1, s[-1]).contiguous()
-        bias = self.bias
-        if bias.numel() != 0 and bias.dtype != x2.dtype:
-            bias = bias.to(x2.dtype)
-        y = w8a8_int8_linear(
-            x2,
-            self.weight_int8_T,
-            self.weight_scale,
-            bias,
-        )
-        return y.reshape(*s[:-1], self.out_features)
-
-
 class INT8W8A8GemLite(nn.Module):
     __constants__ = ("in_features", "out_features")
 
@@ -343,23 +261,6 @@ class INT8W8A8GemLite(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.impl(x).type_as(x)
 
-class INT8W8A8LMDeploy(nn.Module):
-    __constants__ = ("in_features", "out_features")
-
-    def __init__(self, lin: nn.Linear):
-        super().__init__()
-        if QLinear is None:
-            raise ImportError("Install lmdeploy for quant='w8a8_lmdeploy'")
-
-        self.in_features = lin.in_features
-        self.out_features = lin.out_features
-        self.impl = QLinear.from_float(lin)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        s = x.shape
-        y = self.impl(x.reshape(-1, s[-1]).contiguous())
-        return y.reshape(*s[:-1], self.out_features).to(x.dtype)
-
 
 def quantize_model(model: nn.Module, quant: str):
     if quant is None:
@@ -375,9 +276,7 @@ def quantize_model(model: nn.Module, quant: str):
         return (o % 32 == 0) and (k % 32 == 0)
 
     new_linear = {
-        "w8a8_gemlite": INT8W8A8GemLite,
-        "w8a8_lmdeploy": INT8W8A8LMDeploy,
-        "w8a8_sglang": W8A8Int8LinearSGLang,
+        "intw8a8": INT8W8A8GemLite,
         "fp8w8a8": FP8W8A8Linear,
         "nvfp4": FP4Linear,
         "fp8": FP8Linear,

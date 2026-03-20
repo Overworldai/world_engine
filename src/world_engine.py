@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from .model import WorldModel, StaticKVCache, PromptEncoder
 from .ae import get_ae
 from .patch_model import apply_inference_patches
-from .quantize import quantize_model, apply_ptq_model, apply_qat
+from .quantize import quantize_model
 
 
 # Global torch optimizations
