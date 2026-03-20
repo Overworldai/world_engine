@@ -330,7 +330,7 @@ class INT8W8A8GemLite(nn.Module):
         super().__init__()
         if A8W8_INT8_dynamic is None:
             raise ImportError("Install gemlite for quant='w8a8_gemlite'")
-
+        
         self.in_features = lin.in_features
         self.out_features = lin.out_features
 
@@ -341,10 +341,7 @@ class INT8W8A8GemLite(nn.Module):
         ).from_linear(lin)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        s = x.shape
-        y = self.impl(x.reshape(-1, s[-1]).contiguous())
-        return y.reshape(*s[:-1], self.out_features).to(x.dtype)
-
+        return self.impl(x).type_as(x)
 
 class INT8W8A8LMDeploy(nn.Module):
     __constants__ = ("in_features", "out_features")
@@ -391,85 +388,3 @@ def quantize_model(model: nn.Module, quant: str):
             child, quant
         )
     return model
-
-
-from torchao.quantization import (quantize_, 
-                                  Int4WeightOnlyConfig, 
-                                  Int8WeightOnlyConfig, 
-                                  Int8DynamicActivationInt8WeightConfig,
-                                  Float8DynamicActivationInt4WeightConfig,
-                                  Int8DynamicActivationIntxWeightConfig,
-                                  Float8WeightOnlyConfig,
-                                  Float8DynamicActivationFloat8WeightConfig,
-                                  PerTensor, PerRow)
-from torchao.quantization.quantize_.workflows import Int4PackingFormat, Float8PackingFormat
-from torchao.quantization.qat import (QATConfig, 
-                                      IntxFakeQuantizeConfig, 
-                                      Float8FakeQuantizeConfig)
-
-_LAYER_FILTERS = {
-    "mlp":       lambda mod, fqn: isinstance(mod, torch.nn.Linear) and "transformer.blocks" in fqn and ".mlp." in fqn,
-    "attn": lambda mod, fqn: isinstance(mod, torch.nn.Linear) and ".attn." in fqn,\
-    "mlp_and_attn": lambda mod, fqn: isinstance(mod, torch.nn.Linear) and "transformer.blocks" in fqn and (".mlp." in fqn or ".attn." in fqn),
-    "all":       lambda mod, fqn: isinstance(mod, torch.nn.Linear),
-}
-
-def apply_ptq_model(model, config: str, layers: str = "mlp"):
-    """Apply PTQ in-place. layers: 'mlp', 'attention', or None for all Linear layers."""
-    filter_fn = _LAYER_FILTERS.get(layers) if layers else None
-
-    if config == "int4_weights":
-        qconfig = Int4WeightOnlyConfig(group_size=32, int4_packing_format="tile_packed_to_4d", int4_choose_qparams_algorithm="hqq")
-    elif config == "int8_weights":
-        qconfig = Int8WeightOnlyConfig()
-    elif config == "int_w8a8":
-        qconfig = Int8DynamicActivationInt8WeightConfig()
-    elif config == "int4w_int8a":
-        qconfig = Int8DynamicActivationIntxWeightConfig(weight_dtype=torch.int4)
-    elif config == "int4w_fp8a":
-        qconfig = Float8DynamicActivationInt4WeightConfig()
-    elif config == "fp_w8a8":
-        qconfig = Float8DynamicActivationFloat8WeightConfig(granularity=PerTensor())
-    # elif config == "fp_w4a4":
-    #     qconfig = NVFP4DynamicActivationNVFP4WeightConfig()
-    elif config == "fp8_weights":
-        qconfig = Float8WeightOnlyConfig()
-    else:
-        raise ValueError(f"Unknown quant_config: {config!r}")
-    quantize_(model, qconfig, filter_fn=filter_fn)
-
-def apply_qat(model, quant_config: str = "fp8_general", layers: str = None, step: str = "prepare"):
-    """Apply QAT in-place. layers: 'mlp', 'attention', or None for all Linear layers."""
-    filter_fn = _LAYER_FILTERS.get(layers) if layers else None
-
-    if step == "prepare":
-        if quant_config == "fp8_general":
-            weight_config = Float8FakeQuantizeConfig(dtype=torch.float8_e4m3fn, granularity=PerTensor())
-            qconfig = QATConfig(weight_config=weight_config, step=step)
-        elif quant_config == "int8_weights":
-            weight_config = IntxFakeQuantizeConfig(torch.int8, group_size=32, is_symmetric=True)
-            qconfig = QATConfig(weight_config=weight_config, step=step)
-        elif quant_config == "int4_weights":
-            config = Int4WeightOnlyConfig(
-                group_size=32,
-                int4_packing_format=Int4PackingFormat.PRESHUFFLED
-            )
-            qconfig = QATConfig(base_config=config, step=step)
-        else:
-            raise ValueError(f"Unknown quant_config: {quant_config!r}")
-
-    elif step == "convert":
-        # convert step requires a real PTQ base_config (not FakeQuantizeConfigBase)
-        # or None (which just strips fake-quant wrappers back to plain nn.Linear)
-        if quant_config == "fp8_general":
-            qconfig = QATConfig(base_config=Float8WeightOnlyConfig(), step=step)
-        elif quant_config == "int8_weights":
-            quantize_(model, QATConfig(step=step), filter_fn=filter_fn)  # need to run quantize to convert fake quant to real quant for int8, since int8 fake quant is not a simple wrapper around int8 PTQ module
-            qconfig = QATConfig(base_config=Int8WeightOnlyConfig(), step=step)
-        elif quant_config == "int4_weights":
-            qconfig = QATConfig(base_config=Int4WeightOnlyConfig(group_size=32, int4_packing_format=Int4PackingFormat.PRESHUFFLED), step=step)
-        elif quant_config == "bf16":
-            qconfig = QATConfig(step=step)
-        else:
-            raise ValueError(f"Unknown quant_config: {quant_config!r}")
-    quantize_(model, qconfig, filter_fn=filter_fn)
