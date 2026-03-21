@@ -87,13 +87,14 @@ def test_img_decoder_only(benchmark, engine, last_latent):
 MODEL_OVERRIDES = [None]
 
 
+@pytest.mark.parametrize("blocking", [True, False])
 @pytest.mark.parametrize("dit_only", [True])
 @pytest.mark.parametrize("n_frames", [256])
 @pytest.mark.parametrize(
     "model_overrides", MODEL_OVERRIDES,
     ids=lambda d: (",".join(f"{k}={v}" for k, v in d.items()) or "") if d else ""
 )
-def test_ar_rollout(benchmark, dit_only, n_frames, model_overrides):
+def test_ar_rollout(benchmark, dit_only, n_frames, model_overrides, blocking):
     engine = get_warm_engine(MODEL_URI, model_overrides=model_overrides)
 
     try:
@@ -111,6 +112,7 @@ def test_ar_rollout(benchmark, dit_only, n_frames, model_overrides):
     def target():
         for _ in range(n_frames):
             engine.gen_frame(return_img=not dit_only)
-        torch.cuda.synchronize()
+        if blocking:
+            torch.cuda.synchronize()
 
     benchmark.pedantic(target, setup=setup, rounds=20)
