@@ -12,7 +12,6 @@ dependencies = [
   "torchvision==0.25.0",
   "torchaudio==2.10.0",
   "einops",
-  "rotary-embedding-torch==0.8.9",
   "tensordict==0.10.0",
   "transformers==4.57.3",
   "ftfy",

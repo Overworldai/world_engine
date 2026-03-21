@@ -4,14 +4,12 @@ from torch import nn
 
 from torch.nn.attention.flex_attention import flex_attention
 
-from rotary_embedding_torch import RotaryEmbedding
-
 from .nn import rms_norm, NoCastModule
 
 
 class OrthoRoPEAngles(NoCastModule):
     """Functions as a on the fly RoPE angle computer called every fwd pass. Should be setup
-    as a module under WordDiT, then each forward pass it computes a shared tuple of (rope_cos, rope_sin) 
+    as a module under WordDiT, then each forward pass it computes a shared tuple of (rope_cos, rope_sin)
     tensors that get passed to every block for their underlying RoPE computations."""
     def __init__(self, config):
         super().__init__()
