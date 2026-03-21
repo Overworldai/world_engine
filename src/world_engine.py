@@ -159,6 +159,7 @@ class WorldEngine:
 
         return self._ctx
 
+    @torch.compile
     def prep_inputs(self, x, ctrl=None):
         ctrl = ctrl if ctrl is not None else CtrlInput()
         self._ctx["button"].zero_()

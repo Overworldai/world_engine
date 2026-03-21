@@ -13,52 +13,46 @@ def make_block_mask(T: int, L: int, written: torch.Tensor) -> BlockMask:
     """
     T: Q length for this frame
     L: KV capacity == written.numel()
-    written: [L] bool, True where there is valid KV data
+    written: [L] bool, True where there is valid KV data.
+    T and L must be exact multiples of the sparse block size; `written` must be
+    block-aligned, i.e. each block is either all True or all False.
     """
     BS = _DEFAULT_SPARSE_BLOCK_SIZE
-    KV_blocks = (L + BS - 1) // BS
-    Q_blocks = (T + BS - 1) // BS
+
+    if not torch.compiler.is_compiling():
+        torch._check(T % BS == 0, f"T ({T}) must be a multiple of block size ({BS})")
+        torch._check(L % BS == 0, f"L ({L}) must be a multiple of block size ({BS})")
+
+    Q_blocks = T // BS
+    KV_blocks = L // BS
 
     # [KV_blocks, BS]
-    written_blocks = torch.nn.functional.pad(written, (0, KV_blocks * BS - L)).view(KV_blocks, BS)
+    written_blocks = written.view(KV_blocks, BS)
 
-    # Block-level occupancy
-    block_any = written_blocks.any(-1)    # block has at least one written token
-    block_all = written_blocks.all(-1)    # block is fully written
+    # For a valid block-aligned mask, each block is either all written or all empty.
+    block_any = written_blocks.any(-1)
+    if not torch.compiler.is_compiling():
+        assert torch.equal(block_any, written_blocks.all(-1)), "written must be block-aligned"
 
-    # Every Q-block sees the same KV-block pattern
-    nonzero_bm = block_any[None, :].expand(Q_blocks, KV_blocks)       # [Q_blocks, KV_blocks]
-    full_bm = block_all[None, :].expand_as(nonzero_bm)                # [Q_blocks, KV_blocks]
-    partial_bm = nonzero_bm & ~full_bm                                # [Q_blocks, KV_blocks]
+    # Every KV block is a full block
+    full_bm = block_any[None, :].expand(Q_blocks, KV_blocks)
+    full_kv_num_blocks = full_bm.sum(dim=-1, dtype=torch.int32)[None, None].contiguous()
+    full_kv_indices = full_bm.argsort(dim=-1, descending=True, stable=True).to(torch.int32)[None, None].contiguous()
 
-    def dense_to_ordered(dense_mask: torch.Tensor):
-        # dense_mask: [Q_blocks, KV_blocks] bool
-        # returns: [1,1,Q_blocks], [1,1,Q_blocks,KV_blocks]
-        num_blocks = dense_mask.sum(dim=-1, dtype=torch.int32)        # [Q_blocks]
-        indices = dense_mask.argsort(dim=-1, descending=True, stable=True).to(torch.int32)
-        return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
+    # No partial blocks at all.
+    kv_num_blocks = torch.zeros((1, 1, Q_blocks), dtype=torch.int32, device=written.device)
+    kv_indices = torch.zeros((1, 1, Q_blocks, KV_blocks), dtype=torch.int32, device=written.device)
 
-    # Partial blocks (need mask_mod)
-    kv_num_blocks, kv_indices = dense_to_ordered(partial_bm)
-
-    # Full blocks (mask_mod can be skipped entirely)
-    full_kv_num_blocks, full_kv_indices = dense_to_ordered(full_bm)
-
-    def mask_mod(b, h, q, kv):
-        return written[kv]
-
-    bm = BlockMask.from_kv_blocks(
+    return BlockMask.from_kv_blocks(
         kv_num_blocks,
         kv_indices,
         full_kv_num_blocks,
         full_kv_indices,
         BLOCK_SIZE=BS,
-        mask_mod=mask_mod,
+        mask_mod=None,
         seq_lengths=(T, L),
-        compute_q_blocks=False,  # no backward, avoids the transpose/_ordered_to_dense path
+        compute_q_blocks=False,
     )
-
-    return bm
 
 
 class LayerKVCache(nn.Module):
