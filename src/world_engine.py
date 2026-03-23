@@ -165,7 +165,7 @@ class WorldEngine:
 
     def prep_inputs(self, x, ctrl=None):
         ctrl = ctrl if ctrl is not None else CtrlInput()
-        ctrl.button = torch.as_tensor(x, dtype=torch.int64).to(x.device, non_blocking=True)
+        ctrl.button = torch.as_tensor(ctrl.button, dtype=torch.int64).to(x.device, non_blocking=True)
         ctrl.mouse = torch.as_tensor(ctrl.mouse).to(x.device, non_blocking=True)
         ctrl.scroll_wheel = torch.as_tensor(ctrl.scroll_wheel).to(x.device, non_blocking=True)
         ctx = self._prep_inputs(x, ctrl)
