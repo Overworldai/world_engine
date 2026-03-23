@@ -149,8 +149,12 @@ class WorldEngine:
 
     @torch.compile
     def _prep_inputs(self, x, ctrl=None):
+        self._ctx["button"].zero_()
+        self._ctx["button"][..., ctrl.button] = 1.0
+
         self._ctx["mouse"][0, 0, 0] = ctrl.mouse[0]
         self._ctx["mouse"][0, 0, 1] = ctrl.mouse[1]
+
         self._ctx["scroll"][0, 0, 0] = ctrl.scroll_wheel
 
         self._ctx["frame_idx"].copy_(self.frame_ts)
@@ -161,11 +165,9 @@ class WorldEngine:
 
     def prep_inputs(self, x, ctrl=None):
         ctrl = ctrl if ctrl is not None else CtrlInput()
-        self._ctx["button"].zero_()
-        if ctrl.button:
-            self._ctx["button"][..., list(ctrl.button)] = 1.0
-        ctrl.mouse = torch.as_tensor(ctrl.mouse, device=x.device, dtype=self.dtype)
-        ctrl.scroll_wheel = torch.sign(torch.as_tensor(ctrl.scroll_wheel, device=x.device, dtype=self.dtype))
+        ctrl.button = torch.as_tensor(x, dtype=torch.int64).to(x.device, non_blocking=True)
+        ctrl.mouse = torch.as_tensor(ctrl.mouse).to(x.device, non_blocking=True)
+        ctrl.scroll_wheel = torch.as_tensor(ctrl.scroll_wheel).to(x.device, non_blocking=True)
         ctx = self._prep_inputs(x, ctrl)
 
         # prepare prompt conditioning
