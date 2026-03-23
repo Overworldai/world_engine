@@ -71,7 +71,7 @@ class WorldEngine:
             self.prompt_encoder = None
             if self.model_cfg.prompt_conditioning is not None:
                 pe_uri = getattr(self.model_cfg, "prompt_encoder_uri", "google/umt5-xl")
-                self.prompt_encoder = PromptEncoder(pe_uri, dtype=dtype, device=device).eval()
+                self.prompt_encoder = PromptEncoder(pe_uri, dtype=dtype).eval()
 
             self.model = WorldModel.from_pretrained(
                 model_uri, cfg=self.model_cfg, device=self.device, dtype=dtype, load_weights=load_weights
