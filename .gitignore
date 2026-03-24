@@ -11,3 +11,6 @@ docs/_build/
 *.pyc
 __pycache__/
 *.egg-info/
+exported_models/
+venv_openvino/
+.ov_cache/
