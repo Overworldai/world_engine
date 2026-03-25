@@ -3,8 +3,9 @@
 import os
 import pytest
 import torch
+import random
 
-from world_engine import WorldEngine
+from world_engine import WorldEngine, CtrlInput
 
 
 MODEL_URI = os.environ.get("MODEL_URI", "Overworld/Waypoint-1-Small")
