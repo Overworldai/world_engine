@@ -110,7 +110,15 @@ def test_ar_rollout(benchmark, dit_only, n_frames, model_overrides, blocking):
         torch.cuda.synchronize()
 
     def target():
-        for _ in range(n_frames):
+        ctrls = [
+            CtrlInput(
+                button=set(random.sample(range(1, 65), random.randint(0, 10))),
+                mouse=(random.random(), random.random()),
+                scroll_wheel=random.choice((-1, 0, 1))
+            )
+            for _ in range(n_frames)
+        ]
+        for ctrl in ctrls:
             engine.gen_frame(return_img=not dit_only)
         if blocking:
             torch.cuda.synchronize()
