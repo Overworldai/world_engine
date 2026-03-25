@@ -153,11 +153,11 @@ class StaticKVCache(nn.Module):
         global_L = config.global_window * self.tpf
 
         period = config.global_attn_period
-        off = getattr(config, "global_attn_offset", 0) % period
+        off = config.global_attn_offset % period
         self.layers = nn.ModuleList([
             LayerKVCache(
                 batch_size,
-                getattr(config, "n_kv_heads", config.n_heads),
+                config.n_kv_heads,
                 global_L if ((layer_idx - off) % period == 0) else local_L,
                 config.d_model // config.n_heads,
                 dtype,

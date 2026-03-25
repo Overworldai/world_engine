@@ -62,16 +62,15 @@ class WorldEngine:
             # Load Model / Modules
             self.vae = get_ae(
                 self.model_cfg.ae_uri,
-                is_taehv_ae=getattr(self.model_cfg, "taehv_ae", False),
-                auto_aspect_ratio=getattr(self.model_cfg, "auto_aspect_ratio", True),
+                is_taehv_ae=self.model_cfg.taehv_ae,
+                auto_aspect_ratio=self.model_cfg.auto_aspect_ratio,
                 dtype=dtype,
                 device=device,
             )
 
             self.prompt_encoder = None
             if self.model_cfg.prompt_conditioning is not None:
-                pe_uri = getattr(self.model_cfg, "prompt_encoder_uri", "google/umt5-xl")
-                self.prompt_encoder = PromptEncoder(pe_uri, dtype=dtype).eval()
+                self.prompt_encoder = PromptEncoder(self.model_cfg.prompt_encoder_uri, dtype=dtype).eval()
 
             self.model = WorldModel.from_pretrained(
                 model_uri, cfg=self.model_cfg, device=self.device, dtype=dtype, load_weights=load_weights
@@ -85,12 +84,11 @@ class WorldEngine:
             # Inference Scheduler
             self.scheduler_sigmas = torch.tensor(self.model_cfg.scheduler_sigmas, dtype=dtype, device=device)
 
-            pH, pW = getattr(self.model_cfg, "patch", [1, 1])
+            pH, pW = self.model_cfg.patch
             self.frm_shape = 1, 1, self.model_cfg.channels, self.model_cfg.height * pH, self.model_cfg.width * pW
 
             # State
-            inference_fps = getattr(self.model_cfg, "inference_fps", self.model_cfg.base_fps)
-            latent_fps = inference_fps / getattr(self.model_cfg, "temporal_compression", 1)
+            latent_fps = self.model_cfg.inference_fps / self.model_cfg.temporal_compression
             self.ts_mult = int(self.model_cfg.base_fps) // latent_fps
             self.frame_ts = torch.tensor([[0]], dtype=torch.long)
 

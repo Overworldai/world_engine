@@ -309,7 +309,7 @@ class WorldModel(BaseModel):
         return x
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
-        if getattr(self.config, "model_type", "waypoint-1") != "waypoint-1.5":
+        if self.config.model_type != "waypoint-1.5":
             return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
         state_dict = dict(state_dict)

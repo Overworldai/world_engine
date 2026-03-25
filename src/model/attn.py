@@ -19,25 +19,25 @@ class OrthoRoPEAngles(NoCastModule):
         torch._assert(d_head % 8 == 0, "d_head must be divisible by 8")
         d_xy, d_t = d_head // 8, d_head // 4
 
-        nyq = float(getattr(config, "rope_nyquist_frac", 0.8))
+        nyq = float(config.rope_nyquist_frac)
         max_freq = min(self.config.height, self.config.width) * nyq
         n = (d_xy + 1) // 2
         xy = (torch.linspace(1.0, max_freq / 2, n, dtype=torch.float32) * torch.pi).repeat_interleave(2)[:d_xy]
 
-        theta = float(getattr(config, "rope_theta", 10000.0))
+        theta = float(config.rope_theta)
         inv_t = 1.0 / (theta ** (torch.arange(0, d_t, 2, dtype=torch.float32) / d_t))
         inv_t = inv_t.repeat_interleave(2)  # [d_t]
 
-        self.register_buffer("xy", xy, persistent=False)       # [d_xy]
-        self.register_buffer("inv_t", inv_t, persistent=False) # [d_t]
+        self.register_buffer("xy", xy, persistent=False)        # [d_xy]
+        self.register_buffer("inv_t", inv_t, persistent=False)  # [d_t]
 
     @torch.autocast("cuda", enabled=False)
     def forward(self, pos_ids):
         if not torch.compiler.is_compiling():
             torch._assert(
-            (pos_ids["y_pos"].max() < self.config.height) & (pos_ids["x_pos"].max() < self.config.width),
+                (pos_ids["y_pos"].max() < self.config.height) & (pos_ids["x_pos"].max() < self.config.width),
                 f"pos_ids out of bounds, {self.config.height}, {self.config.width}"
-        )
+            )
 
         x = (2.0 * pos_ids["x_pos"].float() + 1.0) / self.config.width - 1.0
         y = (2.0 * pos_ids["y_pos"].float() + 1.0) / self.config.height - 1.0
@@ -50,11 +50,11 @@ class OrthoRoPEAngles(NoCastModule):
         # Returns rope_cos, rope_sin angles of shape [B, 1, T, D/2]
         return freqs.cos()[:, None], freqs.sin()[:, None]
 
+
 class OrthoRoPE(NoCastModule):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        assert not getattr(self.config, "has_audio", False)
 
     @torch.autocast("cuda", enabled=False)
     def forward(self, x, rope_angles):
@@ -70,13 +70,13 @@ class Attn(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
+        self.value_residual = config.value_residual
 
-        self.value_residual = getattr(config, "value_residual", False)
         if self.value_residual:
             self.v_lamb = nn.Parameter(torch.tensor(0.5))
 
         self.n_heads = config.n_heads
-        self.n_kv_heads = getattr(config, "n_kv_heads", config.n_heads)
+        self.n_kv_heads = config.n_kv_heads
         self.d_head = config.d_model // self.n_heads
         assert config.d_model % self.n_heads == 0
 
@@ -89,7 +89,7 @@ class Attn(nn.Module):
 
         self.rope = OrthoRoPE(config)
 
-        self.gated_attn = getattr(config, "gated_attn", False)
+        self.gated_attn = config.gated_attn
         if self.gated_attn:
             self.gate_proj = nn.Linear(self.n_heads, self.n_heads, bias=False)  # sparse attn gate
             nn.init.zeros_(self.gate_proj.weight)
