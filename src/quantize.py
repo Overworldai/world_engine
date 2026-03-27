@@ -1,4 +1,5 @@
 from typing import Optional
+from functools import partial
 
 import torch
 import torch.nn as nn
@@ -114,7 +115,7 @@ class FP4Linear(nn.Module):
 class FP8W8A8Linear(nn.Module):
     __constants__ = ("in_features", "out_features")
 
-    def __init__(self, lin: nn.Linear):
+    def __init__(self, lin: nn.Linear, smoothquant: bool = False):
         super().__init__()
         self.in_features, self.out_features = lin.in_features, lin.out_features
 
@@ -133,9 +134,24 @@ class FP8W8A8Linear(nn.Module):
         else:
             self.register_buffer("bias", lin.bias.detach().to(torch.float16))
 
+        smooth = getattr(lin, "_smooth_scale", None)
+        if smoothquant and smooth is None:
+            raise ValueError(
+                f"smoothquant=True but this checkpoint has no _smooth_scale on "
+                f"{type(lin).__name__}(in={lin.in_features}, out={lin.out_features}). "
+                "SmoothQuant cannot be applied to this model checkpoint."
+            )
+        if smooth is not None:
+            self.register_buffer("_smooth_scale", smooth.detach())
+        else:
+            self._smooth_scale = None
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         s = x.shape
         x2 = x.reshape(-1, s[-1])
+
+        if self._smooth_scale is not None:
+            x2 = x2 * self._smooth_scale
 
         xs = (x2.abs().amax() * self._inv).clamp_min(1e-8).float()          # 0-d
         xf8 = (x2 / xs.to(x2.dtype)).to(torch.float8_e4m3fn).contiguous()
@@ -244,11 +260,11 @@ def _w8a8_int8_linear_fake(
 class INT8W8A8GemLite(nn.Module):
     __constants__ = ("in_features", "out_features")
 
-    def __init__(self, lin: nn.Linear):
+    def __init__(self, lin: nn.Linear, smoothquant: bool = False):
         super().__init__()
         if A8W8_INT8_dynamic is None:
             raise ImportError("Install gemlite for quant='w8a8_gemlite'")
-        
+
         self.in_features = lin.in_features
         self.out_features = lin.out_features
 
@@ -258,11 +274,25 @@ class INT8W8A8GemLite(nn.Module):
             dtype=lin.weight.dtype,
         ).from_linear(lin)
 
+        smooth = getattr(lin, "_smooth_scale", None)
+        if smoothquant and smooth is None:
+            raise ValueError(
+                f"smoothquant=True but this checkpoint has no _smooth_scale on "
+                f"{type(lin).__name__}(in={lin.in_features}, out={lin.out_features}). "
+                "SmoothQuant cannot be applied to this model checkpoint."
+            )
+        if smooth is not None:
+            self.register_buffer("_smooth_scale", smooth.detach())
+        else:
+            self._smooth_scale = None
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._smooth_scale is not None:
+            x = x * self._smooth_scale
         return self.impl(x).type_as(x)
 
 
-def quantize_model(model: nn.Module, quant: str):
+def quantize_model(model: nn.Module, quant: str, smoothquant: bool = False):
     if quant is None:
         return model
 
@@ -276,14 +306,14 @@ def quantize_model(model: nn.Module, quant: str):
         return (o % 32 == 0) and (k % 32 == 0)
 
     new_linear = {
-        "intw8a8": INT8W8A8GemLite,
-        "fp8w8a8": FP8W8A8Linear,
+        "intw8a8": partial(INT8W8A8GemLite, smoothquant=smoothquant),
+        "fp8w8a8": partial(FP8W8A8Linear, smoothquant=smoothquant),
         "nvfp4": FP4Linear,
         "fp8": FP8Linear,
     }[quant]
 
     for name, child in model.named_children():
         setattr(model, name, new_linear(child)) if eligible(child) else quantize_model(
-            child, quant
+            child, quant, smoothquant
         )
     return model

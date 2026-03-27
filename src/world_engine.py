@@ -25,7 +25,7 @@ COMPILE_OPTIONS = {
     # "shape_padding": True,
 }
 
-
+import time
 @dataclass
 class CtrlInput:
     button: Set[int] = field(default_factory=set)  # pressed button IDs
@@ -38,6 +38,7 @@ class WorldEngine:
         self,
         model_uri: str,
         quant: Optional[str] = None,
+        smooth: bool = False,
         model_config_overrides: Optional[Dict] = None,
         device=None,
         dtype=torch.bfloat16,
@@ -76,7 +77,9 @@ class WorldEngine:
             ).eval()
             apply_inference_patches(self.model)
             if quant is not None:
-                quantize_model(self.model, quant)
+                start_time = time.time()
+                quantize_model(self.model, quant, smoothquant=smooth)
+                print(f"Quantization took {time.time() - start_time:.2f}s")
 
             self.kv_cache = StaticKVCache(self.model_cfg, batch_size=1, dtype=dtype).to(device=device)
 
