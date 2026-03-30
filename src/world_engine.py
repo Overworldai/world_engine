@@ -177,11 +177,16 @@ class WorldEngine:
 
     @torch.compile(fullgraph=True, dynamic=False, options=COMPILE_OPTIONS)
     def _denoise_pass(self, x, ctx: Dict[str, Tensor], kv_cache):
+        """Run Deterministic or Stochastic Euler ODE Solver"""
         kv_cache.set_frozen(True)
         sigma = x.new_empty((x.size(0), x.size(1)))
-        for step_sig, step_dsig in zip(self.scheduler_sigmas, self.scheduler_sigmas.diff()):
-            v = self.model(x, sigma.fill_(step_sig), **ctx, kv_cache=kv_cache)
-            x = x + step_dsig * v
+        for step_sig, step_sig_next in zip(self.scheduler_sigmas[:-1], self.scheduler_sigmas[1:]):
+            v = self.model(x, sigma.fill_(step_sig), **ctx, kv_cache=kv_cache).float()
+            x_f = x.float()
+            if self.model_cfg.stochastic_euler:
+                x = (x_f - step_sig * v).lerp(torch.randn_like(x_f), step_sig_next).type_as(x)
+            else:
+                x = (x_f + (step_sig_next - step_sig) * v).type_as(x)
         return x
 
     @torch.compile(fullgraph=True, dynamic=False, options=COMPILE_OPTIONS)

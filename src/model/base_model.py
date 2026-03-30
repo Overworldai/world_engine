@@ -9,6 +9,7 @@ import torch
 
 MODEL_CONFIG_DEFAULTS = OmegaConf.create(
     {
+        "stochastic_euler": False,
         "auto_aspect_ratio": True,
         "gated_attn": False,
         "inference_fps": "${base_fps}",
