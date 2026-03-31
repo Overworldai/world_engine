@@ -21,16 +21,28 @@ dependencies = [
   "huggingface-hub==0.36.0",
   "omegaconf",
   "accelerate==1.12.0",
-
   # Triton (platform-specific)
   "triton==3.6.0; sys_platform == 'linux'",
   "triton-windows==3.6.0.post26; sys_platform == 'win32'",
+  # MLX / Metal (macOS only)
+  "mlx; sys_platform == 'darwin'",
+  "nanobind==2.10.2; sys_platform == 'darwin'",
+  "cmake>=3.27; sys_platform == 'darwin'",
+  "we-kernels; sys_platform == 'darwin'",
 ]
+
+[tool.uv.sources]
+mlx = { git = "https://github.com/ml-explore/mlx.git", branch = "main" }
+we-kernels = { path = "src/mlx_metal/ext", editable = true }
+
+[tool.uv]
+no-build-isolation-package = ["we-kernels"]
 
 [tool.setuptools]
 packages = [
   "world_engine",
   "world_engine.model",
+  "world_engine.mlx_metal",
 ]
 
 [tool.setuptools.package-dir]

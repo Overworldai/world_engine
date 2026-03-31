@@ -13,6 +13,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from we_kernels import w8a8_gemm_nax
+
 N_LAYERS = 24
 D_MODEL = 2048
 N_HEADS = 32
@@ -147,7 +149,7 @@ class Int8NaxLinear(nn.Module):
 
     def __call__(self, x: mx.array):
         x = x.astype(mx.float16) if x.dtype != mx.float16 else x
-        y = mx.w8a8_gemm_nax(x, self.weight_q, w_scales=self.weight_scale, bias=self.bias)
+        y = w8a8_gemm_nax(x, self.weight_q, w_scales=self.weight_scale, bias=self.bias)
         if self.output_splits is not None:
             return mx.split(y, np.cumsum(self.output_splits[:-1]).tolist(), axis=-1)
         return y

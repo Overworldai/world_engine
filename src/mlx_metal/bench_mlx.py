@@ -1,15 +1,11 @@
 """Benchmark MLX fp16 and fused-int8 profiles."""
-from pathlib import Path
 import argparse
-import sys
 import time
 
 import mlx.core as mx
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from src.mlx_world_model import load_from_pytorch, compute_rope_angles
+from .mlx_world_model import load_from_pytorch, compute_rope_angles
 
 
 MODEL_URI = "Overworld-Models/MR160k"

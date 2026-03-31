@@ -14,3 +14,8 @@ __pycache__/
 .build/
 diagnostics/
 .venv*/
+
+# Build artifacts (C++ extensions)
+*.so
+*.dylib
+*.metallib

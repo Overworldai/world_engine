@@ -1,0 +1,16 @@
+[build-system]
+requires = [
+  "setuptools>=68",
+  "wheel",
+  "cmake>=3.27",
+  "nanobind==2.10.2",
+  "mlx>=0.29",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "we-kernels"
+version = "0.0.1"
+description = "World Engine Metal kernels — custom MLX C++ extensions for Apple Silicon"
+requires-python = ">=3.10"
+dependencies = ["mlx>=0.29"]
