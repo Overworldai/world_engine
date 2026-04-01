@@ -5,7 +5,7 @@ import time
 import mlx.core as mx
 import numpy as np
 
-from .mlx_world_model import load_from_pytorch, compute_rope_angles
+from ..mlx_world_model import load_from_pytorch, compute_rope_angles
 
 
 MODEL_URI = "Overworld-Models/MR160k"
@@ -20,22 +20,19 @@ def bench_model(model, label: str):
     cond = model.noise_cond(1.0)
 
     for _ in range(2):
-        mx.eval(model.forward_single(x, cond, cos, sin, mouse, button, scroll, True, 0))
+        mx.eval(model.forward_single(x, cond, cos, sin, mouse, button, scroll, 0))
 
     times = []
     for _ in range(6):
         t0 = time.perf_counter()
-        out = model.forward_single(x, cond, cos, sin, mouse, button, scroll, True, 0)
+        out = model.forward_single(x, cond, cos, sin, mouse, button, scroll, 0)
         mx.eval(out)
         times.append(time.perf_counter() - t0)
     print(f"{label} single fwd: {1000 * np.mean(times):.1f}ms")
 
     for fi in range(3):
         cf, sf = compute_rope_angles(fi, model.ts_mult, model.rope_xy, model.rope_inv_t)
-        mx.eval(model.forward_single(x, model.noise_cond(0.0), cf, sf, mouse, button, scroll, False, fi))
-        mx.eval(model.kv_caches[0].keys)
-        for kv in model.kv_caches:
-            kv.ring_copy(fi)
+        model.cache_write(x, cf, sf, mouse, button, scroll, fi)
 
     times_f = []
     for fi in range(3, 6):

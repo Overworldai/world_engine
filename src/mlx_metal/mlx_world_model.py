@@ -14,6 +14,7 @@ import mlx.nn as nn
 import numpy as np
 
 from we_kernels import w8a8_gemm_nax
+from we_kernels import fused_silu_quant, fused_rmsnorm_adaln_quant, w8a8_gemm_prequantized, w8a8_silu_gemm_nax
 
 N_LAYERS = 24
 D_MODEL = 2048
@@ -154,6 +155,36 @@ class Int8NaxLinear(nn.Module):
             return mx.split(y, np.cumsum(self.output_splits[:-1]).tolist(), axis=-1)
         return y
 
+    def forward_prequantized(self, x_q: mx.array, x_scales: mx.array):
+        """GEMM with pre-quantized int8 activations — skips activation quantization."""
+        y = w8a8_gemm_prequantized(x_q, x_scales, self.weight_q, w_scales=self.weight_scale, bias=self.bias)
+        if self.output_splits is not None:
+            return mx.split(y, np.cumsum(self.output_splits[:-1]).tolist(), axis=-1)
+        return y
+
+
+class Int8NaxSiLULinear(nn.Module):
+    """W8A8 linear that applies fused SiLU+Quant before the GEMM.
+
+    Used for MLP fc2 where the input is fc1's fp16 output and SiLU
+    is applied before fc2's GEMM. Fuses SiLU + int8 quantization
+    into a single Metal kernel dispatch.
+    """
+    def __init__(self, weight_q: mx.array, weight_scale: mx.array, bias: Optional[mx.array] = None):
+        super().__init__()
+        self.weight_q = weight_q
+        self.weight_scale = weight_scale
+        self.bias = bias.astype(mx.float32) if bias is not None else None
+        self.freeze()
+
+    @classmethod
+    def from_linear(cls, lin: nn.Linear):
+        weight_q, weight_scale = _symmetric_int8_quantize_rows(lin.weight)
+        return cls(weight_q, weight_scale, getattr(lin, "bias", None))
+
+    def __call__(self, x: mx.array):
+        return w8a8_silu_gemm_nax(x, self.weight_q, w_scales=self.weight_scale, bias=self.bias)
+
 
 def enable_int8_nax_components(model: nn.Module, components: Sequence[str]) -> dict:
     components = tuple(components)
@@ -213,12 +244,17 @@ def enable_int8_nax_linear(
             ("denoise_step_emb.mlp.fc2", model.denoise_step_emb.mlp.fc2),
             ("out_norm.fc", model.out_norm.fc),
         ])
+        # Patterns where fc2 receives SiLU output — use fused SiLU+Quant variant
+        _silu_fc2_patterns = {f"transformer.blocks.{idx}.mlp.fc2" for idx in range(len(model.transformer))}
         for path, mod in candidates:
             if not isinstance(mod, nn.Linear):
                 continue
             if not _linear_is_eligible(mod) or not _path_matches(path, standalone_patterns):
                 continue
-            _path_set(model, path, Int8NaxLinear.from_linear(mod))
+            if path in _silu_fc2_patterns:
+                _path_set(model, path, Int8NaxSiLULinear.from_linear(mod))
+            else:
+                _path_set(model, path, Int8NaxLinear.from_linear(mod))
             stats["standalone_linears"] += 1
             stats["replaced_linears"] += 1
     return stats
@@ -233,7 +269,7 @@ def ortho_rope(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
     x1 = x[..., 1::2]
     y0 = x0 * cos - x1 * sin
     y1 = x1 * cos + x0 * sin
-    return mx.reshape(mx.stack([y0, y1], axis=-1), x.shape)
+    return mx.concatenate([y0, y1], axis=-1)
 
 
 def compute_rope_angles(frame_idx: int, ts_mult: float, rope_xy: mx.array, rope_inv_t: mx.array) -> Tuple[mx.array, mx.array]:
@@ -257,36 +293,61 @@ class RingKVCache:
         self.values = mx.zeros((1, N_KV_HEADS, capacity, D_HEAD), dtype=mx.float16)
         self.written = mx.concatenate([mx.zeros((L,)), mx.ones((T,))]).astype(mx.float16)
 
-    def write_tail(self, k_new: mx.array, v_new: mx.array):
+    def set_frozen(self, frozen: bool):
+        self.frozen = frozen
+
+    def upsert(self, k_new: mx.array, v_new: mx.array, frame_idx: int) -> Tuple[mx.array, mx.array, mx.array]:
+        """Write current frame to tail, build mask, optionally persist to ring.
+
+        Mirrors PyTorch's LayerKVCache.upsert() exactly:
+          1. Always write tail [L, L+T) — authoritative copy of current frame
+          2. Build attention mask — always hide the ring slot this frame maps to
+          3. If not frozen, persist tail to ring for future frames
+
+        Returns (keys, values, mask) for attention.
+        """
+        # 1. Always write current frame to tail
         self.keys[:, :, self.L:self.L + T, :] = k_new
         self.values[:, :, self.L:self.L + T, :] = v_new
 
-    def attention_tensors(self) -> Tuple[mx.array, mx.array]:
-        return self.keys, self.values
-
-    def eval_tensors(self):
-        return [self.keys, self.values]
-
-    def get_attention_mask(self, frame_idx: int, is_denoise: bool) -> mx.array:
+        # 2. Build mask: start from written, mask out the ring slot we'd write to
         w = self.written
-        if is_denoise and self.num_buckets > 0 and (frame_idx % self.dilation) == 0:
+        write_step = (frame_idx % self.dilation) == 0
+        if self.num_buckets > 0 and write_step:
             bucket = (frame_idx + (self.dilation - 1)) // self.dilation
             slot = bucket % self.num_buckets
             ring_start = slot * T
             indices = mx.arange(self.capacity)
             stale = ((indices >= ring_start) & (indices < ring_start + T)).astype(mx.float16)
             w = w * (1 - stale)
-        return mx.reshape(w, (1, 1, 1, -1)) * 1e4 - 1e4
+        mask = mx.reshape(w, (1, 1, 1, -1)) * 1e4 - 1e4
 
-    def ring_copy(self, frame_idx: int):
-        if (frame_idx % self.dilation) != 0 or self.num_buckets == 0:
-            return
-        bucket = (frame_idx + (self.dilation - 1)) // self.dilation
-        slot = bucket % self.num_buckets
-        rs = slot * T
-        self.keys[:, :, rs:rs + T, :] = self.keys[:, :, self.L:self.L + T, :]
-        self.values[:, :, rs:rs + T, :] = self.values[:, :, self.L:self.L + T, :]
-        self.written[rs:rs + T] = mx.ones((T,), dtype=mx.float16)
+        # 3. Persist to ring
+        # PyTorch only persists when not frozen, but we always write here.
+        # Without this write, fp16 produces NaN when chaining 4+ blocks in
+        # one lazy graph with trained weights. The ring slot is masked out
+        # (step 2) so this write has zero numerical effect — confirmed by
+        # fp32 tail-only vs fp32 tail+ring producing bitwise identical
+        # results. Root cause unknown; possible causes:
+        #   - MLX fuses/reorders the tail write + SDPA read when the write
+        #     is the only mutation, and fp16 intermediates overflow in the
+        #     fused path. The ring write may inhibit the fusion.
+        #   - The SDPA kernel reads masked positions before applying the
+        #     mask, and stale/zero values in the ring region produce
+        #     different fp16 softmax intermediates than fresh K/V values.
+        if write_step and self.num_buckets > 0:
+            bucket = (frame_idx + (self.dilation - 1)) // self.dilation
+            slot = bucket % self.num_buckets
+            rs = slot * T
+            # This is the workaround, we write it to the masked ring slot,
+            # but unless its unfrozen, it won't be marked as having been written to
+            self.keys[:, :, rs:rs + T, :] = k_new
+            self.values[:, :, rs:rs + T, :] = v_new
+            # Only mark as written when unfrozen (cache_write pass).
+            if not getattr(self, "frozen", False):
+                self.written[rs:rs + T] = mx.ones((T,), dtype=mx.float16)
+
+        return self.keys, self.values, mask
 
 
 class MLP(nn.Module):
@@ -295,8 +356,14 @@ class MLP(nn.Module):
         self.fc1 = nn.Linear(d_in, d_hidden, bias=False)
         self.fc2 = nn.Linear(d_hidden, d_out, bias=False)
 
-    def __call__(self, x):
-        return self.fc2(nn.silu(self.fc1(x)))
+    def __call__(self, x, *, fc1_q: mx.array | None = None, fc1_scales: mx.array | None = None):
+        if fc1_q is not None and isinstance(self.fc1, Int8NaxLinear):
+            h = self.fc1.forward_prequantized(fc1_q, fc1_scales)
+        else:
+            h = self.fc1(x)
+        if isinstance(self.fc2, Int8NaxSiLULinear):
+            return self.fc2(h)  # SiLU fused inside fc2
+        return self.fc2(nn.silu(h))
 
 
 class CtrlFusion(nn.Module):
@@ -312,10 +379,12 @@ class CtrlFusion(nn.Module):
 
 
 class CondHead(nn.Module):
-    def __init__(self, noise_conditioning: str):
+    def __init__(self, noise_conditioning: str, shared_cond_proj=None):
         super().__init__()
         self.bias_in = mx.zeros((D_MODEL,)) if noise_conditioning == "wan" else None
-        self.cond_proj = [nn.Linear(D_MODEL, D_MODEL, bias=False) for _ in range(6)]
+        # cond_proj weights are shared across all blocks (PyTorch ties them).
+        # bias_in is per-block.
+        self.cond_proj = shared_cond_proj if shared_cond_proj is not None else [nn.Linear(D_MODEL, D_MODEL, bias=False) for _ in range(6)]
         self.cond_proj_group = None
 
     def __call__(self, cond: mx.array):
@@ -343,29 +412,37 @@ class Attention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, layer_idx: int, is_global: bool, has_ctrl: bool, cfg):
+    def __init__(self, layer_idx: int, is_global: bool, has_ctrl: bool, cfg, shared_cond_proj=None):
         super().__init__()
         self.layer_idx = layer_idx
         self.is_global = is_global
         self.has_ctrl = has_ctrl
         self.attn = Attention(getattr(cfg, "value_residual", False), getattr(cfg, "gated_attn", False))
-        self.cond_head = CondHead(getattr(cfg, "noise_conditioning", "wan"))
+        self.cond_head = CondHead(getattr(cfg, "noise_conditioning", "wan"), shared_cond_proj=shared_cond_proj)
         self.mlp = MLP(D_MODEL, int(D_MODEL * cfg.mlp_ratio), D_MODEL)
         if has_ctrl:
             self.ctrl_mlpfusion = CtrlFusion()
 
-    def __call__(self, x: mx.array, cond: mx.array, ctrl_emb: mx.array, rope_cos: mx.array, rope_sin: mx.array, v1_in: Optional[mx.array], kv_cache: RingKVCache, mask: mx.array) -> Tuple[mx.array, mx.array]:
+    def __call__(self, x: mx.array, cond: mx.array, ctrl_emb: mx.array, rope_cos: mx.array, rope_sin: mx.array, v1_in: Optional[mx.array], kv_cache: RingKVCache, frame_idx: int) -> Tuple[mx.array, mx.array]:
         s0, b0, g0, s1, b1, g1 = self.cond_head(cond)
         residual = x
-        x4 = mx.reshape(x, (1, 1, T, D_MODEL))
-        x_n = mx.fast.rms_norm(x4, None, 1e-5) * (1 + mx.expand_dims(s0, 2)) + mx.expand_dims(b0, 2)
-        x_n = mx.reshape(x_n, (1, T, D_MODEL))
-        if self.attn.qkv_proj is not None:
-            q_raw, k_raw, v_raw = self.attn.qkv_proj(x_n)
+
+        # Attention: RMSNorm + AdaLN + QKV projection
+        if self.attn.qkv_proj is not None and isinstance(self.attn.qkv_proj, Int8NaxLinear):
+            x_2d = mx.reshape(x, (-1, D_MODEL))
+            x_q, x_scales = fused_rmsnorm_adaln_quant(x_2d, mx.reshape(s0, (-1,)), mx.reshape(b0, (-1,)))
+            q_raw, k_raw, v_raw = self.attn.qkv_proj.forward_prequantized(x_q, x_scales)
         else:
-            q_raw = self.attn.q_proj(x_n)
-            k_raw = self.attn.k_proj(x_n)
-            v_raw = self.attn.v_proj(x_n)
+            x4 = mx.reshape(x, (1, 1, T, D_MODEL))
+            x_n = mx.fast.rms_norm(x4, None, 1e-5) * (1 + mx.expand_dims(s0, 2)) + mx.expand_dims(b0, 2)
+            x_n = mx.reshape(x_n, (1, T, D_MODEL))
+            if self.attn.qkv_proj is not None:
+                q_raw, k_raw, v_raw = self.attn.qkv_proj(x_n)
+            else:
+                q_raw = self.attn.q_proj(x_n)
+                k_raw = self.attn.k_proj(x_n)
+                v_raw = self.attn.v_proj(x_n)
+
         q = mx.reshape(q_raw, (1, T, N_HEADS, D_HEAD)).transpose(0, 2, 1, 3)
         k_new = mx.reshape(k_raw, (1, T, N_KV_HEADS, D_HEAD)).transpose(0, 2, 1, 3)
         v_new = mx.reshape(v_raw, (1, T, N_KV_HEADS, D_HEAD)).transpose(0, 2, 1, 3)
@@ -377,8 +454,9 @@ class TransformerBlock(nn.Module):
             v1_out = v_new
         q = ortho_rope(mx.fast.rms_norm(q, None, 1e-5), rope_cos, rope_sin)
         k_new = ortho_rope(mx.fast.rms_norm(k_new, None, 1e-5), rope_cos, rope_sin)
-        kv_cache.write_tail(k_new, v_new)
-        k_attn, v_attn = kv_cache.attention_tensors()
+
+        # KV cache upsert: write tail, build mask, optionally persist to ring
+        k_attn, v_attn, mask = kv_cache.upsert(k_new, v_new, frame_idx)
         y = mx.fast.scaled_dot_product_attention(q, k_attn, v_attn, scale=D_HEAD ** -0.5, mask=mask)
         y = mx.reshape(y.transpose(0, 2, 1, 3), (1, T, N_HEADS * D_HEAD))
         y = self.attn.out_proj(y)
@@ -390,9 +468,18 @@ class TransformerBlock(nn.Module):
             x4_2 = mx.reshape(x_n2, (1, 1, T, D_MODEL))
             fused = self.ctrl_mlpfusion(x4_2, c_n)
             x = mx.reshape(fused, (1, T, D_MODEL)) + x
-        x4_m = mx.reshape(x, (1, 1, T, D_MODEL))
-        mn = mx.fast.rms_norm(x4_m, None, 1e-5) * (1 + mx.expand_dims(s1, 2)) + mx.expand_dims(b1, 2)
-        mo = self.mlp(mn)
+
+        # MLP: RMSNorm + AdaLN + fc1 + SiLU + fc2
+        if isinstance(self.mlp.fc1, Int8NaxLinear):
+            # Fused RMSNorm + AdaLN + Quant → pre-quantized fc1
+            x_2d = mx.reshape(x, (-1, D_MODEL))
+            fc1_q, fc1_scales = fused_rmsnorm_adaln_quant(x_2d, mx.reshape(s1, (-1,)), mx.reshape(b1, (-1,)))
+            mo = self.mlp(None, fc1_q=fc1_q, fc1_scales=fc1_scales)
+        else:
+            x4_m = mx.reshape(x, (1, 1, T, D_MODEL))
+            mn = mx.fast.rms_norm(x4_m, None, 1e-5) * (1 + mx.expand_dims(s1, 2)) + mx.expand_dims(b1, 2)
+            mo = self.mlp(mn)
+
         x4_g = mx.reshape(mo, (1, 1, T, D_MODEL))
         x = mx.reshape(x4_g * mx.expand_dims(g1, 2), (1, T, D_MODEL)) + x
         return x, v1_out
@@ -436,8 +523,10 @@ class MLXWorldModel(nn.Module):
         period = cfg.global_attn_period
         off = getattr(cfg, "global_attn_offset", 0) % period
         ctrl_period = cfg.ctrl_conditioning_period
+        noise_cond_type = getattr(cfg, "noise_conditioning", "wan")
+        shared_cond_proj = [nn.Linear(D_MODEL, D_MODEL, bias=False) for _ in range(6)]
         self.transformer = [
-            TransformerBlock(i, ((i - off) % period == 0), (ctrl_period is not None and i % ctrl_period == 0), cfg)
+            TransformerBlock(i, ((i - off) % period == 0), (ctrl_period is not None and i % ctrl_period == 0), cfg, shared_cond_proj)
             for i in range(N_LAYERS)
         ]
         local_L = cfg.local_window * T
@@ -464,15 +553,14 @@ class MLXWorldModel(nn.Module):
         mlp = self.ctrl_emb.mlp
         return mlp.fc2(nn.silu(mlp.fc1(inp))).astype(mx.float16) + 1e-7
 
-    def forward_single(self, x: mx.array, cond: mx.array, rope_cos: mx.array, rope_sin: mx.array, mouse: mx.array, button: mx.array, scroll: mx.array, is_denoise: bool, frame_idx: int) -> mx.array:
+    def forward_single(self, x: mx.array, cond: mx.array, rope_cos: mx.array, rope_sin: mx.array, mouse: mx.array, button: mx.array, scroll: mx.array, frame_idx: int) -> mx.array:
         ctrl_emb = self.ctrl_embed(mouse, button, scroll)
         x_2d = mx.reshape(x, (1, C, HP * PH, WP * PW)).transpose(0, 2, 3, 1)
         x_pat = self.patchify(x_2d)
         x_seq = mx.reshape(x_pat, (1, T, D_MODEL))
         v1 = None
         for blk, kv in zip(self.transformer, self.kv_caches):
-            mask = kv.get_attention_mask(frame_idx, is_denoise)
-            x_seq, v1 = blk(x_seq, cond, ctrl_emb, rope_cos, rope_sin, v1, kv, mask)
+            x_seq, v1 = blk(x_seq, cond, ctrl_emb, rope_cos, rope_sin, v1, kv, frame_idx)
         y = nn.silu(cond)
         ab = self.out_norm.fc(y)
         ab = mx.reshape(mx.broadcast_to(mx.expand_dims(ab, 2), (1, 1, T, 2 * D_MODEL)), (1, T, 2 * D_MODEL))
@@ -484,19 +572,22 @@ class MLXWorldModel(nn.Module):
         return mx.reshape(x_out, (1, 1, C, HP * PH, WP * PW))
 
     def denoise(self, x, rope_cos, rope_sin, mouse, button, scroll, frame_idx: int) -> mx.array:
+        for kv in self.kv_caches:
+            kv.set_frozen(True)
         for sigma, dsigma in zip(SIGMAS[:4], DSIGMAS):
             cond = self.noise_cond(sigma)
-            v = self.forward_single(x, cond, rope_cos, rope_sin, mouse, button, scroll, True, frame_idx)
+            v = self.forward_single(x, cond, rope_cos, rope_sin, mouse, button, scroll, frame_idx)
             x = x + dsigma * v
+            mx.eval(x)  # separate lazy graphs per denoise step
+        for kv in self.kv_caches:
+            kv.set_frozen(False)
         return x
 
     def cache_write(self, x, rope_cos, rope_sin, mouse, button, scroll, frame_idx: int):
         cond = self.noise_cond(0.0)
-        self.forward_single(x, cond, rope_cos, rope_sin, mouse, button, scroll, False, frame_idx)
-        mx.eval(*[arr for kv in self.kv_caches for arr in kv.eval_tensors()])
-        for kv in self.kv_caches:
-            kv.ring_copy(frame_idx)
-        mx.eval(*[arr for kv in self.kv_caches for arr in kv.eval_tensors()])
+        self.forward_single(x, cond, rope_cos, rope_sin, mouse, button, scroll, frame_idx)
+        # Eval to materialize KV cache writes before next frame
+        mx.eval(*[arr for kv in self.kv_caches for arr in [kv.keys, kv.values]])
 
 
 def load_from_pytorch(model_uri: str, int8_profile: Optional[str] = "speed", kv_cache_mode: str = "fp16", attention_mode: str = "fp16") -> Tuple[MLXWorldModel, object]:
@@ -524,6 +615,8 @@ def load_from_pytorch(model_uri: str, int8_profile: Optional[str] = "speed", kv_
     weights = []
     for name, param in pt_model.named_parameters():
         arr = mx.array(param.detach().float().numpy()).astype(mx.float16)
+        # MLX model uses transformer[i] (plain list), PyTorch uses transformer.blocks[i]
+        name = name.replace("transformer.blocks.", "transformer.")
         if name == "patchify.weight":
             arr = mx.transpose(arr, (0, 2, 3, 1))
         if "ctrl_mlpfusion.mlp.fc1.weight" in name:

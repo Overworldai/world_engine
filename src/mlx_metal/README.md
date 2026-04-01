@@ -7,20 +7,27 @@ on Apple Silicon GPUs.
 
 ```
 src/mlx_metal/
-  __init__.py              package root (re-exports we_kernels.w8a8_gemm_nax)
+  __init__.py              package root
   mlx_world_model.py       MLX WorldModel with selective W8A8 linear layers
-  bench_w8a8.py            benchmark: fp16 vs W8A16 vs W8A8
-  bench_mlx.py             end-to-end model benchmark
   ext/                     C++ MLX extension (native Metal 4 / NAX path)
     CMakeLists.txt
     setup.py               built automatically via uv sync
     bindings.cpp            nanobind -> Python
     kernels/
-      w8a8_gemm.h           MLX Primitive header
+      w8a8_gemm.h           MLX Primitive headers (GEMM + fused quant)
       w8a8_gemm.cpp         host-side dispatch (tile selection, Metal buffer binding)
-      w8a8_gemm.metal       NAX kernel (MLX Steel NAXTile, int8 MMA via MPP)
+      w8a8_gemm.metal        v1 (both-staged) + v2 (A-direct) tiled NAX GEMM
+      w8a8_matvec.metal      SIMD dot-product matvec for M<5 (decode path)
+      w8a8_fused_silu_quant.metal        ZeroQuant: fused SiLU + int8 quant
+      w8a8_fused_rmsnorm_quant.metal     ZeroQuant: fused RMSNorm (+AdaLN) + int8 quant
     we_kernels/
-      __init__.py            Python wrapper (dynamic activation quant + reshape)
+      __init__.py            Python wrappers
+  benchmarks/
+    bench_gemm.py          GEMM kernel timing: fp16 vs W8A16 vs W8A8
+    bench_e2e.py           end-to-end operator chains (activation + GEMM) across quant strategies
+    bench_fused_quant.py   ZeroQuant fused kernel benchmarks
+    bench_mlx.py           full model benchmark (fp16 / speed / max_qat profiles)
+    bench_render.py        full render pipeline: MLX model + TAEHV decode → PNG frames
 ```
 
 ## Architecture
@@ -36,18 +43,72 @@ as documented in Table 7.3 of the
 
 ### Kernel implementation
 
-The C++ extension kernel (`ext/kernels/w8a8_gemm.metal`) uses MLX's own Steel NAX
-abstractions (`NAXTile`, `BaseNAXFrag`, `tile_matmad_nax`) for the int8 MMA path (frankly,
-because MLX has better code optimisation than anything I could come up with).
+The tiled GEMM kernel (`ext/kernels/w8a8_gemm.metal`) uses MLX's Steel NAX
+abstractions (`NAXTile`, `BaseNAXFrag`, `tile_matmad_nax`) for the int8 MMA path.
+Both v1 (both A+B staged) and v2 (A-direct, B staged) variants live in one file,
+selected at dispatch time based on N/K ratio.
 
 Key design:
-- **Both A and B staged through threadgroup** with coalesced 128-bit device reads
+- **v1 (both-staged)**: A and B through threadgroup. Wins for wide N (≥4096).
+- **v2 (A-direct)**: A loads from device, B staged. Halves TG usage. Wins for square shapes.
 - **int8 threadgroup memory** — 2x denser than fp16, enabling larger BK tiles
-- **MLX NAXTile fragment loads** with compile-time `Int<1>` column stride for
-  vectorized reads and `const_for_loop` for static register allocation
-- **MPP `matmul2d` cooperative tensors** — int8x int8 -> int32 on NAX hardware
+- **MLX NAXTile fragment loads** with compile-time `Int<1>` column stride
+- **MPP `matmul2d` cooperative tensors** — int8 × int8 → int32 on NAX hardware
 - **Per-row scale epilogue** — `out = (int32_accum * x_scale * w_scale + bias)` cast to fp16
 - **Multiple tile specializations** selected at runtime based on M, N, K
+- **Matvec kernel** for M<5 (decode path): SIMD dot-product with 128-bit vector loads
+
+### ZeroQuant fused activation quantization
+
+Fuses dynamic activation quantization into the preceding operator (RMSNorm, SiLU),
+eliminating a separate kernel dispatch and memory round-trip per GEMM:
+
+```
+Unfused:  RMSNorm → fp16 → [quant kernel] → int8 + scale → W8A8 GEMM → fp16
+Fused:    RMSNorm+Quant → int8 + scale → W8A8 GEMM → fp16
+```
+
+Two fused Metal kernels:
+- **`fused_rmsnorm_quant`** / **`fused_rmsnorm_adaln_quant`** — RMSNorm (+ optional
+  AdaLN `*(1+s)+b` modulation) + per-row int8 quantization in 3 phases: sum-of-squares
+  reduction → normalize + absmax → quantize. Feeds QKV and MLP fc1 projections.
+- **`fused_silu_quant`** — SiLU activation + per-row int8 quantization in 2 phases:
+  SiLU + absmax → quantize. Feeds MLP fc2 (via `Int8NaxSiLULinear`).
+
+Benchmark (standalone kernel, M=512):
+| Kernel | Shape | Separate | Fused | Speedup |
+|--------|-------|----------|-------|---------|
+| SiLU+Quant | 512×8192 | 525μs | 203μs | **2.59×** |
+| RMSNorm+AdaLN+Quant | 512×2048 | 258μs | 174μs | **1.48×** |
+
+End-to-end (fused quant + GEMM vs fp16 baseline):
+| Operation | fp16 | W8A8 fused | Speedup |
+|-----------|------|-----------|---------|
+| QKV proj (2048→6144) | 484μs | 348μs | **0.72×** |
+| MLP fc2 (8192→2048) | 593μs | 478μs | **0.81×** |
+| **Forward pass total** | **44.3ms** | **36.8ms** | **0.83×** |
+
+## Known Issues
+
+### fp16 overflow with AdaLN-gated models
+
+The model was trained at **bfloat16** (exponent range up to 3.4e38). The AdaLN gates
+have trained magnitudes of ~20× per layer. Through the `x = y * gate + residual`
+accumulation across 24 residual layers, activations grow to 500–1800 absmax. This is
+by design and works at bfloat16/fp32.
+
+At fp16 (max 65504), these values are within range individually, but **intermediate
+products overflow** during element-wise computation when the lazy evaluation graph
+spans multiple transformer blocks. The issue manifests as NaN during multi-frame
+generation with real image context in the KV cache:
+
+- **fp32**: stable for unlimited frames
+- **fp16 without seed context**: stable (activations stay smaller with zero KV history)
+- **fp16 with real seed image**: NaN deterministically at frame 2+
+
+The int8 W8A8 path inherits this limitation since all non-GEMM operations (attention,
+RMSNorm, gate multiplication, residual adds) run at fp16. The int8 GEMM itself has
+plenty of precision (int32 accumulator, fp32 epilogue).
 
 ## Setup
 
@@ -61,6 +122,12 @@ Key design:
 ### Running benchmarks
 
 ```bash
-python -m src.mlx_metal.bench_w8a8
-python -m src.mlx_metal.bench_w8a8 --shapes sweep --accuracy
+uv run python -m src.mlx_metal.benchmarks.bench_gemm
+uv run python -m src.mlx_metal.benchmarks.bench_gemm --shapes sweep --accuracy
+uv run python -m src.mlx_metal.benchmarks.bench_e2e
+uv run python -m src.mlx_metal.benchmarks.bench_e2e --accuracy
+uv run python -m src.mlx_metal.benchmarks.bench_fused_quant
+uv run python -m src.mlx_metal.benchmarks.bench_fused_quant --accuracy
+uv run python -m src.mlx_metal.benchmarks.bench_mlx
+uv run python -m src.mlx_metal.benchmarks.bench_render --save-frames
 ```
