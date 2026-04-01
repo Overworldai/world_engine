@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from .attn import Attn, CrossAttention, OrthoRoPEAngles
 from .nn import AdaLN, ada_gate, ada_rmsnorm, NoiseConditioner
 from .base_model import BaseModel
+from ..quantize import preregister_smooth_scales
 
 
 class PromptEncoder(nn.Module):
@@ -308,21 +309,9 @@ class WorldModel(BaseModel):
 
         return x
 
-    def _preregister_smooth_scales(self, state_dict):
-        """Register _smooth_scale buffers on submodules so strict loading accepts them."""
-        for key, tensor in state_dict.items():
-            if key.endswith("._smooth_scale"):
-                module_path = key[: -len("._smooth_scale")]
-                try:
-                    submod = self.get_submodule(module_path)
-                    if not hasattr(submod, "_smooth_scale"):
-                        submod.register_buffer("_smooth_scale", tensor)
-                except AttributeError:
-                    pass
-
     def load_state_dict(self, state_dict, strict=True, assign=False):
         if self.config.model_type != "waypoint-1.5":
-            self._preregister_smooth_scales(state_dict)
+            preregister_smooth_scales(self, state_dict)
             return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
         state_dict = dict(state_dict)
@@ -372,5 +361,5 @@ class WorldModel(BaseModel):
                     state_dict[k] = state_dict[rk]
         state_dict = {k: v for k, v in state_dict.items() if ".cond_heads." not in k}
 
-        self._preregister_smooth_scales(state_dict)
+        preregister_smooth_scales(self, state_dict)
         return super().load_state_dict(state_dict, strict=strict, assign=assign)

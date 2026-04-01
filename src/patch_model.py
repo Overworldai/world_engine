@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from .model.nn import rms_norm
 from .model.attn import Attn
 from .model.world_model import MLPFusion
+from .quantize import merge_qkv_smoothscales
 from torch.nn.attention.flex_attention import flex_attention
 
 
@@ -111,26 +112,7 @@ class MergedQKVAttn(Attn):
                 [self.q_proj.weight, self.k_proj.weight, self.v_proj.weight], dim=0
             ))
 
-        # Propagate SmoothQuant scales from separate q/k/v into the merged qkv_proj.
-        # q/k/v share the same input so they need a single unified input scale.
-        _sq = getattr(src.q_proj, "_smooth_scale", None)  # stored as 1/s
-        _sk = getattr(src.k_proj, "_smooth_scale", None)
-        _sv = getattr(src.v_proj, "_smooth_scale", None)
-        if _sq is not None or _sk is not None or _sv is not None:
-            D = src.q_proj.in_features
-            dev = self.qkv_proj.weight.device
-            ones = torch.ones(D, device=dev, dtype=torch.float32)
-            s_q = (1.0 / _sq.float()) if _sq is not None else ones
-            s_k = (1.0 / _sk.float()) if _sk is not None else ones
-            s_v = (1.0 / _sv.float()) if _sv is not None else ones
-            s_uni = torch.stack([s_q, s_k, s_v]).amax(dim=0)  # [D]
-            with torch.no_grad():
-                w = self.qkv_proj.weight.float()
-                w[: self.q_out].mul_(s_uni / s_q)
-                w[self.q_out : self.q_out + self.kv_out].mul_(s_uni / s_k)
-                w[self.q_out + self.kv_out :].mul_(s_uni / s_v)
-                self.qkv_proj.weight.copy_(w.to(self.qkv_proj.weight.dtype))
-            self.qkv_proj.register_buffer("_smooth_scale", (1.0 / s_uni).to(torch.bfloat16))
+        merge_qkv_smoothscales(self, src)
 
         del self.q_proj, self.k_proj, self.v_proj
 

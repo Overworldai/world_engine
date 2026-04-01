@@ -280,6 +280,41 @@ class INT8W8A8GemLite(nn.Module):
         return self.impl(x).type_as(x)
 
 
+def preregister_smooth_scales(model: nn.Module, state_dict: dict) -> None:
+    """Register _smooth_scale buffers on submodules before strict state_dict loading."""
+    for key, tensor in state_dict.items():
+        if key.endswith("._smooth_scale"):
+            module_path = key[: -len("._smooth_scale")]
+            try:
+                submod = model.get_submodule(module_path)
+                if not hasattr(submod, "_smooth_scale"):
+                    submod.register_buffer("_smooth_scale", tensor)
+            except AttributeError:
+                pass
+
+def merge_qkv_smoothscales(model: nn.Module, src):
+        # Propagate SmoothQuant scales from separate q/k/v into the merged qkv_proj.
+        # q/k/v share the same input so they need a single unified input scale.
+        _sq = getattr(src.q_proj, "_smooth_scale", None)  # stored as 1/s
+        _sk = getattr(src.k_proj, "_smooth_scale", None)
+        _sv = getattr(src.v_proj, "_smooth_scale", None)
+        if _sq is not None or _sk is not None or _sv is not None:
+            D = src.q_proj.in_features
+            dev = model.qkv_proj.weight.device
+            ones = torch.ones(D, device=dev, dtype=torch.float32)
+            s_q = (1.0 / _sq.float()) if _sq is not None else ones
+            s_k = (1.0 / _sk.float()) if _sk is not None else ones
+            s_v = (1.0 / _sv.float()) if _sv is not None else ones
+            s_uni = torch.stack([s_q, s_k, s_v]).amax(dim=0)  # [D]
+            with torch.no_grad():
+                w = model.qkv_proj.weight.float()
+                w[: model.q_out].mul_(s_uni / s_q)
+                w[model.q_out : model.q_out + model.kv_out].mul_(s_uni / s_k)
+                w[model.q_out + model.kv_out :].mul_(s_uni / s_v)
+                model.qkv_proj.weight.copy_(w.to(model.qkv_proj.weight.dtype))
+            model.qkv_proj.register_buffer("_smooth_scale", (1.0 / s_uni).to(torch.bfloat16))
+
+
 def quantize_model(model: nn.Module, quant: str, smoothquant: bool = False):
     if quant is None:
         return model
