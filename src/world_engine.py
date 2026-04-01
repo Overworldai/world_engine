@@ -77,9 +77,7 @@ class WorldEngine:
             ).eval()
             apply_inference_patches(self.model)
             if quant is not None:
-                start_time = time.time()
                 quantize_model(self.model, quant, smoothquant=smooth)
-                print(f"Quantization took {time.time() - start_time:.2f}s")
 
             self.kv_cache = StaticKVCache(self.model_cfg, batch_size=1, dtype=dtype).to(device=device)
 

@@ -303,7 +303,7 @@ def quantize_model(model: nn.Module, quant: str, smoothquant: bool = False):
 
     new_linear = {
         "intw8a8": partial(INT8W8A8GemLite, smoothquant=smoothquant),
-        "fp8w8a8": partial(FP8W8A8Linear, smoothquant=smoothquant),
+        "fp8w8a8": FP8W8A8Linear,
         "nvfp4": FP4Linear,
         "fp8": FP8Linear,
     }[quant]
