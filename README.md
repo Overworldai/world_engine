@@ -133,6 +133,17 @@ Supported inference quantization schemes are:
 | `nvfp4` | NVFP4 weights + FP4 activations via FlashInfer/CUTLASS | NVIDIA Blackwell (B100, B200, RTX 5090) |
 
 
+### SmoothQuant
+
+SmoothQuant improves INT8/FP8 quantization quality by migrating activation outliers into weights at calibration time. It requires a checkpoint that was specifically calibrated with SmoothQuant — passing `smooth=True` with a non-calibrated checkpoint will raise an error.
+
+```python
+# Only works with a SmoothQuant-calibrated checkpoint (e.g. Overworld-Models/MR160k-smoothquant)
+engine = WorldEngine("Overworld-Models/MR160k-smoothquant", quant="intw8a8", smooth=True, device="cuda")
+```
+
+Supported with `intw8a8` and `fp8w8a8`. Has no effect (and will raise) with `nvfp4` or `fp8`.
+
 ### WorldEngine
 
 `WorldEngine` computes each new frame from past frames, the controls, and the current prompt, then appends it to the sequence so later frames stay aligned with what has already been generated.
