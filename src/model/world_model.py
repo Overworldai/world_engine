@@ -308,8 +308,21 @@ class WorldModel(BaseModel):
 
         return x
 
+    def _preregister_smooth_scales(self, state_dict):
+        """Register _smooth_scale buffers on submodules so strict loading accepts them."""
+        for key, tensor in state_dict.items():
+            if key.endswith("._smooth_scale"):
+                module_path = key[: -len("._smooth_scale")]
+                try:
+                    submod = self.get_submodule(module_path)
+                    if not hasattr(submod, "_smooth_scale"):
+                        submod.register_buffer("_smooth_scale", tensor)
+                except AttributeError:
+                    pass
+
     def load_state_dict(self, state_dict, strict=True, assign=False):
         if self.config.model_type != "waypoint-1.5":
+            self._preregister_smooth_scales(state_dict)
             return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
         state_dict = dict(state_dict)
@@ -324,7 +337,7 @@ class WorldModel(BaseModel):
         for i in range(self.config.n_layers):
             p = f"transformer.blocks.{i}."
 
-            for name in ("fc1.weight", "fc2.weight"):
+            for name in ("fc1.weight", "fc2.weight", "fc1._smooth_scale", "fc2._smooth_scale"):
                 old = p + "dit_mlp." + name
                 if old in state_dict:
                     state_dict.setdefault(p + "mlp." + name, state_dict.pop(old))
@@ -359,4 +372,5 @@ class WorldModel(BaseModel):
                     state_dict[k] = state_dict[rk]
         state_dict = {k: v for k, v in state_dict.items() if ".cond_heads." not in k}
 
+        self._preregister_smooth_scales(state_dict)
         return super().load_state_dict(state_dict, strict=strict, assign=assign)

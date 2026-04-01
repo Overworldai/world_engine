@@ -135,12 +135,6 @@ class FP8W8A8Linear(nn.Module):
             self.register_buffer("bias", lin.bias.detach().to(torch.float16))
 
         smooth = getattr(lin, "_smooth_scale", None)
-        if smoothquant and smooth is None:
-            raise ValueError(
-                f"smoothquant=True but this checkpoint has no _smooth_scale on "
-                f"{type(lin).__name__}(in={lin.in_features}, out={lin.out_features}). "
-                "SmoothQuant cannot be applied to this model checkpoint."
-            )
         if smooth is not None:
             self.register_buffer("_smooth_scale", smooth.detach())
         else:
@@ -275,12 +269,6 @@ class INT8W8A8GemLite(nn.Module):
         ).from_linear(lin)
 
         smooth = getattr(lin, "_smooth_scale", None)
-        if smoothquant and smooth is None:
-            raise ValueError(
-                f"smoothquant=True but this checkpoint has no _smooth_scale on "
-                f"{type(lin).__name__}(in={lin.in_features}, out={lin.out_features}). "
-                "SmoothQuant cannot be applied to this model checkpoint."
-            )
         if smooth is not None:
             self.register_buffer("_smooth_scale", smooth.detach())
         else:
@@ -295,6 +283,14 @@ class INT8W8A8GemLite(nn.Module):
 def quantize_model(model: nn.Module, quant: str, smoothquant: bool = False):
     if quant is None:
         return model
+
+    if smoothquant and not any(
+        hasattr(m, "_smooth_scale") for m in model.modules() if isinstance(m, nn.Linear)
+    ):
+        raise ValueError(
+            "smoothquant=True but no linear layers have _smooth_scale. "
+            "This checkpoint does not contain SmoothQuant scales."
+        )
 
     def eligible(m: nn.Module) -> bool:
         w = getattr(m, "weight", None)
@@ -312,8 +308,9 @@ def quantize_model(model: nn.Module, quant: str, smoothquant: bool = False):
         "fp8": FP8Linear,
     }[quant]
 
-    for name, child in model.named_children():
-        setattr(model, name, new_linear(child)) if eligible(child) else quantize_model(
-            child, quant, smoothquant
-        )
+    def _recurse(m: nn.Module):
+        for name, child in m.named_children():
+            setattr(m, name, new_linear(child)) if eligible(child) else _recurse(child)
+
+    _recurse(model)
     return model
