@@ -134,11 +134,7 @@ mx::array w8a8_gemm(
       {static_cast<int>(M), static_cast<int>(N)},
       mx::float16,
       std::make_shared<W8A8Gemm>(stream, M, N, K, has_bias),
-      {mx::contiguous(x_q, false, stream),
-       mx::contiguous(w_q, false, stream),
-       mx::contiguous(x_scales, false, stream),
-       mx::contiguous(w_scales, false, stream),
-       mx::contiguous(bias, false, stream)});
+      {x_q, w_q, x_scales, w_scales, bias});
 }
 
 // ===========================================================================

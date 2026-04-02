@@ -199,6 +199,21 @@ def main():
     if args.save_frames:
         print(f"  Frames saved to: {out_dir}/")
 
+        # Build a collage of all saved frames
+        from PIL import Image
+        saved = sorted(out_dir.glob("frame_*.png"))
+        if saved:
+            imgs = [Image.open(p) for p in saved]
+            w, h = imgs[0].size
+            cols = min(4, len(imgs))
+            rows = (len(imgs) + cols - 1) // cols
+            collage = Image.new("RGB", (w * cols, h * rows))
+            for i, im in enumerate(imgs):
+                collage.paste(im, ((i % cols) * w, (i // cols) * h))
+            collage_path = out_dir / "collage.png"
+            collage.save(collage_path)
+            print(f"  Collage: {collage_path}")
+
 
 if __name__ == "__main__":
     main()

@@ -379,30 +379,14 @@ class RingKVCache:
             w = w * (1 - stale)
         mask = mx.reshape(w, (1, 1, 1, -1)) * 1e4 - 1e4
 
-        # 3. Persist to ring
-        # PyTorch only persists when not frozen, but we always write here.
-        # Without this write, fp16 produces NaN when chaining 4+ blocks in
-        # one lazy graph with trained weights. The ring slot is masked out
-        # (step 2) so this write has zero numerical effect — confirmed by
-        # fp32 tail-only vs fp32 tail+ring producing bitwise identical
-        # results. Root cause unknown; possible causes:
-        #   - MLX fuses/reorders the tail write + SDPA read when the write
-        #     is the only mutation, and fp16 intermediates overflow in the
-        #     fused path. The ring write may inhibit the fusion.
-        #   - The SDPA kernel reads masked positions before applying the
-        #     mask, and stale/zero values in the ring region produce
-        #     different fp16 softmax intermediates than fresh K/V values.
-        if write_step and self.num_buckets > 0:
+        # 3. Persist to ring (only when unfrozen — cache_write pass)
+        if write_step and self.num_buckets > 0 and not getattr(self, "frozen", False):
             bucket = (frame_idx + (self.dilation - 1)) // self.dilation
             slot = bucket % self.num_buckets
             rs = slot * T
-            # This is the workaround, we write it to the masked ring slot,
-            # but unless its unfrozen, it won't be marked as having been written to
             self.keys[:, :, rs:rs + T, :] = k_new
             self.values[:, :, rs:rs + T, :] = v_new
-            # Only mark as written when unfrozen (cache_write pass).
-            if not getattr(self, "frozen", False):
-                self.written[rs:rs + T] = mx.ones((T,), dtype=mx.float16)
+            self.written[rs:rs + T] = mx.ones((T,), dtype=mx.float16)
 
         return self.keys, self.values, mask
 
@@ -538,6 +522,7 @@ class TransformerBlock(nn.Module):
                 x_2d, mx.reshape(s1, (-1,)), mx.reshape(b1, (-1,)),
                 smooth_scale=self.mlp.fc1.smooth_scale,
             )
+            mx.eval(fc1_q, fc1_scales)  # workaround: flush fused quant before GEMM reads it
             mo = self.mlp(None, fc1_q=fc1_q, fc1_scales=fc1_scales)
         else:
             x4_m = mx.reshape(x, (1, 1, T, D_MODEL))

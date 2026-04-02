@@ -102,25 +102,7 @@ End-to-end (fused quant + GEMM vs fp16 baseline):
 
 ## Known Issues
 
-### fp16 overflow with AdaLN-gated models
-
-The model was trained at **bfloat16** (exponent range up to 3.4e38). The AdaLN gates
-have trained magnitudes of ~20× per layer. Through the `x = y * gate + residual`
-accumulation across 24 residual layers, activations grow to 500–1800 absmax. This is
-by design and works at bfloat16/fp32.
-
-At fp16 (max 65504), these values are within range individually, but **intermediate
-products overflow** during element-wise computation when the lazy evaluation graph
-spans multiple transformer blocks. The issue manifests as NaN during multi-frame
-generation with real image context in the KV cache:
-
-- **fp32**: stable for unlimited frames
-- **fp16 without seed context**: stable (activations stay smaller with zero KV history)
-- **fp16 with real seed image**: NaN deterministically at frame 2+
-
-The int8 W8A8 path inherits this limitation since all non-GEMM operations (attention,
-RMSNorm, gate multiplication, residual adds) run at fp16. The int8 GEMM itself has
-plenty of precision (int32 accumulator, fp32 epilogue).
+### Quality degredation after a few frames
 
 ## Setup
 
