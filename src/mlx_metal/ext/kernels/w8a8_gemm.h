@@ -70,11 +70,11 @@ std::vector<mx::array> fused_silu_quant(
     const mx::array& x,
     mx::StreamOrDevice s = {});
 
-// Fused RMSNorm (+ optional AdaLN) + per-row int8 quantization
+// Fused RMSNorm (+ optional AdaLN) (+ optional SmoothQuant) + per-row int8 quantization
 class FusedRMSNormQuant : public mx::Primitive {
  public:
-  FusedRMSNormQuant(mx::Stream stream, uint32_t M, uint32_t K, float eps, bool has_adaln)
-      : mx::Primitive(stream), M_(M), K_(K), eps_(eps), has_adaln_(has_adaln) {}
+  FusedRMSNormQuant(mx::Stream stream, uint32_t M, uint32_t K, float eps, bool has_adaln, bool has_smooth = false)
+      : mx::Primitive(stream), M_(M), K_(K), eps_(eps), has_adaln_(has_adaln), has_smooth_(has_smooth) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -96,6 +96,7 @@ class FusedRMSNormQuant : public mx::Primitive {
   uint32_t M_, K_;
   float eps_;
   bool has_adaln_;
+  bool has_smooth_;
 };
 
 std::vector<mx::array> fused_rmsnorm_quant(
@@ -103,10 +104,24 @@ std::vector<mx::array> fused_rmsnorm_quant(
     float eps = 1e-5f,
     mx::StreamOrDevice s = {});
 
+std::vector<mx::array> fused_rmsnorm_smooth_quant(
+    const mx::array& x,
+    const mx::array& smooth_scale,
+    float eps = 1e-5f,
+    mx::StreamOrDevice s = {});
+
 std::vector<mx::array> fused_rmsnorm_adaln_quant(
     const mx::array& x,
     const mx::array& adaln_s,
     const mx::array& adaln_b,
+    float eps = 1e-5f,
+    mx::StreamOrDevice s = {});
+
+std::vector<mx::array> fused_rmsnorm_adaln_smooth_quant(
+    const mx::array& x,
+    const mx::array& adaln_s,
+    const mx::array& adaln_b,
+    const mx::array& smooth_scale,
     float eps = 1e-5f,
     mx::StreamOrDevice s = {});
 

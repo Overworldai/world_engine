@@ -88,4 +88,50 @@ Args:
 
 Returns:
     list[int8 x_q [M, K], fp32 x_scales [M]])");
+
+  m.def(
+      "fused_rmsnorm_smooth_quant",
+      [](const mx::array& x,
+         const mx::array& smooth_scale,
+         float eps) {
+        return we_kernels::fused_rmsnorm_smooth_quant(x, smooth_scale, eps);
+      },
+      nb::arg("x"),
+      nb::arg("smooth_scale"),
+      nb::arg("eps") = 1e-5f,
+      R"(Fused RMSNorm + SmoothQuant + per-row int8 quantization.
+
+Args:
+    x: fp16 activations [M, K]
+    smooth_scale: fp16 per-channel smooth scale [K]
+    eps: RMSNorm epsilon
+
+Returns:
+    list[int8 x_q [M, K], fp32 x_scales [M]])");
+
+  m.def(
+      "fused_rmsnorm_adaln_smooth_quant",
+      [](const mx::array& x,
+         const mx::array& adaln_s,
+         const mx::array& adaln_b,
+         const mx::array& smooth_scale,
+         float eps) {
+        return we_kernels::fused_rmsnorm_adaln_smooth_quant(x, adaln_s, adaln_b, smooth_scale, eps);
+      },
+      nb::arg("x"),
+      nb::arg("adaln_s"),
+      nb::arg("adaln_b"),
+      nb::arg("smooth_scale"),
+      nb::arg("eps") = 1e-5f,
+      R"(Fused RMSNorm + AdaLN + SmoothQuant + per-row int8 quantization.
+
+Args:
+    x: fp16 activations [M, K]
+    adaln_s: fp16 scale modulation [K]
+    adaln_b: fp16 bias modulation [K]
+    smooth_scale: fp16 per-channel smooth scale [K]
+    eps: RMSNorm epsilon
+
+Returns:
+    list[int8 x_q [M, K], fp32 x_scales [M]])");
 }

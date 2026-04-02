@@ -1,4 +1,9 @@
-"""Benchmark MLX fp16 and fused-int8 profiles."""
+"""Benchmark MLX fp16 and fused-int8 profiles.
+
+Usage:
+  python -m src.mlx_metal.benchmarks.bench_mlx
+  python -m src.mlx_metal.benchmarks.bench_mlx --model-uri Overworld-Models/MR160k-smoothquant
+"""
 import argparse
 import time
 
@@ -9,6 +14,7 @@ from ..mlx_world_model import load_from_pytorch, compute_rope_angles
 
 
 MODEL_URI = "Overworld-Models/MR160k"
+SMOOTHQUANT_URI = "Overworld-Models/MR160k-smoothquant"
 
 
 def bench_model(model, label: str):
@@ -50,6 +56,8 @@ def bench_model(model, label: str):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-uri", default=MODEL_URI)
+    parser.add_argument("--smoothquant", action="store_true",
+                        help="Also benchmark with SmoothQuant model")
     args = parser.parse_args()
 
     summaries = []
@@ -73,6 +81,26 @@ def main():
         )
         single, frame = bench_model(model, label)
         summaries.append((label, single, frame))
+
+    if args.smoothquant:
+        sq_uri = SMOOTHQUANT_URI
+        for profile in ["speed", "max_qat"]:
+            model, cfg = load_from_pytorch(
+                sq_uri,
+                int8_profile=profile,
+                kv_cache_mode="fp16",
+                attention_mode="fp16",
+            )
+            label = f"smoothquant w8a8 nax {profile}"
+            print(
+                {
+                    "model_uri": sq_uri,
+                    "profile": profile,
+                    "int8_stats": getattr(model, "int8_stats", None),
+                }
+            )
+            single, frame = bench_model(model, label)
+            summaries.append((label, single, frame))
 
     print("\nSummary:")
     for label, single, frame in summaries:

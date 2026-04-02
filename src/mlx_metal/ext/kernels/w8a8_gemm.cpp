@@ -225,7 +225,29 @@ void FusedRMSNormQuant::eval_gpu(
   struct Params { uint32_t M; uint32_t K; float eps; };
   Params params{M_, K_, eps_};
 
-  if (has_adaln_) {
+  // 4 variants: {adaln, no_adaln} x {smooth, no_smooth}
+  // Input layout:
+  //   no_adaln, no_smooth:  [x]
+  //   no_adaln, smooth:     [x, smooth_scale]
+  //   adaln, no_smooth:     [x, adaln_s, adaln_b]
+  //   adaln, smooth:        [x, adaln_s, adaln_b, smooth_scale]
+
+  if (has_adaln_ && has_smooth_) {
+    auto& adaln_s = inputs[1];
+    auto& adaln_b = inputs[2];
+    auto& smooth = inputs[3];
+
+    auto kernel = d.get_kernel("fused_rmsnorm_adaln_smooth_quant", mtl_lib);
+    enc.set_compute_pipeline_state(kernel);
+
+    enc.set_input_array(x, 0);
+    enc.set_output_array(x_q, 1);
+    enc.set_output_array(x_scales, 2);
+    enc.set_input_array(adaln_s, 3);
+    enc.set_input_array(adaln_b, 4);
+    enc.set_input_array(smooth, 5);
+    enc.set_bytes(params, 6);
+  } else if (has_adaln_) {
     auto& adaln_s = inputs[1];
     auto& adaln_b = inputs[2];
 
@@ -238,6 +260,17 @@ void FusedRMSNormQuant::eval_gpu(
     enc.set_input_array(adaln_s, 3);
     enc.set_input_array(adaln_b, 4);
     enc.set_bytes(params, 5);
+  } else if (has_smooth_) {
+    auto& smooth = inputs[1];
+
+    auto kernel = d.get_kernel("fused_rmsnorm_smooth_quant", mtl_lib);
+    enc.set_compute_pipeline_state(kernel);
+
+    enc.set_input_array(x, 0);
+    enc.set_output_array(x_q, 1);
+    enc.set_output_array(x_scales, 2);
+    enc.set_input_array(smooth, 3);
+    enc.set_bytes(params, 4);
   } else {
     auto kernel = d.get_kernel("fused_rmsnorm_quant", mtl_lib);
     enc.set_compute_pipeline_state(kernel);
@@ -281,10 +314,48 @@ std::vector<mx::array> fused_rmsnorm_adaln_quant(
       {mx::Shape{static_cast<int>(M), static_cast<int>(K)},
        mx::Shape{static_cast<int>(M)}},
       {mx::int8, mx::float32},
-      std::make_shared<FusedRMSNormQuant>(stream, M, K, eps, true),
+      std::make_shared<FusedRMSNormQuant>(stream, M, K, eps, true, false),
       {mx::contiguous(x, false, stream),
        mx::contiguous(adaln_s, false, stream),
        mx::contiguous(adaln_b, false, stream)});
+}
+
+std::vector<mx::array> fused_rmsnorm_smooth_quant(
+    const mx::array& x,
+    const mx::array& smooth_scale,
+    float eps,
+    mx::StreamOrDevice s) {
+  uint32_t M = static_cast<uint32_t>(x.shape(0));
+  uint32_t K = static_cast<uint32_t>(x.shape(1));
+  auto stream = mx::to_stream(s);
+  return mx::array::make_arrays(
+      {mx::Shape{static_cast<int>(M), static_cast<int>(K)},
+       mx::Shape{static_cast<int>(M)}},
+      {mx::int8, mx::float32},
+      std::make_shared<FusedRMSNormQuant>(stream, M, K, eps, false, true),
+      {mx::contiguous(x, false, stream),
+       mx::contiguous(smooth_scale, false, stream)});
+}
+
+std::vector<mx::array> fused_rmsnorm_adaln_smooth_quant(
+    const mx::array& x,
+    const mx::array& adaln_s,
+    const mx::array& adaln_b,
+    const mx::array& smooth_scale,
+    float eps,
+    mx::StreamOrDevice s) {
+  uint32_t M = static_cast<uint32_t>(x.shape(0));
+  uint32_t K = static_cast<uint32_t>(x.shape(1));
+  auto stream = mx::to_stream(s);
+  return mx::array::make_arrays(
+      {mx::Shape{static_cast<int>(M), static_cast<int>(K)},
+       mx::Shape{static_cast<int>(M)}},
+      {mx::int8, mx::float32},
+      std::make_shared<FusedRMSNormQuant>(stream, M, K, eps, true, true),
+      {mx::contiguous(x, false, stream),
+       mx::contiguous(adaln_s, false, stream),
+       mx::contiguous(adaln_b, false, stream),
+       mx::contiguous(smooth_scale, false, stream)});
 }
 
 }  // namespace we_kernels

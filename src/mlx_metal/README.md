@@ -68,12 +68,24 @@ Unfused:  RMSNorm → fp16 → [quant kernel] → int8 + scale → W8A8 GEMM →
 Fused:    RMSNorm+Quant → int8 + scale → W8A8 GEMM → fp16
 ```
 
-Two fused Metal kernels:
+Fused Metal kernels:
 - **`fused_rmsnorm_quant`** / **`fused_rmsnorm_adaln_quant`** — RMSNorm (+ optional
   AdaLN `*(1+s)+b` modulation) + per-row int8 quantization in 3 phases: sum-of-squares
   reduction → normalize + absmax → quantize. Feeds QKV and MLP fc1 projections.
+- **`fused_rmsnorm_adaln_smooth_quant`** / **`fused_rmsnorm_smooth_quant`** — Same as
+  above but with per-channel SmoothQuant scale applied after normalization/modulation
+  and before quantization: `v = (rms_norm(x) * (1+s) + b) * smooth_scale[k]`.
 - **`fused_silu_quant`** — SiLU activation + per-row int8 quantization in 2 phases:
   SiLU + absmax → quantize. Feeds MLP fc2 (via `Int8NaxSiLULinear`).
+
+### SmoothQuant integration
+
+Loads pre-calibrated per-channel smooth scales from `Overworld-Models/MR160k-smoothquant`.
+96 smooth scales total: per block × 4 (q_proj, k_proj, v_proj, mlp.fc1).
+
+For merged QKV projections, the three separate q/k/v scales are unified via element-wise
+max (matching PyTorch's `merge_qkv_smoothscales`), with weight compensation applied.
+Smooth scales are fused directly into the Metal quantization kernels — no fallback path.
 
 Benchmark (standalone kernel, M=512):
 | Kernel | Shape | Separate | Fused | Speedup |
@@ -129,5 +141,8 @@ uv run python -m src.mlx_metal.benchmarks.bench_e2e --accuracy
 uv run python -m src.mlx_metal.benchmarks.bench_fused_quant
 uv run python -m src.mlx_metal.benchmarks.bench_fused_quant --accuracy
 uv run python -m src.mlx_metal.benchmarks.bench_mlx
+uv run python -m src.mlx_metal.benchmarks.bench_mlx --smoothquant
+uv run python -m src.mlx_metal.benchmarks.bench_mlx --model-uri Overworld-Models/MR160k-smoothquant
 uv run python -m src.mlx_metal.benchmarks.bench_render --save-frames
+uv run python -m src.mlx_metal.benchmarks.bench_render --smoothquant --save-frames
 ```

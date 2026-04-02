@@ -23,6 +23,7 @@ from ..mlx_world_model import load_from_pytorch, compute_rope_angles
 
 
 MODEL_URI = "Overworld-Models/MR160k"
+SMOOTHQUANT_URI = "Overworld-Models/MR160k-smoothquant"
 SEED_IMAGE = pathlib.Path(__file__).parent / "frozen_valley_sniper.jpg"
 
 
@@ -55,7 +56,11 @@ def main():
     parser.add_argument("--save-frames", action="store_true", help="Save rendered frames as PNGs")
     parser.add_argument("--out-dir", default="bench_render_output", help="Output directory for saved frames")
     parser.add_argument("--no-decode", action="store_true", help="Skip VAE decode (measure model only)")
+    parser.add_argument("--smoothquant", action="store_true", help="Use SmoothQuant model")
     args = parser.parse_args()
+
+    if args.smoothquant and args.model_uri == MODEL_URI:
+        args.model_uri = SMOOTHQUANT_URI
 
     int8_profile = None if args.profile == "fp16" else args.profile
 
@@ -69,11 +74,21 @@ def main():
     latent_shape = (1, 1, cfg.channels, cfg.height * pH, cfg.width * pW)
 
     # --- Load VAE and encode seed image ---
+    # The VAE expects the original video resolution (e.g. 720x1280) and
+    # internally resizes to the latent pixel size (e.g. 512x1024).
+    # Look up which input resolution maps to our latent pixel size.
+    from src.ae import ChunkedStreamingTAEHV
+    encode_h, encode_w = pixel_h, pixel_w
+    for (src_h, src_w), (dst_h, dst_w) in ChunkedStreamingTAEHV._ENCODE_SIZES.items():
+        if dst_h == pixel_h and dst_w == pixel_w:
+            encode_h, encode_w = src_h, src_w
+            break
+
     print(f"Loading VAE from model config")
     vae = load_vae(args.model_uri)
 
-    print(f"Loading seed image: {args.seed_image} (resizing to {pixel_w}x{pixel_h})")
-    seed_img = load_seed_image(pathlib.Path(args.seed_image), pixel_h, pixel_w)
+    print(f"Loading seed image: {args.seed_image} (resizing to {encode_w}x{encode_h})")
+    seed_img = load_seed_image(pathlib.Path(args.seed_image), encode_h, encode_w)
 
     t_compress = getattr(cfg, "temporal_compression", 1)
     seed_batch = seed_img.unsqueeze(0).expand(t_compress, -1, -1, -1)

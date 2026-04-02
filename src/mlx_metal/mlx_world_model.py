@@ -118,21 +118,22 @@ def get_int8_nax_profile_components(profile: str = "speed") -> tuple[str, ...]:
 
 
 class Int8NaxLinear(nn.Module):
-    def __init__(self, weight_q: mx.array, weight_scale: mx.array, bias: Optional[mx.array] = None, output_splits: Optional[Sequence[int]] = None):
+    def __init__(self, weight_q: mx.array, weight_scale: mx.array, bias: Optional[mx.array] = None, output_splits: Optional[Sequence[int]] = None, smooth_scale: Optional[mx.array] = None):
         super().__init__()
         self.weight_q = weight_q
         self.weight_scale = weight_scale
         self.bias = bias.astype(mx.float32) if bias is not None else None
         self.output_splits = tuple(output_splits) if output_splits is not None else None
+        self.smooth_scale = smooth_scale.astype(mx.float16) if smooth_scale is not None else None
         self.freeze()
 
     @classmethod
-    def from_linear(cls, lin: nn.Linear):
+    def from_linear(cls, lin: nn.Linear, smooth_scale: Optional[mx.array] = None):
         weight_q, weight_scale = _symmetric_int8_quantize_rows(lin.weight)
-        return cls(weight_q, weight_scale, getattr(lin, "bias", None))
+        return cls(weight_q, weight_scale, getattr(lin, "bias", None), smooth_scale=smooth_scale)
 
     @classmethod
-    def from_linears(cls, linears: Sequence[nn.Linear]):
+    def from_linears(cls, linears: Sequence[nn.Linear], smooth_scale: Optional[mx.array] = None):
         weights = []
         scales = []
         biases = []
@@ -146,10 +147,16 @@ class Int8NaxLinear(nn.Module):
             if lin_bias is not None:
                 biases.append(lin_bias.astype(mx.float32))
         bias = mx.concatenate(biases, axis=0) if biases else None
-        return cls(mx.concatenate(weights, axis=0), mx.concatenate(scales, axis=0), bias=bias, output_splits=splits)
+        return cls(mx.concatenate(weights, axis=0), mx.concatenate(scales, axis=0), bias=bias, output_splits=splits, smooth_scale=smooth_scale)
+
+    def _apply_smooth(self, x: mx.array) -> mx.array:
+        if self.smooth_scale is not None:
+            return x * self.smooth_scale
+        return x
 
     def __call__(self, x: mx.array):
         x = x.astype(mx.float16) if x.dtype != mx.float16 else x
+        x = self._apply_smooth(x)
         y = w8a8_gemm_nax(x, self.weight_q, w_scales=self.weight_scale, bias=self.bias)
         if self.output_splits is not None:
             return mx.split(y, np.cumsum(self.output_splits[:-1]).tolist(), axis=-1)
@@ -186,7 +193,7 @@ class Int8NaxSiLULinear(nn.Module):
         return w8a8_silu_gemm_nax(x, self.weight_q, w_scales=self.weight_scale, bias=self.bias)
 
 
-def enable_int8_nax_components(model: nn.Module, components: Sequence[str]) -> dict:
+def enable_int8_nax_components(model: nn.Module, components: Sequence[str], smooth_scales: Optional[dict] = None) -> dict:
     components = tuple(components)
     qkv_patterns = DEFAULT_INT8_NAX_QKV_PATTERNS if "qkv" in components else ()
     cond_patterns = DEFAULT_INT8_NAX_COND_PATTERNS if "cond" in components else ()
@@ -195,7 +202,46 @@ def enable_int8_nax_components(model: nn.Module, components: Sequence[str]) -> d
         if name in {"qkv", "cond"}:
             continue
         standalone_patterns.extend(INT8_NAX_STANDALONE_COMPONENT_PATTERNS[name])
-    return enable_int8_nax_linear(model, qkv_patterns=qkv_patterns, cond_patterns=cond_patterns, standalone_patterns=tuple(standalone_patterns))
+    return enable_int8_nax_linear(model, qkv_patterns=qkv_patterns, cond_patterns=cond_patterns, standalone_patterns=tuple(standalone_patterns), smooth_scales=smooth_scales)
+
+
+def _merge_qkv_smooth_scales(
+    smooth_scales: dict, idx: int, q_proj, k_proj, v_proj
+) -> Optional[mx.array]:
+    """Merge separate q/k/v smooth scales into a unified QKV smooth scale.
+
+    Mirrors PyTorch's merge_qkv_smoothscales: takes element-wise max of
+    the individual smoothing factors, then adjusts q/k/v weights so that
+    a single unified scale can be applied to the shared input.
+
+    Smooth scales are stored as 1/s (reciprocal of smoothing factor).
+    Unified scale = 1 / max(s_q, s_k, s_v) per channel.
+    Weight adjustment: W_new[section] *= s_uni / s_individual.
+    """
+    s_q = smooth_scales.get(f"transformer.blocks.{idx}.attn.q_proj")
+    s_k = smooth_scales.get(f"transformer.blocks.{idx}.attn.k_proj")
+    s_v = smooth_scales.get(f"transformer.blocks.{idx}.attn.v_proj")
+    if s_q is None and s_k is None and s_v is None:
+        return None
+
+    D = q_proj.weight.shape[-1]
+    ones = mx.ones((D,), dtype=mx.float32)
+    # Smooth scales are stored as 1/s; convert to s for merging
+    sq = (1.0 / s_q.astype(mx.float32)) if s_q is not None else ones
+    sk = (1.0 / s_k.astype(mx.float32)) if s_k is not None else ones
+    sv = (1.0 / s_v.astype(mx.float32)) if s_v is not None else ones
+    s_uni = mx.maximum(mx.maximum(sq, sk), sv)
+
+    # Adjust weights: W_new = W * (s_uni / s_individual)
+    q_adj = (s_uni / sq).astype(mx.float16)
+    k_adj = (s_uni / sk).astype(mx.float16)
+    v_adj = (s_uni / sv).astype(mx.float16)
+    q_proj.weight = q_proj.weight * q_adj
+    k_proj.weight = k_proj.weight * k_adj
+    v_proj.weight = v_proj.weight * v_adj
+
+    # Return unified scale as 1/s_uni (reciprocal form)
+    return (1.0 / s_uni).astype(mx.float16)
 
 
 def enable_int8_nax_linear(
@@ -204,17 +250,25 @@ def enable_int8_nax_linear(
     qkv_patterns: Optional[Sequence[str]] = DEFAULT_INT8_NAX_QKV_PATTERNS,
     cond_patterns: Optional[Sequence[str]] = DEFAULT_INT8_NAX_COND_PATTERNS,
     standalone_patterns: Optional[Sequence[str]] = DEFAULT_INT8_NAX_STANDALONE_PATTERNS,
+    smooth_scales: Optional[dict] = None,
 ) -> dict:
-    stats = {"fused_qkv_groups": 0, "fused_cond_groups": 0, "fused_mlp_modules": 0, "standalone_linears": 0, "replaced_linears": 0}
+    stats = {"fused_qkv_groups": 0, "fused_cond_groups": 0, "fused_mlp_modules": 0, "standalone_linears": 0, "replaced_linears": 0, "smooth_applied": 0}
+    if smooth_scales is None:
+        smooth_scales = {}
 
     for idx, blk in enumerate(model.transformer):
         attn_path = f"transformer.blocks.{idx}.attn"
         if _path_matches(attn_path, qkv_patterns):
             linears = [blk.attn.q_proj, blk.attn.k_proj, blk.attn.v_proj]
             if all(_linear_is_eligible(lin) for lin in linears):
-                blk.attn.qkv_proj = Int8NaxLinear.from_linears(linears)
+                qkv_smooth = _merge_qkv_smooth_scales(
+                    smooth_scales, idx, blk.attn.q_proj, blk.attn.k_proj, blk.attn.v_proj
+                )
+                blk.attn.qkv_proj = Int8NaxLinear.from_linears(linears, smooth_scale=qkv_smooth)
                 stats["fused_qkv_groups"] += 1
                 stats["replaced_linears"] += 3
+                if qkv_smooth is not None:
+                    stats["smooth_applied"] += 1
         cond_path = f"transformer.blocks.{idx}.cond_head"
         if _path_matches(cond_path, cond_patterns):
             if all(_linear_is_eligible(lin) for lin in blk.cond_head.cond_proj):
@@ -251,17 +305,20 @@ def enable_int8_nax_linear(
                 continue
             if not _linear_is_eligible(mod) or not _path_matches(path, standalone_patterns):
                 continue
+            ss = smooth_scales.get(path)
             if path in _silu_fc2_patterns:
                 _path_set(model, path, Int8NaxSiLULinear.from_linear(mod))
             else:
-                _path_set(model, path, Int8NaxLinear.from_linear(mod))
+                _path_set(model, path, Int8NaxLinear.from_linear(mod, smooth_scale=ss))
+                if ss is not None:
+                    stats["smooth_applied"] += 1
             stats["standalone_linears"] += 1
             stats["replaced_linears"] += 1
     return stats
 
 
-def enable_int8_nax_profile(model: nn.Module, profile: str = "speed") -> dict:
-    return enable_int8_nax_components(model, get_int8_nax_profile_components(profile))
+def enable_int8_nax_profile(model: nn.Module, profile: str = "speed", smooth_scales: Optional[dict] = None) -> dict:
+    return enable_int8_nax_components(model, get_int8_nax_profile_components(profile), smooth_scales=smooth_scales)
 
 
 def ortho_rope(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
@@ -429,8 +486,12 @@ class TransformerBlock(nn.Module):
 
         # Attention: RMSNorm + AdaLN + QKV projection
         if self.attn.qkv_proj is not None and isinstance(self.attn.qkv_proj, Int8NaxLinear):
+            # Fused RMSNorm+AdaLN+(SmoothQuant)+Quant → pre-quantized QKV
             x_2d = mx.reshape(x, (-1, D_MODEL))
-            x_q, x_scales = fused_rmsnorm_adaln_quant(x_2d, mx.reshape(s0, (-1,)), mx.reshape(b0, (-1,)))
+            x_q, x_scales = fused_rmsnorm_adaln_quant(
+                x_2d, mx.reshape(s0, (-1,)), mx.reshape(b0, (-1,)),
+                smooth_scale=self.attn.qkv_proj.smooth_scale,
+            )
             q_raw, k_raw, v_raw = self.attn.qkv_proj.forward_prequantized(x_q, x_scales)
         else:
             x4 = mx.reshape(x, (1, 1, T, D_MODEL))
@@ -471,9 +532,12 @@ class TransformerBlock(nn.Module):
 
         # MLP: RMSNorm + AdaLN + fc1 + SiLU + fc2
         if isinstance(self.mlp.fc1, Int8NaxLinear):
-            # Fused RMSNorm + AdaLN + Quant → pre-quantized fc1
+            # Fused RMSNorm + AdaLN + (SmoothQuant) + Quant → pre-quantized fc1
             x_2d = mx.reshape(x, (-1, D_MODEL))
-            fc1_q, fc1_scales = fused_rmsnorm_adaln_quant(x_2d, mx.reshape(s1, (-1,)), mx.reshape(b1, (-1,)))
+            fc1_q, fc1_scales = fused_rmsnorm_adaln_quant(
+                x_2d, mx.reshape(s1, (-1,)), mx.reshape(b1, (-1,)),
+                smooth_scale=self.mlp.fc1.smooth_scale,
+            )
             mo = self.mlp(None, fc1_q=fc1_q, fc1_scales=fc1_scales)
         else:
             x4_m = mx.reshape(x, (1, 1, T, D_MODEL))
@@ -590,6 +654,23 @@ class MLXWorldModel(nn.Module):
         mx.eval(*[arr for kv in self.kv_caches for arr in [kv.keys, kv.values]])
 
 
+def _extract_smooth_scales(pt_model) -> dict:
+    """Extract SmoothQuant scales from PyTorch model buffers.
+
+    Returns a dict mapping MLX-style paths (e.g. 'transformer.blocks.0.mlp.fc1')
+    to mx.array smooth scales of shape [D].
+    """
+    smooth_scales = {}
+    for name, buf in pt_model.named_buffers():
+        if not name.endswith("._smooth_scale"):
+            continue
+        # e.g. 'transformer.blocks.0.attn.q_proj._smooth_scale' -> 'transformer.blocks.0.attn.q_proj'
+        layer_path = name[: -len("._smooth_scale")]
+        arr = mx.array(buf.detach().float().numpy()).astype(mx.float16)
+        smooth_scales[layer_path] = arr
+    return smooth_scales
+
+
 def load_from_pytorch(model_uri: str, int8_profile: Optional[str] = "speed", kv_cache_mode: str = "fp16", attention_mode: str = "fp16") -> Tuple[MLXWorldModel, object]:
     import torch
     from src.model import WorldModel
@@ -612,6 +693,12 @@ def load_from_pytorch(model_uri: str, int8_profile: Optional[str] = "speed", kv_
 
     pt_model = WorldModel.from_pretrained(model_uri, cfg=cfg, device="cpu", dtype=torch.float16).eval()
     mlx_model = MLXWorldModel(cfg, kv_cache_mode=kv_cache_mode, attention_mode=attention_mode)
+
+    # Extract SmoothQuant scales before weight conversion
+    smooth_scales = _extract_smooth_scales(pt_model)
+    if smooth_scales:
+        print(f"  SmoothQuant: loaded {len(smooth_scales)} smooth scales")
+
     weights = []
     for name, param in pt_model.named_parameters():
         arr = mx.array(param.detach().float().numpy()).astype(mx.float16)
@@ -639,7 +726,7 @@ def load_from_pytorch(model_uri: str, int8_profile: Optional[str] = "speed", kv_
         return x.astype(mx.float16) if isinstance(x, mx.array) and x.dtype == mx.float32 and x.ndim >= 2 else x
     mlx_model.update(tree_map(cast_fp16, mlx_model.parameters()))
     if int8_profile is not None:
-        stats = enable_int8_nax_profile(mlx_model, int8_profile)
+        stats = enable_int8_nax_profile(mlx_model, int8_profile, smooth_scales=smooth_scales if smooth_scales else None)
         mlx_model.int8_profile = int8_profile
         mlx_model.int8_stats = stats
     else:

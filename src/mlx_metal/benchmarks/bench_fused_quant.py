@@ -20,6 +20,7 @@ from we_kernels import (
     fused_silu_quant,
     fused_rmsnorm_quant,
     fused_rmsnorm_adaln_quant,
+    fused_rmsnorm_smooth_quant,
     w8a8_gemm_prequantized,
     w8a8_silu_gemm_nax,
     w8a8_gemm_nax,
@@ -214,6 +215,8 @@ def run_accuracy():
         ("SiLU+Quant", 512, 2048),
         ("RMSNorm+Quant", 512, 2048),
         ("RMSNorm+AdaLN+Quant", 512, 2048),
+        ("RMSNorm+Smooth+Quant", 512, 2048),
+        ("RMSNorm+AdaLN+Smooth+Quant", 512, 2048),
     ]
 
     for op, M, K in tests:
@@ -237,7 +240,7 @@ def run_accuracy():
             ref_sc = mx.maximum(ref_absmax / 127.0, 1e-6)
             ref_q = mx.clip(mx.round(ref_v / mx.expand_dims(ref_sc, -1)), -127, 127).astype(mx.int8)
 
-        else:  # RMSNorm+AdaLN+Quant
+        elif op == "RMSNorm+AdaLN+Quant":
             s = mx.random.normal((K,)).astype(mx.float16)
             b = mx.random.normal((K,)).astype(mx.float16)
             mx.eval(s, b)
@@ -245,6 +248,30 @@ def run_accuracy():
             x_f32 = x.astype(mx.float32)
             rms = mx.sqrt(mx.mean(x_f32 * x_f32, axis=-1, keepdims=True) + 1e-5)
             ref_v = (x_f32 / rms) * (1.0 + s.astype(mx.float32)) + b.astype(mx.float32)
+            ref_absmax = mx.max(mx.abs(ref_v), axis=-1)
+            ref_sc = mx.maximum(ref_absmax / 127.0, 1e-6)
+            ref_q = mx.clip(mx.round(ref_v / mx.expand_dims(ref_sc, -1)), -127, 127).astype(mx.int8)
+
+        elif op == "RMSNorm+Smooth+Quant":
+            sm = mx.random.uniform(shape=(K,), low=0.02, high=0.5).astype(mx.float16)
+            mx.eval(sm)
+            fused_q, fused_sc = fused_rmsnorm_smooth_quant(x, sm, eps=1e-5)
+            x_f32 = x.astype(mx.float32)
+            rms = mx.sqrt(mx.mean(x_f32 * x_f32, axis=-1, keepdims=True) + 1e-5)
+            ref_v = (x_f32 / rms) * sm.astype(mx.float32)
+            ref_absmax = mx.max(mx.abs(ref_v), axis=-1)
+            ref_sc = mx.maximum(ref_absmax / 127.0, 1e-6)
+            ref_q = mx.clip(mx.round(ref_v / mx.expand_dims(ref_sc, -1)), -127, 127).astype(mx.int8)
+
+        else:  # RMSNorm+AdaLN+Smooth+Quant
+            s = mx.random.normal((K,)).astype(mx.float16)
+            b = mx.random.normal((K,)).astype(mx.float16)
+            sm = mx.random.uniform(shape=(K,), low=0.02, high=0.5).astype(mx.float16)
+            mx.eval(s, b, sm)
+            fused_q, fused_sc = fused_rmsnorm_adaln_quant(x, s, b, eps=1e-5, smooth_scale=sm)
+            x_f32 = x.astype(mx.float32)
+            rms = mx.sqrt(mx.mean(x_f32 * x_f32, axis=-1, keepdims=True) + 1e-5)
+            ref_v = ((x_f32 / rms) * (1.0 + s.astype(mx.float32)) + b.astype(mx.float32)) * sm.astype(mx.float32)
             ref_absmax = mx.max(mx.abs(ref_v), axis=-1)
             ref_sc = mx.maximum(ref_absmax / 127.0, 1e-6)
             ref_q = mx.clip(mx.round(ref_v / mx.expand_dims(ref_sc, -1)), -127, 127).astype(mx.int8)
