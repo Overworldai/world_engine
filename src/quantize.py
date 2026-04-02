@@ -1,4 +1,5 @@
 from typing import Optional
+from functools import partial
 
 import torch
 import torch.nn as nn
@@ -12,6 +13,12 @@ try:
     QUANTS.append("nvfp4")
 except ImportError:
     pass
+try:
+    from gemlite.helper import A8W8_INT8_dynamic
+    import gemlite
+    gemlite.set_autotune("max")
+except ImportError:
+    A8W8_INT8_dynamic = None
 
 
 @torch.library.custom_op("world_engine::fp4_linear", mutates_args=())
@@ -108,7 +115,7 @@ class FP4Linear(nn.Module):
 class FP8W8A8Linear(nn.Module):
     __constants__ = ("in_features", "out_features")
 
-    def __init__(self, lin: nn.Linear):
+    def __init__(self, lin: nn.Linear, smoothquant: bool = False):
         super().__init__()
         self.in_features, self.out_features = lin.in_features, lin.out_features
 
@@ -127,9 +134,18 @@ class FP8W8A8Linear(nn.Module):
         else:
             self.register_buffer("bias", lin.bias.detach().to(torch.float16))
 
+        smooth = getattr(lin, "_smooth_scale", None)
+        if smooth is not None:
+            self.register_buffer("_smooth_scale", smooth.detach())
+        else:
+            self._smooth_scale = None
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         s = x.shape
         x2 = x.reshape(-1, s[-1])
+
+        if self._smooth_scale is not None:
+            x2 = x2 * self._smooth_scale
 
         xs = (x2.abs().amax() * self._inv).clamp_min(1e-8).float()          # 0-d
         xf8 = (x2 / xs.to(x2.dtype)).to(torch.float8_e4m3fn).contiguous()
@@ -183,10 +199,133 @@ class FP8Linear(nn.Module):
 
         return result.reshape(x.shape[:-1] + (-1,))
 
+def _per_token_quant_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Local per-token symmetric int8 quantization matching SGLang's W8A8 flow:
+      scale = absmax / 127
+      x_q   = round(x / scale)
+    Returns:
+      x_q:    [..., K] int8
+      scales: [..., 1] float32
+    """
+    x_fp = x.float().nan_to_num()
+    scales = (x_fp.abs().amax(dim=-1, keepdim=True).clamp_min(1e-10) / 127.0).float()
+    x_q = torch.round(x_fp / scales).clamp(-127, 127).to(torch.int8)
+    return x_q, scales
 
-def quantize_model(model: nn.Module, quant: str):
+
+@torch.library.custom_op("world_engine::w8a8_int8_linear", mutates_args=())
+def w8a8_int8_linear(
+    a: torch.Tensor,
+    b_int8_T: torch.Tensor,
+    b_scale: torch.Tensor,
+    bias: torch.Tensor,
+) -> torch.Tensor:
+    if sgl_int8_scaled_mm is None:
+        raise ImportError("sgl-kernel is required for quant='w8a8'")
+
+    assert a.ndim == 2, "expected [M, K] input"
+    x_q, x_scale = _per_token_quant_int8(a.contiguous())
+
+    bias_arg = None if bias.numel() == 0 else bias
+    return sgl_int8_scaled_mm(
+        x_q,                 # [M, K] row-major int8
+        b_int8_T,            # [K, N] column-major int8 view
+        x_scale,             # [M, 1] float32
+        b_scale,             # [N, 1] float32
+        out_dtype=a.dtype,
+        bias=bias_arg,
+    )
+
+
+@w8a8_int8_linear.register_fake
+def _w8a8_int8_linear_fake(
+    a: torch.Tensor,
+    b_int8_T: torch.Tensor,
+    b_scale: torch.Tensor,
+    bias: torch.Tensor,
+) -> torch.Tensor:
+    return torch.empty(
+        (a.shape[0], b_int8_T.shape[1]),
+        device=a.device,
+        dtype=a.dtype,
+    )
+
+class INT8W8A8GemLite(nn.Module):
+    __constants__ = ("in_features", "out_features")
+
+    def __init__(self, lin: nn.Linear, smoothquant: bool = False):
+        super().__init__()
+        if A8W8_INT8_dynamic is None:
+            raise ImportError("Install gemlite for quant='w8a8_gemlite'")
+
+        self.in_features = lin.in_features
+        self.out_features = lin.out_features
+
+        # Minimal wrapper: assumes the layer is already on the target CUDA device.
+        self.impl = A8W8_INT8_dynamic(
+            device=str(lin.weight.device),
+            dtype=lin.weight.dtype,
+        ).from_linear(lin)
+
+        smooth = getattr(lin, "_smooth_scale", None)
+        if smooth is not None:
+            self.register_buffer("_smooth_scale", smooth.detach())
+        else:
+            self._smooth_scale = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._smooth_scale is not None:
+            x = x * self._smooth_scale
+        return self.impl(x).type_as(x)
+
+
+def preregister_smooth_scales(model: nn.Module, state_dict: dict) -> None:
+    """Register _smooth_scale buffers on submodules before strict state_dict loading."""
+    for key, tensor in state_dict.items():
+        if key.endswith("._smooth_scale"):
+            module_path = key[: -len("._smooth_scale")]
+            try:
+                submod = model.get_submodule(module_path)
+                if not hasattr(submod, "_smooth_scale"):
+                    submod.register_buffer("_smooth_scale", tensor)
+            except AttributeError:
+                pass
+
+def merge_qkv_smoothscales(model: nn.Module, src):
+        # Propagate SmoothQuant scales from separate q/k/v into the merged qkv_proj.
+        # q/k/v share the same input so they need a single unified input scale.
+        _sq = getattr(src.q_proj, "_smooth_scale", None)  # stored as 1/s
+        _sk = getattr(src.k_proj, "_smooth_scale", None)
+        _sv = getattr(src.v_proj, "_smooth_scale", None)
+        if _sq is not None or _sk is not None or _sv is not None:
+            D = src.q_proj.in_features
+            dev = model.qkv_proj.weight.device
+            ones = torch.ones(D, device=dev, dtype=torch.float32)
+            s_q = (1.0 / _sq.float()) if _sq is not None else ones
+            s_k = (1.0 / _sk.float()) if _sk is not None else ones
+            s_v = (1.0 / _sv.float()) if _sv is not None else ones
+            s_uni = torch.stack([s_q, s_k, s_v]).amax(dim=0)  # [D]
+            with torch.no_grad():
+                w = model.qkv_proj.weight.float()
+                w[: model.q_out].mul_(s_uni / s_q)
+                w[model.q_out : model.q_out + model.kv_out].mul_(s_uni / s_k)
+                w[model.q_out + model.kv_out :].mul_(s_uni / s_v)
+                model.qkv_proj.weight.copy_(w.to(model.qkv_proj.weight.dtype))
+            model.qkv_proj.register_buffer("_smooth_scale", (1.0 / s_uni).to(torch.bfloat16))
+
+
+def quantize_model(model: nn.Module, quant: str, smoothquant: bool = False):
     if quant is None:
         return model
+
+    if smoothquant and not any(
+        hasattr(m, "_smooth_scale") for m in model.modules() if isinstance(m, nn.Linear)
+    ):
+        raise ValueError(
+            "smoothquant=True but no linear layers have _smooth_scale. "
+            "This checkpoint does not contain SmoothQuant scales."
+        )
 
     def eligible(m: nn.Module) -> bool:
         w = getattr(m, "weight", None)
@@ -198,13 +337,15 @@ def quantize_model(model: nn.Module, quant: str):
         return (o % 32 == 0) and (k % 32 == 0)
 
     new_linear = {
-        "w8a8": FP8W8A8Linear,
+        "intw8a8": partial(INT8W8A8GemLite, smoothquant=smoothquant),
+        "fp8w8a8": FP8W8A8Linear,
         "nvfp4": FP4Linear,
         "fp8": FP8Linear,
     }[quant]
 
-    for name, child in model.named_children():
-        setattr(model, name, new_linear(child)) if eligible(child) else quantize_model(
-            child, quant
-        )
+    def _recurse(m: nn.Module):
+        for name, child in m.named_children():
+            setattr(m, name, new_linear(child)) if eligible(child) else _recurse(child)
+
+    _recurse(model)
     return model

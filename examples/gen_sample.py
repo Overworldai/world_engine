@@ -1,5 +1,4 @@
-# python3 examples/gen_sample.py <model_uri>
-# e.g. python3 examples/gen_sample.py Overworld-Models/Lapp0-WP-Mini-1.4.5-BL-Distill
+# uv run --dev examples/gen_sample.py Overworld/Waypoint-1.5-1B
 
 import cv2
 import imageio.v3 as iio
@@ -13,20 +12,7 @@ from world_engine import WorldEngine, CtrlInput
 
 
 # Create inference engine
-engine = WorldEngine(sys.argv[1], device="cuda")
-
-
-# Set seed frame
-url = random.choice([
-    "https://gist.github.com/user-attachments/assets/d81c6d26-a838-4afe-9d13-fd67677043c3",
-    "https://gist.github.com/user-attachments/assets/b6d18c38-098e-43b0-8e61-66a16e5d8946",
-    "https://gist.github.com/user-attachments/assets/0734a8c1-3eb4-4ffe-8c37-5665c45ab559",
-    "https://gist.github.com/user-attachments/assets/f9c20d4d-7565-452d-8b02-42a85ea175ed",
-    "https://gist.github.com/user-attachments/assets/68c943a4-008a-4c25-948c-c81ab4c47d21",
-])
-frame = cv2.imdecode(np.frombuffer(urllib.request.urlopen(url).read(), np.uint8), cv2.IMREAD_COLOR)
-frame = cv2.resize(frame, (1024, 512))[:, :, ::-1]
-engine.append_frame(torch.from_numpy(np.repeat(frame[None], 4, axis=0)))
+engine = WorldEngine(sys.argv[1], quant=None, device="cuda")
 
 
 # Define sequence of controller inputs applied
@@ -46,8 +32,22 @@ controller_sequence += (
 controller_sequence += [CtrlInput()] * 10
 
 
+# Set seed frame
+url = random.choice([
+    "https://gist.github.com/user-attachments/assets/d81c6d26-a838-4afe-9d13-fd67677043c3",
+    "https://gist.github.com/user-attachments/assets/b6d18c38-098e-43b0-8e61-66a16e5d8946",
+    "https://gist.github.com/user-attachments/assets/0734a8c1-3eb4-4ffe-8c37-5665c45ab559",
+    "https://gist.github.com/user-attachments/assets/f9c20d4d-7565-452d-8b02-42a85ea175ed",
+    "https://gist.github.com/user-attachments/assets/68c943a4-008a-4c25-948c-c81ab4c47d21",
+])
+seed_frame = cv2.imdecode(np.frombuffer(urllib.request.urlopen(url).read(), np.uint8), cv2.IMREAD_COLOR)
+seed_frame_x4 = torch.from_numpy(np.repeat(seed_frame[None], 4, axis=0))
+
+
 # Generate frames conditioned on controller inputs
 with iio.imopen("out.mp4", "w", plugin="pyav") as out:
-    out.write(engine.gen_frame().cpu().numpy(), fps=60, codec="libx264")
+    engine.append_frame(seed_frame_x4)
+    out.write(seed_frame_x4, fps=60, codec="libx264")
     for ctrl in controller_sequence:
-        out.write(engine.gen_frame(ctrl=ctrl).cpu().numpy())
+        four_frames = engine.gen_frame(ctrl=ctrl).cpu().numpy()
+        out.write(four_frames)

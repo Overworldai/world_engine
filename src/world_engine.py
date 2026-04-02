@@ -25,12 +25,12 @@ COMPILE_OPTIONS = {
     # "shape_padding": True,
 }
 
-
+import time
 @dataclass
 class CtrlInput:
     button: Set[int] = field(default_factory=set)  # pressed button IDs
-    mouse: Tuple[float, float] = (0.0, 0.0)  # (x, y) velocity
-    scroll_wheel: int = 0  # bwd, stationary, or fwd -> (-1, 0, 1)
+    mouse: Tuple[float, float] = (0.0, 0.0)  # (dx, dy) velocity
+    scroll_wheel: int = 0  # down, stationary, or up -> (-1, 0, 1)
 
 
 class WorldEngine:
@@ -38,6 +38,7 @@ class WorldEngine:
         self,
         model_uri: str,
         quant: Optional[str] = None,
+        smooth: bool = False,
         model_config_overrides: Optional[Dict] = None,
         device=None,
         dtype=torch.bfloat16,
@@ -45,8 +46,9 @@ class WorldEngine:
     ):
         """
         model_uri: HF URI or local folder containing model.safetensors and config.yaml
-        quant: None | w8a8 | nvfp4
+        quant: None | intw8a8 | fp8w8a8 | nvfp4
         model_config_overrides: Dict to override model config values
+        - auto_aspect_ratio: set to False to work in ae raw space, otherwise in/out are 720p or 360p
         """
         self.device = torch.get_default_device() if device is None else device
         self.dtype = torch.get_default_dtype() if dtype is None else dtype
@@ -58,31 +60,35 @@ class WorldEngine:
 
         with torch.device(self.device):
             # Load Model / Modules
-            self.vae = get_ae(self.model_cfg.ae_uri, getattr(self.model_cfg, "taehv_ae", False), dtype=dtype)
+            self.vae = get_ae(
+                self.model_cfg.ae_uri,
+                is_taehv_ae=self.model_cfg.taehv_ae,
+                auto_aspect_ratio=self.model_cfg.auto_aspect_ratio,
+                dtype=dtype,
+                device=device,
+            )
 
             self.prompt_encoder = None
             if self.model_cfg.prompt_conditioning is not None:
-                pe_uri = getattr(self.model_cfg, "prompt_encoder_uri", "google/umt5-xl")
-                self.prompt_encoder = PromptEncoder(pe_uri, dtype=dtype).eval()
+                self.prompt_encoder = PromptEncoder(self.model_cfg.prompt_encoder_uri, dtype=dtype).eval()
 
             self.model = WorldModel.from_pretrained(
                 model_uri, cfg=self.model_cfg, device=self.device, dtype=dtype, load_weights=load_weights
             ).eval()
             apply_inference_patches(self.model)
             if quant is not None:
-                quantize_model(self.model, quant)
+                quantize_model(self.model, quant, smoothquant=smooth)
 
-            self.kv_cache = StaticKVCache(self.model_cfg, batch_size=1, dtype=dtype)
+            self.kv_cache = StaticKVCache(self.model_cfg, batch_size=1, dtype=dtype).to(device=device)
 
             # Inference Scheduler
-            self.scheduler_sigmas = torch.tensor(self.model_cfg.scheduler_sigmas, dtype=dtype)
+            self.scheduler_sigmas = torch.tensor(self.model_cfg.scheduler_sigmas, dtype=dtype, device=device)
 
-            pH, pW = getattr(self.model_cfg, "patch", [1, 1])
+            pH, pW = self.model_cfg.patch
             self.frm_shape = 1, 1, self.model_cfg.channels, self.model_cfg.height * pH, self.model_cfg.width * pW
 
             # State
-            inference_fps = getattr(self.model_cfg, "inference_fps", self.model_cfg.base_fps)
-            latent_fps = inference_fps / getattr(self.model_cfg, "temporal_compression", 1)
+            latent_fps = self.model_cfg.inference_fps / self.model_cfg.temporal_compression
             self.ts_mult = int(self.model_cfg.base_fps) // latent_fps
             self.frame_ts = torch.tensor([[0]], dtype=torch.long)
 
@@ -141,8 +147,12 @@ class WorldEngine:
 
     @torch.compile
     def _prep_inputs(self, x, ctrl=None):
+        self._ctx["button"].zero_()
+        self._ctx["button"][..., ctrl.button] = 1.0
+
         self._ctx["mouse"][0, 0, 0] = ctrl.mouse[0]
         self._ctx["mouse"][0, 0, 1] = ctrl.mouse[1]
+
         self._ctx["scroll"][0, 0, 0] = ctrl.scroll_wheel
 
         self._ctx["frame_idx"].copy_(self.frame_ts)
@@ -153,11 +163,9 @@ class WorldEngine:
 
     def prep_inputs(self, x, ctrl=None):
         ctrl = ctrl if ctrl is not None else CtrlInput()
-        self._ctx["button"].zero_()
-        if ctrl.button:
-            self._ctx["button"][..., list(ctrl.button)] = 1.0
-        ctrl.mouse = torch.as_tensor(ctrl.mouse, device=x.device, dtype=self.dtype)
-        ctrl.scroll_wheel = torch.sign(torch.as_tensor(ctrl.scroll_wheel, device=x.device, dtype=self.dtype))
+        ctrl.button = torch.as_tensor(list(ctrl.button), dtype=torch.int64).to(x.device, non_blocking=True)
+        ctrl.mouse = torch.as_tensor(ctrl.mouse).to(x.device, non_blocking=True)
+        ctrl.scroll_wheel = torch.as_tensor(ctrl.scroll_wheel).to(x.device, non_blocking=True)
         ctx = self._prep_inputs(x, ctrl)
 
         # prepare prompt conditioning

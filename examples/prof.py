@@ -1,3 +1,9 @@
+"""
+Additional Dependencies: N/A
+Run: `python3 examples/prof.py Overworld/Waypoint-1.5-1B`
+"""
+import sys
+
 import torch
 from torch.profiler import profile, ProfilerActivity
 
@@ -5,7 +11,7 @@ from world_engine import WorldEngine
 
 
 def do_profile(n_frames=64, row_limit=20):
-    engine = WorldEngine("OpenWorldLabs/CoDCtl-Causal-Flux-SelfForcing", device="cuda")
+    engine = WorldEngine(sys.argv[1], device="cuda")
     # warmup
     for _ in range(4):
         engine.gen_frame()

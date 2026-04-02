@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from .model.nn import rms_norm
 from .model.attn import Attn
 from .model.world_model import MLPFusion
+from .quantize import merge_qkv_smoothscales
 from torch.nn.attention.flex_attention import flex_attention
 
 
@@ -110,6 +111,8 @@ class MergedQKVAttn(Attn):
             self.qkv_proj.weight.copy_(torch.cat(
                 [self.q_proj.weight, self.k_proj.weight, self.v_proj.weight], dim=0
             ))
+
+        merge_qkv_smoothscales(self, src)
 
         del self.q_proj, self.k_proj, self.v_proj
 
