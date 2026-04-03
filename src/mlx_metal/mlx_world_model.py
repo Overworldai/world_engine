@@ -522,7 +522,6 @@ class TransformerBlock(nn.Module):
                 x_2d, mx.reshape(s1, (-1,)), mx.reshape(b1, (-1,)),
                 smooth_scale=self.mlp.fc1.smooth_scale,
             )
-            mx.eval(fc1_q, fc1_scales)  # workaround: flush fused quant before GEMM reads it
             mo = self.mlp(None, fc1_q=fc1_q, fc1_scales=fc1_scales)
         else:
             x4_m = mx.reshape(x, (1, 1, T, D_MODEL))

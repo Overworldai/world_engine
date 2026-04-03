@@ -83,7 +83,7 @@ void W8A8Gemm::eval_gpu(
 
   auto mtl_lib = d.get_library("we_kernels", lib_path());
 
-  auto& enc = d.get_command_encoder(s.index);
+  auto& enc = mx::metal::get_command_encoder(s);
 
   enc.set_input_array(x_q, 0);
   enc.set_input_array(w_q, 1);
@@ -162,7 +162,7 @@ void FusedSiLUQuant::eval_gpu(
   auto mtl_lib = d.get_library("we_kernels", lib_path());
   auto kernel = d.get_kernel("fused_silu_quant", mtl_lib);
 
-  auto& enc = d.get_command_encoder(s.index);
+  auto& enc = mx::metal::get_command_encoder(s);
   enc.set_compute_pipeline_state(kernel);
 
   enc.set_input_array(x, 0);
@@ -216,7 +216,7 @@ void FusedRMSNormQuant::eval_gpu(
   auto& d = mx::metal::device(s.device);
   auto mtl_lib = d.get_library("we_kernels", lib_path());
 
-  auto& enc = d.get_command_encoder(s.index);
+  auto& enc = mx::metal::get_command_encoder(s);
 
   struct Params { uint32_t M; uint32_t K; float eps; };
   Params params{M_, K_, eps_};

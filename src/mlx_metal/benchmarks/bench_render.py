@@ -51,7 +51,7 @@ def main():
     parser.add_argument("--model-uri", default=MODEL_URI)
     parser.add_argument("--seed-image", default=str(SEED_IMAGE))
     parser.add_argument("--profile", choices=["fp16", "speed", "max_qat"], default="speed")
-    parser.add_argument("--frames", type=int, default=10, help="Number of frames to generate")
+    parser.add_argument("--frames", type=int, default=20, help="Number of frames to generate")
     parser.add_argument("--warmup-frames", type=int, default=3, help="Warmup frames (not timed)")
     parser.add_argument("--save-frames", action="store_true", help="Save rendered frames as PNGs")
     parser.add_argument("--out-dir", default="bench_render_output", help="Output directory for saved frames")

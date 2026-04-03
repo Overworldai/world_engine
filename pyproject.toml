@@ -30,7 +30,7 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-mlx = { git = "https://github.com/ml-explore/mlx.git", branch = "main" }
+mlx = { git = "https://github.com/Clydingus/mlx.git", branch = "fix/sdpa-nax-int16-overflow" }
 we-kernels = { path = "src/mlx_metal/ext", editable = true }
 
 [tool.uv]

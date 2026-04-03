@@ -621,8 +621,8 @@ wheels = [
 
 [[package]]
 name = "mlx"
-version = "0.31.2.dev20260331+117b4f18"
-source = { git = "https://github.com/ml-explore/mlx.git?branch=main#117b4f18061be46acd91c2d50ac45bfd3094f32f" }
+version = "0.31.2.dev20260404+ccfad158"
+source = { git = "https://github.com/Clydingus/mlx.git?branch=fix%2Fsdpa-nax-int16-overflow#ccfad158de60610d7a8128c83d007202ce85479c" }
 
 [[package]]
 name = "mpmath"
@@ -1902,7 +1902,7 @@ requires-dist = [
     { name = "ftfy" },
     { name = "gemlite" },
     { name = "huggingface-hub", specifier = ">=1.7.0" },
-    { name = "mlx", marker = "sys_platform == 'darwin'", git = "https://github.com/ml-explore/mlx.git?branch=main" },
+    { name = "mlx", marker = "sys_platform == 'darwin'", git = "https://github.com/Clydingus/mlx.git?branch=fix%2Fsdpa-nax-int16-overflow" },
     { name = "nanobind", marker = "sys_platform == 'darwin'", specifier = "==2.10.2" },
     { name = "omegaconf" },
     { name = "taehv", git = "https://github.com/madebyollin/taehv.git?rev=7dc60ec6601af2e668e31bc70acc4cb3665e4c22" },
