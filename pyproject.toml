@@ -27,6 +27,7 @@ dependencies = [
   "nanobind==2.10.2; sys_platform == 'darwin'",
   "cmake>=3.27; sys_platform == 'darwin'",
   "we-kernels; sys_platform == 'darwin'",
+  "matplotlib>=3.10.8",
 ]
 
 [tool.uv.sources]

@@ -134,4 +134,60 @@ Args:
 
 Returns:
     list[int8 x_q [M, K], fp32 x_scales [M]])");
+
+  m.def(
+      "fused_qkv_norm_rope",
+      [](const mx::array& qkv,
+         const mx::array& rope_cos,
+         const mx::array& rope_sin,
+         uint32_t n_q, uint32_t n_k, uint32_t n_v,
+         float eps) {
+        return we_kernels::fused_qkv_norm_rope(qkv, rope_cos, rope_sin, n_q, n_k, n_v, eps);
+      },
+      nb::arg("qkv"),
+      nb::arg("rope_cos"),
+      nb::arg("rope_sin"),
+      nb::arg("n_q"),
+      nb::arg("n_k"),
+      nb::arg("n_v"),
+      nb::arg("eps") = 1e-5f,
+      R"(Fused QKV split + per-head RMSNorm + OrthoRoPE.
+
+Args:
+    qkv: fp16 [T, (N_Q+N_K+N_V)*D_HEAD] — flat QKV from GEMM
+    rope_cos: fp16 [T, D_ROPE] — precomputed cos angles
+    rope_sin: fp16 [T, D_ROPE] — precomputed sin angles
+    n_q: number of Q heads
+    n_k: number of K heads
+    n_v: number of V heads
+    eps: RMSNorm epsilon
+
+Returns:
+    list[fp16 q [N_Q, T, D_HEAD], fp16 k [N_K, T, D_HEAD], fp16 v [N_V, T, D_HEAD]])");
+
+  m.def(
+      "ring_flash_attention",
+      [](const mx::array& Q,
+         const mx::array& K,
+         const mx::array& V,
+         const mx::array& written,
+         float scale) {
+        return we_kernels::ring_flash_attention(Q, K, V, written, scale);
+      },
+      nb::arg("Q"),
+      nb::arg("K"),
+      nb::arg("V"),
+      nb::arg("written"),
+      nb::arg("scale"),
+      R"(Ring-buffer flash attention.
+
+Args:
+    Q: fp16 [N_H, T, D_HEAD] — query
+    K: fp16 [N_H, capacity, D_HEAD] — key cache
+    V: fp16 [N_H, capacity, D_HEAD] — value cache
+    written: fp16 [capacity] — 1.0 for valid, 0.0 for empty
+    scale: float — 1/sqrt(D_HEAD)
+
+Returns:
+    fp16 [N_H, T, D_HEAD])");
 }

@@ -117,6 +117,71 @@ def w8a8_gemm_prequantized(
     return _ext.w8a8_gemm(x_q, weight_q, x_scales, w_scales, bias_data)
 
 
+def ring_flash_attention(
+    Q: mx.array,
+    K: mx.array,
+    V: mx.array,
+    written: mx.array,
+    scale: float,
+) -> mx.array:
+    """Ring-buffer flash attention.
+
+    Custom SDPA that skips unwritten KV cache slots using the written bitvector.
+    Uses online softmax — no materialized attention matrix.
+
+    Parameters
+    ----------
+    Q : mx.array, fp16, shape [N_H, T, D_HEAD]
+    K : mx.array, fp16, shape [N_H, capacity, D_HEAD]
+    V : mx.array, fp16, shape [N_H, capacity, D_HEAD]
+    written : mx.array, fp16, shape [capacity] — 1.0 valid, 0.0 empty
+    scale : float — typically 1/sqrt(D_HEAD)
+
+    Returns
+    -------
+    mx.array, fp16, shape [N_H, T, D_HEAD]
+    """
+    Q_3d = Q.astype(mx.float16)
+    K_3d = K.astype(mx.float16)
+    V_3d = V.astype(mx.float16)
+    w = written.astype(mx.float16)
+    return _ext.ring_flash_attention(Q_3d, K_3d, V_3d, w, scale)
+
+
+def fused_qkv_norm_rope(
+    qkv: mx.array,
+    rope_cos: mx.array,
+    rope_sin: mx.array,
+    n_q: int,
+    n_k: int,
+    n_v: int,
+    eps: float = 1e-5,
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Fused QKV split + per-head RMSNorm + OrthoRoPE.
+
+    Takes flat QKV GEMM output and produces head-split Q, K (with norm+rope)
+    and V (transposed only). Eliminates separate split/reshape/norm/rope ops.
+
+    Parameters
+    ----------
+    qkv : mx.array, fp16, shape [T, (N_Q+N_K+N_V)*D_HEAD]
+    rope_cos : mx.array, fp16, shape [T, D_ROPE]
+    rope_sin : mx.array, fp16, shape [T, D_ROPE]
+    n_q, n_k, n_v : number of Q, K, V heads
+    eps : RMSNorm epsilon
+
+    Returns
+    -------
+    tuple of (q [N_Q, T, D_HEAD], k [N_K, T, D_HEAD], v [N_V, T, D_HEAD])
+    """
+    qkv_2d = mx.reshape(qkv, (-1, qkv.shape[-1])).astype(mx.float16)
+    # rope_cos/sin come as [1, 1, T, D_ROPE] — flatten to [T, D_ROPE]
+    rc = mx.reshape(rope_cos, (-1, rope_cos.shape[-1])).astype(mx.float16)
+    rs = mx.reshape(rope_sin, (-1, rope_sin.shape[-1])).astype(mx.float16)
+    result = _ext.fused_qkv_norm_rope(qkv_2d, rc, rs, n_q, n_k, n_v, eps)
+    return result[0], result[1], result[2]
+
+
 def w8a8_silu_gemm_nax(
     x: mx.array,
     weight_q: mx.array,

@@ -42,22 +42,50 @@ inline void store_scaled(
     constexpr short _TN = DTile::kTileCols;
     const short2 sc = BaseNAXFrag::get_coord();
 
-    STEEL_PRAGMA_UNROLL
-    for (short fi = 0; fi < _TM; fi++) {
+    // Fast path: interior tile, no bounds checks, vectorized 4-wide half stores
+    const bool full_tile = (m_base + sc.y + (_TM - 1) * 16 + 8 < M) &&
+                           (n_base + sc.x + (_TN - 1) * 16 + 4 <= N);
+
+    if (full_tile) {
         STEEL_PRAGMA_UNROLL
-        for (short fj = 0; fj < _TN; fj++) {
-            thread auto& frag = Dtile.frag_at(fi, fj);
+        for (short fi = 0; fi < _TM; fi++) {
             STEEL_PRAGMA_UNROLL
-            for (short i = 0; i < 2; i++) {
-                uint gm = m_base + sc.y + fi * 16 + i * 8;
-                if (gm >= M) continue;
-                float x_sc = x_scales[gm];
+            for (short fj = 0; fj < _TN; fj++) {
+                thread auto& frag = Dtile.frag_at(fi, fj);
                 STEEL_PRAGMA_UNROLL
-                for (short j = 0; j < 4; j++) {
-                    uint gn = n_base + sc.x + fj * 16 + j;
-                    if (gn >= N) continue;
-                    float val = (float)frag[i * 4 + j] * x_sc * w_scales[gn] + bias[gn];
-                    dst[gm * N + gn] = (half)val;
+                for (short i = 0; i < 2; i++) {
+                    uint gm = m_base + sc.y + fi * 16 + i * 8;
+                    float x_sc = x_scales[gm];
+                    uint gn = n_base + sc.x + fj * 16;
+                    // Vectorized: compute 4 values and store as half4
+                    half4 out_vec;
+                    out_vec[0] = (half)((float)frag[i * 4 + 0] * x_sc * w_scales[gn + 0] + bias[gn + 0]);
+                    out_vec[1] = (half)((float)frag[i * 4 + 1] * x_sc * w_scales[gn + 1] + bias[gn + 1]);
+                    out_vec[2] = (half)((float)frag[i * 4 + 2] * x_sc * w_scales[gn + 2] + bias[gn + 2]);
+                    out_vec[3] = (half)((float)frag[i * 4 + 3] * x_sc * w_scales[gn + 3] + bias[gn + 3]);
+                    *reinterpret_cast<device half4*>(dst + gm * N + gn) = out_vec;
+                }
+            }
+        }
+    } else {
+        // Edge tile: scalar stores with bounds checks
+        STEEL_PRAGMA_UNROLL
+        for (short fi = 0; fi < _TM; fi++) {
+            STEEL_PRAGMA_UNROLL
+            for (short fj = 0; fj < _TN; fj++) {
+                thread auto& frag = Dtile.frag_at(fi, fj);
+                STEEL_PRAGMA_UNROLL
+                for (short i = 0; i < 2; i++) {
+                    uint gm = m_base + sc.y + fi * 16 + i * 8;
+                    if (gm >= M) continue;
+                    float x_sc = x_scales[gm];
+                    STEEL_PRAGMA_UNROLL
+                    for (short j = 0; j < 4; j++) {
+                        uint gn = n_base + sc.x + fj * 16 + j;
+                        if (gn >= N) continue;
+                        float val = (float)frag[i * 4 + j] * x_sc * w_scales[gn] + bias[gn];
+                        dst[gm * N + gn] = (half)val;
+                    }
                 }
             }
         }

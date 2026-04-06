@@ -101,9 +101,9 @@ void W8A8Gemm::eval_gpu(
   if (M_ < MATVEC_LIMIT && K_ % 1024 == 0) {
     auto kernel = d.get_kernel("w8a8_matvec", mtl_lib);
     enc.set_compute_pipeline_state(kernel);
-    constexpr int BN_MV = 8; // from matvec kernel
+    constexpr int BN_MV = 32; // from matvec kernel: 4 SGs × 8 results each
     MTL::Size grid_dims(M_, (N_ + BN_MV - 1) / BN_MV, 1);
-    MTL::Size group_dims(64, 1, 1); // 2 simdgroups × 32
+    MTL::Size group_dims(128, 1, 1); // 4 simdgroups × 32
     enc.dispatch_threadgroups(grid_dims, group_dims);
   } else {
     const auto& tile = select_tile(M_, N_, K_);
@@ -352,6 +352,160 @@ std::vector<mx::array> fused_rmsnorm_adaln_smooth_quant(
        mx::contiguous(adaln_s, false, stream),
        mx::contiguous(adaln_b, false, stream),
        mx::contiguous(smooth_scale, false, stream)});
+}
+
+// ===========================================================================
+// Fused QKV split + per-head RMSNorm + OrthoRoPE
+// ===========================================================================
+
+void FusedQKVNormRoPE::eval_cpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  throw std::runtime_error("FusedQKVNormRoPE: CPU not supported");
+}
+
+void FusedQKVNormRoPE::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& qkv = inputs[0];
+  auto& rope_cos = inputs[1];
+  auto& rope_sin = inputs[2];
+  auto& q_out = outputs[0];
+  auto& k_out = outputs[1];
+  auto& v_out = outputs[2];
+
+  q_out.set_data(mx::allocator::malloc(q_out.nbytes()));
+  k_out.set_data(mx::allocator::malloc(k_out.nbytes()));
+  v_out.set_data(mx::allocator::malloc(v_out.nbytes()));
+
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+  auto mtl_lib = d.get_library("we_kernels", lib_path());
+  auto kernel = d.get_kernel("fused_qkv_norm_rope", mtl_lib);
+
+  auto& enc = mx::metal::get_command_encoder(s);
+  enc.set_compute_pipeline_state(kernel);
+
+  enc.set_input_array(qkv, 0);
+  enc.set_output_array(q_out, 1);
+  enc.set_output_array(k_out, 2);
+  enc.set_output_array(v_out, 3);
+  enc.set_input_array(rope_cos, 4);
+  enc.set_input_array(rope_sin, 5);
+
+  struct Params {
+    uint32_t T, N_Q, N_K, N_V, D_HEAD, D_ROPE;
+    float eps;
+  };
+  Params params{T_, N_Q_, N_K_, N_V_, D_HEAD_, D_ROPE_, eps_};
+  enc.set_bytes(params, 6);
+
+  uint32_t N_TOTAL = N_Q_ + N_K_ + N_V_;
+  MTL::Size grid(T_, N_TOTAL, 1);
+  MTL::Size group(32, 1, 1);  // one simdgroup per (token, head)
+  enc.dispatch_threadgroups(grid, group);
+}
+
+std::vector<mx::array> fused_qkv_norm_rope(
+    const mx::array& qkv,
+    const mx::array& rope_cos,
+    const mx::array& rope_sin,
+    uint32_t N_Q, uint32_t N_K, uint32_t N_V,
+    float eps,
+    mx::StreamOrDevice s) {
+  uint32_t T = static_cast<uint32_t>(qkv.shape(0));
+  uint32_t QKV_DIM = static_cast<uint32_t>(qkv.shape(1));
+  uint32_t N_TOTAL = N_Q + N_K + N_V;
+  uint32_t D_HEAD = QKV_DIM / N_TOTAL;
+  uint32_t D_ROPE = D_HEAD / 2;
+
+  auto stream = mx::to_stream(s);
+  int iT = static_cast<int>(T);
+  int iD = static_cast<int>(D_HEAD);
+  return mx::array::make_arrays(
+      {mx::Shape{static_cast<int>(N_Q), iT, iD},
+       mx::Shape{static_cast<int>(N_K), iT, iD},
+       mx::Shape{static_cast<int>(N_V), iT, iD}},
+      {mx::float16, mx::float16, mx::float16},
+      std::make_shared<FusedQKVNormRoPE>(stream, T, N_Q, N_K, N_V, D_HEAD, D_ROPE, eps),
+      {mx::contiguous(qkv, false, stream),
+       mx::contiguous(rope_cos, false, stream),
+       mx::contiguous(rope_sin, false, stream)});
+}
+
+// ===========================================================================
+// Ring-buffer flash attention
+// ===========================================================================
+
+void RingFlashAttention::eval_cpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  throw std::runtime_error("RingFlashAttention: CPU not supported");
+}
+
+void RingFlashAttention::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& Q = inputs[0];
+  auto& K = inputs[1];
+  auto& V = inputs[2];
+  auto& written = inputs[3];
+  auto& O = outputs[0];
+
+  O.set_data(mx::allocator::malloc(O.nbytes()));
+
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+  auto mtl_lib = d.get_library("we_kernels", lib_path());
+  auto kernel = d.get_kernel("ring_flash_attention", mtl_lib);
+
+  auto& enc = mx::metal::get_command_encoder(s);
+  enc.set_compute_pipeline_state(kernel);
+
+  enc.set_input_array(Q, 0);
+  enc.set_input_array(K, 1);
+  enc.set_input_array(V, 2);
+  enc.set_input_array(written, 3);
+  enc.set_output_array(O, 4);
+
+  struct Params {
+    uint32_t N_Q_HEADS, N_KV_HEADS, T, CAPACITY, D_HEAD;
+    float scale;
+  };
+  Params params{N_Q_, N_KV_, T_, capacity_, D_HEAD_, scale_};
+  enc.set_bytes(params, 5);
+
+  // One threadgroup per (q_block, q_head), BQ=16 queries per block
+  constexpr uint32_t BQ = 16;
+  uint32_t q_blocks = (T_ + BQ - 1) / BQ;
+  MTL::Size grid(q_blocks, N_Q_, 1);
+  MTL::Size group(128, 1, 1);  // 4 simdgroups
+  enc.dispatch_threadgroups(grid, group);
+}
+
+mx::array ring_flash_attention(
+    const mx::array& Q,
+    const mx::array& K,
+    const mx::array& V,
+    const mx::array& written,
+    float scale,
+    mx::StreamOrDevice s) {
+  // Q: [N_Q, T, D], K/V: [N_KV, capacity, D], written: [capacity]
+  uint32_t N_Q = static_cast<uint32_t>(Q.shape(0));
+  uint32_t N_KV = static_cast<uint32_t>(K.shape(0));
+  uint32_t T = static_cast<uint32_t>(Q.shape(1));
+  uint32_t D = static_cast<uint32_t>(Q.shape(2));
+  uint32_t capacity = static_cast<uint32_t>(K.shape(1));
+
+  auto stream = mx::to_stream(s);
+  return mx::array(
+      {static_cast<int>(N_Q), static_cast<int>(T), static_cast<int>(D)},
+      mx::float16,
+      std::make_shared<RingFlashAttention>(stream, N_Q, N_KV, T, capacity, D, scale),
+      {mx::contiguous(Q, false, stream),
+       mx::contiguous(K, false, stream),
+       mx::contiguous(V, false, stream),
+       mx::contiguous(written, false, stream)});
 }
 
 }  // namespace we_kernels

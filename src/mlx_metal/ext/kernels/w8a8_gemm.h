@@ -125,4 +125,81 @@ std::vector<mx::array> fused_rmsnorm_adaln_smooth_quant(
     float eps = 1e-5f,
     mx::StreamOrDevice s = {});
 
+// Fused QKV split + per-head RMSNorm + OrthoRoPE
+class FusedQKVNormRoPE : public mx::Primitive {
+ public:
+  FusedQKVNormRoPE(mx::Stream stream, uint32_t T, uint32_t N_Q, uint32_t N_K,
+                    uint32_t N_V, uint32_t D_HEAD, uint32_t D_ROPE, float eps)
+      : mx::Primitive(stream), T_(T), N_Q_(N_Q), N_K_(N_K), N_V_(N_V),
+        D_HEAD_(D_HEAD), D_ROPE_(D_ROPE), eps_(eps) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  const char* name() const override { return "FusedQKVNormRoPE"; }
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override {
+    int T = static_cast<int>(T_);
+    int D = static_cast<int>(D_HEAD_);
+    return {mx::Shape{static_cast<int>(N_Q_), T, D},
+            mx::Shape{static_cast<int>(N_K_), T, D},
+            mx::Shape{static_cast<int>(N_V_), T, D}};
+  }
+
+ private:
+  uint32_t T_, N_Q_, N_K_, N_V_, D_HEAD_, D_ROPE_;
+  float eps_;
+};
+
+std::vector<mx::array> fused_qkv_norm_rope(
+    const mx::array& qkv,
+    const mx::array& rope_cos,
+    const mx::array& rope_sin,
+    uint32_t N_Q, uint32_t N_K, uint32_t N_V,
+    float eps = 1e-5f,
+    mx::StreamOrDevice s = {});
+
+// Ring-buffer flash attention with GQA support
+class RingFlashAttention : public mx::Primitive {
+ public:
+  RingFlashAttention(mx::Stream stream, uint32_t N_Q, uint32_t N_KV,
+                     uint32_t T, uint32_t capacity, uint32_t D_HEAD, float scale)
+      : mx::Primitive(stream), N_Q_(N_Q), N_KV_(N_KV), T_(T),
+        capacity_(capacity), D_HEAD_(D_HEAD), scale_(scale) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  const char* name() const override { return "RingFlashAttention"; }
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override {
+    return {mx::Shape{static_cast<int>(N_Q_), static_cast<int>(T_),
+                      static_cast<int>(D_HEAD_)}};
+  }
+
+ private:
+  uint32_t N_Q_, N_KV_, T_, capacity_, D_HEAD_;
+  float scale_;
+};
+
+mx::array ring_flash_attention(
+    const mx::array& Q,
+    const mx::array& K,
+    const mx::array& V,
+    const mx::array& written,
+    float scale,
+    mx::StreamOrDevice s = {});
+
 }  // namespace we_kernels

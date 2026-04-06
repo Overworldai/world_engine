@@ -16,6 +16,8 @@ import numpy as np
 from we_kernels import w8a8_gemm_nax
 from we_kernels import fused_silu_quant, fused_rmsnorm_adaln_quant, w8a8_gemm_prequantized, w8a8_silu_gemm_nax
 
+DTYPE = mx.float16
+
 N_LAYERS = 24
 D_MODEL = 2048
 N_HEADS = 32
@@ -335,8 +337,8 @@ def compute_rope_angles(frame_idx: int, ts_mult: float, rope_xy: mx.array, rope_
     y_norm = (2.0 * (idx // WP).astype(mx.float32) + 1.0) / HP - 1.0
     t_val = mx.full((T,), float(frame_idx * ts_mult), dtype=mx.float32)
     freqs = mx.concatenate([mx.expand_dims(x_norm, -1) * rope_xy, mx.expand_dims(y_norm, -1) * rope_xy, mx.expand_dims(t_val, -1) * rope_inv_t], axis=-1)
-    cos = mx.reshape(mx.cos(freqs), (1, 1, T, D_ROPE)).astype(mx.float16)
-    sin = mx.reshape(mx.sin(freqs), (1, 1, T, D_ROPE)).astype(mx.float16)
+    cos = mx.reshape(mx.cos(freqs), (1, 1, T, D_ROPE)).astype(DTYPE)
+    sin = mx.reshape(mx.sin(freqs), (1, 1, T, D_ROPE)).astype(DTYPE)
     return cos, sin
 
 
@@ -346,8 +348,8 @@ class RingKVCache:
         self.L = L
         self.dilation = dilation
         self.num_buckets = num_buckets
-        self.keys = mx.zeros((1, N_KV_HEADS, capacity, D_HEAD), dtype=mx.float16)
-        self.values = mx.zeros((1, N_KV_HEADS, capacity, D_HEAD), dtype=mx.float16)
+        self.keys = mx.zeros((1, N_KV_HEADS, capacity, D_HEAD), dtype=DTYPE)
+        self.values = mx.zeros((1, N_KV_HEADS, capacity, D_HEAD), dtype=DTYPE)
         self.written = mx.concatenate([mx.zeros((L,)), mx.ones((T,))]).astype(mx.float16)
 
     def set_frozen(self, frozen: bool):
@@ -356,18 +358,14 @@ class RingKVCache:
     def upsert(self, k_new: mx.array, v_new: mx.array, frame_idx: int) -> Tuple[mx.array, mx.array, mx.array]:
         """Write current frame to tail, build mask, optionally persist to ring.
 
-        Mirrors PyTorch's LayerKVCache.upsert() exactly:
-          1. Always write tail [L, L+T) — authoritative copy of current frame
-          2. Build attention mask — always hide the ring slot this frame maps to
-          3. If not frozen, persist tail to ring for future frames
-
         Returns (keys, values, mask) for attention.
+        Compact mode: gathers only written slots for mask-free SDPA.
         """
         # 1. Always write current frame to tail
         self.keys[:, :, self.L:self.L + T, :] = k_new
         self.values[:, :, self.L:self.L + T, :] = v_new
 
-        # 2. Build mask: start from written, mask out the ring slot we'd write to
+        # 2. Build effective written mask (hiding stale ring slot)
         w = self.written
         write_step = (frame_idx % self.dilation) == 0
         if self.num_buckets > 0 and write_step:
@@ -377,9 +375,17 @@ class RingKVCache:
             indices = mx.arange(self.capacity)
             stale = ((indices >= ring_start) & (indices < ring_start + T)).astype(mx.float16)
             w = w * (1 - stale)
+
+        # 3. Gather compact K/V at written indices (mask-free SDPA)
+        import numpy as np
+        w_np = np.array(w)
+        valid_idx = mx.array(np.where(w_np > 0.5)[0].astype(np.int32))
+        k_compact = self.keys[:, :, valid_idx, :]
+        v_compact = self.values[:, :, valid_idx, :]
+
         mask = mx.reshape(w, (1, 1, 1, -1)) * 1e4 - 1e4
 
-        # 3. Persist to ring (only when unfrozen — cache_write pass)
+        # 4. Persist to ring (only when unfrozen — cache_write pass)
         if write_step and self.num_buckets > 0 and not getattr(self, "frozen", False):
             bucket = (frame_idx + (self.dilation - 1)) // self.dilation
             slot = bucket % self.num_buckets
@@ -388,7 +394,7 @@ class RingKVCache:
             self.values[:, :, rs:rs + T, :] = v_new
             self.written[rs:rs + T] = mx.ones((T,), dtype=mx.float16)
 
-        return self.keys, self.values, mask
+        return k_compact, v_compact, mask
 
 
 class MLP(nn.Module):
@@ -500,9 +506,9 @@ class TransformerBlock(nn.Module):
         q = ortho_rope(mx.fast.rms_norm(q, None, 1e-5), rope_cos, rope_sin)
         k_new = ortho_rope(mx.fast.rms_norm(k_new, None, 1e-5), rope_cos, rope_sin)
 
-        # KV cache upsert: write tail, build mask, optionally persist to ring
-        k_attn, v_attn, mask = kv_cache.upsert(k_new, v_new, frame_idx)
-        y = mx.fast.scaled_dot_product_attention(q, k_attn, v_attn, scale=D_HEAD ** -0.5, mask=mask)
+        # KV cache upsert — compact gather for mask-free SDPA
+        k_compact, v_compact, _mask = kv_cache.upsert(k_new, v_new, frame_idx)
+        y = mx.fast.scaled_dot_product_attention(q, k_compact, v_compact, scale=D_HEAD ** -0.5)
         y = mx.reshape(y.transpose(0, 2, 1, 3), (1, T, N_HEADS * D_HEAD))
         y = self.attn.out_proj(y)
         x4_y = mx.reshape(y, (1, 1, T, D_MODEL))
@@ -594,12 +600,12 @@ class MLXWorldModel(nn.Module):
         emb = mx.concatenate([mx.sin(phase), mx.cos(phase)], axis=-1) * (2 ** 0.5)
         mlp = self.denoise_step_emb.mlp
         emb = mlp.fc2(nn.silu(mlp.fc1(emb)))
-        return mx.reshape(emb, (1, 1, D_MODEL)).astype(mx.float16)
+        return mx.reshape(emb, (1, 1, D_MODEL)).astype(DTYPE)
 
     def ctrl_embed(self, mouse, button, scroll) -> mx.array:
         inp = mx.concatenate([mouse, button, scroll], axis=-1)
         mlp = self.ctrl_emb.mlp
-        return mlp.fc2(nn.silu(mlp.fc1(inp))).astype(mx.float16) + 1e-7
+        return mlp.fc2(nn.silu(mlp.fc1(inp))).astype(DTYPE) + 1e-7
 
     def forward_single(self, x: mx.array, cond: mx.array, rope_cos: mx.array, rope_sin: mx.array, mouse: mx.array, button: mx.array, scroll: mx.array, frame_idx: int) -> mx.array:
         ctrl_emb = self.ctrl_embed(mouse, button, scroll)
@@ -650,7 +656,7 @@ def _extract_smooth_scales(pt_model) -> dict:
             continue
         # e.g. 'transformer.blocks.0.attn.q_proj._smooth_scale' -> 'transformer.blocks.0.attn.q_proj'
         layer_path = name[: -len("._smooth_scale")]
-        arr = mx.array(buf.detach().float().numpy()).astype(mx.float16)
+        arr = mx.array(buf.detach().float().numpy()).astype(DTYPE)
         smooth_scales[layer_path] = arr
     return smooth_scales
 
@@ -675,7 +681,7 @@ def load_from_pytorch(model_uri: str, int8_profile: Optional[str] = "speed", kv_
     SIGMAS = list(cfg.scheduler_sigmas)
     DSIGMAS = [SIGMAS[i + 1] - SIGMAS[i] for i in range(len(SIGMAS) - 1)]
 
-    pt_model = WorldModel.from_pretrained(model_uri, cfg=cfg, device="cpu", dtype=torch.float16).eval()
+    pt_model = WorldModel.from_pretrained(model_uri, cfg=cfg, device="cpu", dtype=torch.bfloat16).eval()
     mlx_model = MLXWorldModel(cfg, kv_cache_mode=kv_cache_mode, attention_mode=attention_mode)
 
     # Extract SmoothQuant scales before weight conversion
@@ -685,7 +691,7 @@ def load_from_pytorch(model_uri: str, int8_profile: Optional[str] = "speed", kv_
 
     weights = []
     for name, param in pt_model.named_parameters():
-        arr = mx.array(param.detach().float().numpy()).astype(mx.float16)
+        arr = mx.array(param.detach().float().numpy()).astype(DTYPE)
         # MLX model uses transformer[i] (plain list), PyTorch uses transformer.blocks[i]
         name = name.replace("transformer.blocks.", "transformer.")
         if name == "patchify.weight":
@@ -706,9 +712,9 @@ def load_from_pytorch(model_uri: str, int8_profile: Optional[str] = "speed", kv_
     mlx_model.rope_inv_t = mx.array(pt_model.transformer.rope_angles.inv_t.detach().float().numpy())
     mlx_model.denoise_step_emb.freq = mx.array(pt_model.denoise_step_emb.freq.detach().float().numpy())
     from mlx.utils import tree_map
-    def cast_fp16(x):
-        return x.astype(mx.float16) if isinstance(x, mx.array) and x.dtype == mx.float32 and x.ndim >= 2 else x
-    mlx_model.update(tree_map(cast_fp16, mlx_model.parameters()))
+    def cast_dtype(x):
+        return x.astype(DTYPE) if isinstance(x, mx.array) and x.dtype == mx.float32 and x.ndim >= 2 else x
+    mlx_model.update(tree_map(cast_dtype, mlx_model.parameters()))
     if int8_profile is not None:
         stats = enable_int8_nax_profile(mlx_model, int8_profile, smooth_scales=smooth_scales if smooth_scales else None)
         mlx_model.int8_profile = int8_profile

@@ -1,10 +1,13 @@
 // W8A8 matrix-vector kernel for M=1..4 (single/few-token decode)
 //
-// SIMD dot-product with 128-bit vector loads — each thread loads 32 int8
-// values via 2x int4 (16-byte) reads, computes partial dot product,
-// then simd_sum reduces across 32 lanes.
+// v2: Wider tiles (BN=32) with 4 simdgroups, each producing 8 results.
+// Each thread loads 32 int8 values via 2x int4 (16-byte) reads, computes
+// partial dot products, then simd_sum reduces across 32 lanes.
 //
-// Based on MLX's qmv_fast pattern but for symmetric int8x int8->int32.
+// Improvements over v1:
+//   - 4 simdgroups × 8 results each = BN=32 (was 2×4=8): 4× fewer TGs
+//   - Vectorized 4-wide char4 dot using multiply-add chains
+//   - Better GPU occupancy from larger threadgroups (128 threads)
 
 #include <metal_stdlib>
 #include <metal_simdgroup>
@@ -19,12 +22,14 @@ struct W8A8Params {
 constant constexpr int SIMD_SIZE = 32;
 constant constexpr int VALUES_PER_THREAD = 32;
 constant constexpr int BLOCK_SIZE = VALUES_PER_THREAD * SIMD_SIZE; // 1024
-constant constexpr int RESULTS_PER_SG = 4;
-constant constexpr int NUM_SG = 2;
-constant constexpr int BN = NUM_SG * RESULTS_PER_SG; // 8
-constant constexpr int TG_SIZE = NUM_SG * SIMD_SIZE;  // 64
+constant constexpr int RESULTS_PER_SG = 8;
+constant constexpr int NUM_SG = 4;
+constant constexpr int BN = NUM_SG * RESULTS_PER_SG; // 32
+constant constexpr int TG_SIZE = NUM_SG * SIMD_SIZE;  // 128
 
 inline int dot16(int4 a, int4 b) {
+    // Unpack 2x int4 (each int4 = 4x int32 holding 4x int8 as char4)
+    // into 16 int8 pairs, compute sum of products.
     char4 a0 = as_type<char4>(a[0]); char4 b0 = as_type<char4>(b[0]);
     char4 a1 = as_type<char4>(a[1]); char4 b1 = as_type<char4>(b[1]);
     char4 a2 = as_type<char4>(a[2]); char4 b2 = as_type<char4>(b[2]);
@@ -66,7 +71,7 @@ void w8a8_matvec(
 
     float x_sc = x_scales[m_row];
 
-    int result[RESULTS_PER_SG] = {0, 0, 0, 0};
+    int result[RESULTS_PER_SG] = {0, 0, 0, 0, 0, 0, 0, 0};
 
     for (uint k = 0; k < K; k += BLOCK_SIZE) {
         int4 xv0 = x_vec[0];
