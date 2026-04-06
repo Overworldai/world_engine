@@ -88,6 +88,26 @@ Additionally, Waypoint-1.5 expects 720p inputs / outputs, therefore `img` is `[4
 
 See [examples/gen_sample.py](./examples/gen_sample.py) for reference.
 
+Space each 4-frame batch evenly across the time until the next batch is ready, while the next batch is generated in parallel to keep playback smooth and latency low. Example code to accomplish this is below.
+```
+def render_batch(frames, batch_dt):
+    step = batch_dt / len(frames)
+    render(frames[0])
+    for frame in frames[1:]:
+        time.sleep(step)
+        render(frame)
+
+
+def generation_loop(engine, ctrl_input_generator):
+    frames, batch_dt = None, 0.0
+    for ctrl in ctrl_input_generator:
+        start = time.perf_counter()
+        next_frames = engine.gen_frame(ctrl=ctrl)
+        if frames is not None:
+            render_batch(frames, batch_dt)
+        frames, batch_dt = next_frames.cpu(), time.perf_counter() - start
+```
+
 ## Usage
 ```
 from world_engine import WorldEngine, CtrlInput
