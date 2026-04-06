@@ -2,6 +2,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import os
 
 
 QUANTS = [None]  # TODO: enable specific quant based on model config, which should specify compatible quants [None, "w8a8", "fp8"]
@@ -13,9 +14,16 @@ try:
 except ImportError:
     pass
 try:
+    config_path = "gemlite_config.json"
     from gemlite.helper import A8W8_INT8_dynamic
     import gemlite
-    gemlite.set_autotune("max")
+
+    if os.path.exists(config_path):
+        gemlite.load_config(config_path)
+    else: 
+        gemlite.set_autotune("max")
+        gemlite.helper.warmup(shapes=[(128,2048), (2048,2048), (2048,8192), (4096,2048), (8192,2048)], batch_sizes=[1], processor=A8W8_INT8_dynamic())
+        gemlite.cache_config(config_path)
 except ImportError:
     A8W8_INT8_dynamic = None
 
@@ -265,7 +273,7 @@ class INT8W8A8GemLite(nn.Module):
 def quantize_model(model: nn.Module, quant: str):
     if quant is None:
         return model
-
+    
     def eligible(m: nn.Module) -> bool:
         w = getattr(m, "weight", None)
         if not isinstance(m, nn.Linear):
