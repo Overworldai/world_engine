@@ -74,7 +74,7 @@ for controller_input in [
 		CtrlInput(mouse=[0.1, 0.2]),
 		CtrlInput(button={95, 32, 105}),
 ]:
-	img = engine.gen_frame(ctrl=controller_input)
+	img = engine.gen_frame(ctrl=controller_input)  # see section below for img shape explanation
 ```
 
 ## Waypoint-1.5 Behavior
