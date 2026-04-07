@@ -9,7 +9,6 @@ requires-python = ">=3.10"
 dependencies = [
   "taehv @ git+https://github.com/madebyollin/taehv.git@7dc60ec6601af2e668e31bc70acc4cb3665e4c22",
   "torch==2.10.0",
-  "fbgemm-gpu-genai==1.5.0; sys_platform == 'linux'",
   "einops",
   "tensordict==0.10.0",
   "transformers>=5.3.0",
