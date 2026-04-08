@@ -1,4 +1,4 @@
-#include "kernels/w8a8_gemm.h"
+#include "kernels/we_ops.h"
 
 #include <dlfcn.h>
 #include <filesystem>
@@ -434,22 +434,22 @@ std::vector<mx::array> fused_qkv_norm_rope(
 }
 
 // ===========================================================================
-// Ring-buffer flash attention
+// Scatter-read flash attention
 // ===========================================================================
 
-void RingFlashAttention::eval_cpu(
+void ScatterSDPA::eval_cpu(
     const std::vector<mx::array>& inputs,
     std::vector<mx::array>& outputs) {
-  throw std::runtime_error("RingFlashAttention: CPU not supported");
+  throw std::runtime_error("ScatterSDPA: CPU not supported");
 }
 
-void RingFlashAttention::eval_gpu(
+void ScatterSDPA::eval_gpu(
     const std::vector<mx::array>& inputs,
     std::vector<mx::array>& outputs) {
   auto& Q = inputs[0];
   auto& K = inputs[1];
   auto& V = inputs[2];
-  auto& written = inputs[3];
+  auto& block_offsets = inputs[3];
   auto& O = outputs[0];
 
   O.set_data(mx::allocator::malloc(O.nbytes()));
@@ -457,7 +457,7 @@ void RingFlashAttention::eval_gpu(
   auto& s = stream();
   auto& d = mx::metal::device(s.device);
   auto mtl_lib = d.get_library("we_kernels", lib_path());
-  auto kernel = d.get_kernel("ring_flash_attention", mtl_lib);
+  auto kernel = d.get_kernel(kernel_name_, mtl_lib);
 
   auto& enc = mx::metal::get_command_encoder(s);
   enc.set_compute_pipeline_state(kernel);
@@ -465,47 +465,67 @@ void RingFlashAttention::eval_gpu(
   enc.set_input_array(Q, 0);
   enc.set_input_array(K, 1);
   enc.set_input_array(V, 2);
-  enc.set_input_array(written, 3);
+  enc.set_input_array(block_offsets, 3);
   enc.set_output_array(O, 4);
 
   struct Params {
-    uint32_t N_Q_HEADS, N_KV_HEADS, T, CAPACITY, D_HEAD;
+    uint32_t N_Q_HEADS, N_KV_HEADS, T, CAPACITY, D_HEAD, N_BLOCKS;
     float scale;
   };
-  Params params{N_Q_, N_KV_, T_, capacity_, D_HEAD_, scale_};
+  Params params{N_Q_, N_KV_, T_, capacity_, D_HEAD_, n_blocks_, scale_};
   enc.set_bytes(params, 5);
 
-  // One threadgroup per (q_block, q_head), BQ=16 queries per block
-  constexpr uint32_t BQ = 16;
-  uint32_t q_blocks = (T_ + BQ - 1) / BQ;
+  uint32_t q_blocks = (T_ + bq_ - 1) / bq_;
   MTL::Size grid(q_blocks, N_Q_, 1);
-  MTL::Size group(128, 1, 1);  // 4 simdgroups
+  MTL::Size group(tg_size_, 1, 1);
   enc.dispatch_threadgroups(grid, group);
 }
 
-mx::array ring_flash_attention(
+// Variant configs: kernel_name, BQ, tg_size
+struct VariantConfig {
+  const char* kernel_name;
+  uint32_t bq;
+  uint32_t tg_size;
+};
+
+static VariantConfig resolve_variant(const std::string& variant) {
+  if (variant == "bq16_bk32_wm1")  return {"scatter_sdpa_bq16_bk32_wm1",  16, 32};
+  if (variant == "bq32_bk32_wm1")  return {"scatter_sdpa_bq32_bk32_wm1",  32, 32};
+  if (variant == "bq32_bk32_wm2")  return {"scatter_sdpa_bq32_bk32_wm2",  32, 64};
+  if (variant == "bq64_bk32_wm2")  return {"scatter_sdpa_bq64_bk32_wm2",  64, 64};
+  if (variant == "bq32_bk64_wm1")  return {"scatter_sdpa_bq32_bk64_wm1",  32, 32};
+  // Default
+  return {"scatter_sdpa", 32, 32};
+}
+
+mx::array scatter_sdpa(
     const mx::array& Q,
     const mx::array& K,
     const mx::array& V,
-    const mx::array& written,
+    const mx::array& block_offsets,
     float scale,
+    const std::string& variant,
     mx::StreamOrDevice s) {
-  // Q: [N_Q, T, D], K/V: [N_KV, capacity, D], written: [capacity]
   uint32_t N_Q = static_cast<uint32_t>(Q.shape(0));
   uint32_t N_KV = static_cast<uint32_t>(K.shape(0));
   uint32_t T = static_cast<uint32_t>(Q.shape(1));
   uint32_t D = static_cast<uint32_t>(Q.shape(2));
   uint32_t capacity = static_cast<uint32_t>(K.shape(1));
+  uint32_t n_blocks = static_cast<uint32_t>(block_offsets.shape(0));
+
+  auto cfg = resolve_variant(variant);
 
   auto stream = mx::to_stream(s);
   return mx::array(
       {static_cast<int>(N_Q), static_cast<int>(T), static_cast<int>(D)},
       mx::float16,
-      std::make_shared<RingFlashAttention>(stream, N_Q, N_KV, T, capacity, D, scale),
+      std::make_shared<ScatterSDPA>(
+          stream, N_Q, N_KV, T, capacity, D, n_blocks, scale,
+          cfg.kernel_name, cfg.bq, cfg.tg_size),
       {mx::contiguous(Q, false, stream),
        mx::contiguous(K, false, stream),
        mx::contiguous(V, false, stream),
-       mx::contiguous(written, false, stream)});
+       mx::contiguous(block_offsets, false, stream)});
 }
 
 }  // namespace we_kernels

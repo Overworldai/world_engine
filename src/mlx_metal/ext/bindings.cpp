@@ -2,7 +2,7 @@
 #include <nanobind/stl/vector.h>
 
 #include "mlx/mlx.h"
-#include "kernels/w8a8_gemm.h"
+#include "kernels/we_ops.h"
 
 namespace nb = nanobind;
 namespace mx = mlx::core;
@@ -166,28 +166,46 @@ Returns:
     list[fp16 q [N_Q, T, D_HEAD], fp16 k [N_K, T, D_HEAD], fp16 v [N_V, T, D_HEAD]])");
 
   m.def(
-      "ring_flash_attention",
+      "scatter_sdpa",
       [](const mx::array& Q,
          const mx::array& K,
          const mx::array& V,
-         const mx::array& written,
+         const mx::array& block_offsets,
          float scale) {
-        return we_kernels::ring_flash_attention(Q, K, V, written, scale);
+        return we_kernels::scatter_sdpa(Q, K, V, block_offsets, scale);
       },
       nb::arg("Q"),
       nb::arg("K"),
       nb::arg("V"),
-      nb::arg("written"),
+      nb::arg("block_offsets"),
       nb::arg("scale"),
-      R"(Ring-buffer flash attention.
+      R"(Scatter-read flash attention.
 
 Args:
-    Q: fp16 [N_H, T, D_HEAD] — query
-    K: fp16 [N_H, capacity, D_HEAD] — key cache
-    V: fp16 [N_H, capacity, D_HEAD] — value cache
-    written: fp16 [capacity] — 1.0 for valid, 0.0 for empty
+    Q: fp16 [N_Q, T, D_HEAD] — query
+    K: fp16 [N_KV, capacity, D_HEAD] — key cache
+    V: fp16 [N_KV, capacity, D_HEAD] — value cache
+    block_offsets: int32 [N_BLOCKS] — token offsets of valid BK=32 blocks
     scale: float — 1/sqrt(D_HEAD)
 
 Returns:
-    fp16 [N_H, T, D_HEAD])");
+    fp16 [N_Q, T, D_HEAD])");
+
+  // Named variant dispatchers for autotuning
+  auto make_variant = [&](const char* py_name, const char* variant) {
+    m.def(
+        py_name,
+        [variant](const mx::array& Q, const mx::array& K, const mx::array& V,
+                  const mx::array& block_offsets, float scale) {
+          return we_kernels::scatter_sdpa(Q, K, V, block_offsets, scale,
+                                          std::string(variant));
+        },
+        nb::arg("Q"), nb::arg("K"), nb::arg("V"),
+        nb::arg("block_offsets"), nb::arg("scale"));
+  };
+  make_variant("scatter_sdpa_bq16_bk32_wm1", "bq16_bk32_wm1");
+  make_variant("scatter_sdpa_bq32_bk32_wm1", "bq32_bk32_wm1");
+  make_variant("scatter_sdpa_bq32_bk32_wm2", "bq32_bk32_wm2");
+  make_variant("scatter_sdpa_bq64_bk32_wm2", "bq64_bk32_wm2");
+  make_variant("scatter_sdpa_bq32_bk64_wm1", "bq32_bk64_wm1");
 }

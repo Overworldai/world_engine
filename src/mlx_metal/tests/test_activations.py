@@ -173,9 +173,7 @@ class TestSequentialActivations:
         for kv in model.kv_caches:
             kv.keys = mx.zeros_like(kv.keys)
             kv.values = mx.zeros_like(kv.values)
-            kv.written = mx.concatenate([
-                mx.zeros((kv.L,)), mx.ones((T,))
-            ]).astype(mx.float16)
+            kv.written_slots = set()
 
         mouse, button, scroll = _seed_cache(model, cfg, latent_shape)
 
@@ -185,7 +183,7 @@ class TestSequentialActivations:
             cache_state.append((
                 np.array(kv.keys),
                 np.array(kv.values),
-                np.array(kv.written),
+                set(kv.written_slots),
             ))
 
         cap = ActivationCapture()
@@ -199,7 +197,7 @@ class TestSequentialActivations:
         for i, kv in enumerate(model.kv_caches):
             kv.keys = mx.array(cache_state[i][0])
             kv.values = mx.array(cache_state[i][1])
-            kv.written = mx.array(cache_state[i][2])
+            kv.written_slots = cache_state[i][2]
 
         # Run frame 1, second time with same seed
         _run_frame(model, cfg, latent_shape, 1, mouse, button, scroll, rng_seed=42)
@@ -222,9 +220,7 @@ class TestSequentialActivations:
         for kv in model.kv_caches:
             kv.keys = mx.zeros_like(kv.keys)
             kv.values = mx.zeros_like(kv.values)
-            kv.written = mx.concatenate([
-                mx.zeros((kv.L,)), mx.ones((T,))
-            ]).astype(mx.float16)
+            kv.written_slots = set()
 
         mouse, button, scroll = _seed_cache(model, cfg, latent_shape)
 
@@ -258,9 +254,7 @@ class TestSequentialActivations:
         for kv in model.kv_caches:
             kv.keys = mx.zeros_like(kv.keys)
             kv.values = mx.zeros_like(kv.values)
-            kv.written = mx.concatenate([
-                mx.zeros((kv.L,)), mx.ones((T,))
-            ]).astype(mx.float16)
+            kv.written_slots = set()
 
         mouse, button, scroll = _seed_cache(model, cfg, latent_shape)
 
@@ -287,9 +281,7 @@ class TestSequentialActivations:
         for kv in model.kv_caches:
             kv.keys = mx.zeros_like(kv.keys)
             kv.values = mx.zeros_like(kv.values)
-            kv.written = mx.concatenate([
-                mx.zeros((kv.L,)), mx.ones((T,))
-            ]).astype(mx.float16)
+            kv.written_slots = set()
 
         mouse, button, scroll = _seed_cache(model, cfg, latent_shape)
 

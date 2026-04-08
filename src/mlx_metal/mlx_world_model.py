@@ -15,6 +15,7 @@ import numpy as np
 
 from we_kernels import w8a8_gemm_nax
 from we_kernels import fused_silu_quant, fused_rmsnorm_adaln_quant, w8a8_gemm_prequantized, w8a8_silu_gemm_nax
+from we_kernels import scatter_sdpa
 
 DTYPE = mx.float16
 
@@ -343,6 +344,8 @@ def compute_rope_angles(frame_idx: int, ts_mult: float, rope_xy: mx.array, rope_
 
 
 class RingKVCache:
+    BK = 32  # scatter_sdpa block granularity
+
     def __init__(self, capacity: int, L: int, dilation: int, num_buckets: int):
         self.capacity = capacity
         self.L = L
@@ -350,51 +353,59 @@ class RingKVCache:
         self.num_buckets = num_buckets
         self.keys = mx.zeros((1, N_KV_HEADS, capacity, D_HEAD), dtype=DTYPE)
         self.values = mx.zeros((1, N_KV_HEADS, capacity, D_HEAD), dtype=DTYPE)
-        self.written = mx.concatenate([mx.zeros((L,)), mx.ones((T,))]).astype(mx.float16)
+        # Track which ring slots are populated (pure Python — no GPU sync needed)
+        self.written_slots: set[int] = set()
 
     def set_frozen(self, frozen: bool):
         self.frozen = frozen
 
-    def upsert(self, k_new: mx.array, v_new: mx.array, frame_idx: int) -> Tuple[mx.array, mx.array, mx.array]:
-        """Write current frame to tail, build mask, optionally persist to ring.
+    def compute_block_offsets(self, frame_idx: int) -> mx.array:
+        """Precompute BK-aligned block offsets for scatter-read SDPA.
 
-        Returns (keys, values, mask) for attention.
-        Compact mode: gathers only written slots for mask-free SDPA.
+        Slightly differs from pytorch implementation, usually would use .argwhere or 
+        .nonzero, but mlx doesn't have those equivalent primitives. Using np could 
+        force GPU->CPU sync, so we instead track the indices with a python set.
+        Uses self.written_slots to know which ring buckets are populated.
+        Called once per forward_single.
         """
+        # Determine stale bucket to exclude (being overwritten this frame)
+        stale_slot = -1
+        write_step = (frame_idx % self.dilation) == 0
+        if self.num_buckets > 0 and write_step:
+            bucket = (frame_idx + (self.dilation - 1)) // self.dilation
+            stale_slot = bucket % self.num_buckets
+
+        # Collect BK-aligned block offsets for written, non-stale ring buckets
+        offsets = []
+        for slot in sorted(self.written_slots):
+            if slot == stale_slot:
+                continue
+            start = slot * T
+            for blk in range(T // self.BK):
+                offsets.append(start + blk * self.BK)
+
+        # Tail is always valid
+        for blk in range(T // self.BK):
+            offsets.append(self.L + blk * self.BK)
+
+        return mx.array(np.array(offsets, dtype=np.int32))
+
+    def upsert(self, k_new: mx.array, v_new: mx.array, frame_idx: int,
+               block_offsets: mx.array | None = None) -> None:
+        """Write current frame to tail, optionally persist to ring."""
         # 1. Always write current frame to tail
         self.keys[:, :, self.L:self.L + T, :] = k_new
         self.values[:, :, self.L:self.L + T, :] = v_new
 
-        # 2. Build effective written mask (hiding stale ring slot)
-        w = self.written
+        # 2. Persist to ring (only when unfrozen — cache_write pass)
         write_step = (frame_idx % self.dilation) == 0
-        if self.num_buckets > 0 and write_step:
-            bucket = (frame_idx + (self.dilation - 1)) // self.dilation
-            slot = bucket % self.num_buckets
-            ring_start = slot * T
-            indices = mx.arange(self.capacity)
-            stale = ((indices >= ring_start) & (indices < ring_start + T)).astype(mx.float16)
-            w = w * (1 - stale)
-
-        # 3. Gather compact K/V at written indices (mask-free SDPA)
-        import numpy as np
-        w_np = np.array(w)
-        valid_idx = mx.array(np.where(w_np > 0.5)[0].astype(np.int32))
-        k_compact = self.keys[:, :, valid_idx, :]
-        v_compact = self.values[:, :, valid_idx, :]
-
-        mask = mx.reshape(w, (1, 1, 1, -1)) * 1e4 - 1e4
-
-        # 4. Persist to ring (only when unfrozen — cache_write pass)
         if write_step and self.num_buckets > 0 and not getattr(self, "frozen", False):
             bucket = (frame_idx + (self.dilation - 1)) // self.dilation
             slot = bucket % self.num_buckets
             rs = slot * T
             self.keys[:, :, rs:rs + T, :] = k_new
             self.values[:, :, rs:rs + T, :] = v_new
-            self.written[rs:rs + T] = mx.ones((T,), dtype=mx.float16)
-
-        return k_compact, v_compact, mask
+            self.written_slots.add(slot)
 
 
 class MLP(nn.Module):
@@ -470,7 +481,7 @@ class TransformerBlock(nn.Module):
         if has_ctrl:
             self.ctrl_mlpfusion = CtrlFusion()
 
-    def __call__(self, x: mx.array, cond: mx.array, ctrl_emb: mx.array, rope_cos: mx.array, rope_sin: mx.array, v1_in: Optional[mx.array], kv_cache: RingKVCache, frame_idx: int) -> Tuple[mx.array, mx.array]:
+    def __call__(self, x: mx.array, cond: mx.array, ctrl_emb: mx.array, rope_cos: mx.array, rope_sin: mx.array, v1_in: Optional[mx.array], kv_cache: RingKVCache, frame_idx: int, block_offsets: mx.array | None = None) -> Tuple[mx.array, mx.array]:
         s0, b0, g0, s1, b1, g1 = self.cond_head(cond)
         residual = x
 
@@ -506,10 +517,15 @@ class TransformerBlock(nn.Module):
         q = ortho_rope(mx.fast.rms_norm(q, None, 1e-5), rope_cos, rope_sin)
         k_new = ortho_rope(mx.fast.rms_norm(k_new, None, 1e-5), rope_cos, rope_sin)
 
-        # KV cache upsert — compact gather for mask-free SDPA
-        k_compact, v_compact, _mask = kv_cache.upsert(k_new, v_new, frame_idx)
-        y = mx.fast.scaled_dot_product_attention(q, k_compact, v_compact, scale=D_HEAD ** -0.5)
-        y = mx.reshape(y.transpose(0, 2, 1, 3), (1, T, N_HEADS * D_HEAD))
+        # KV cache upsert + scatter-read SDPA
+        kv_cache.upsert(k_new, v_new, frame_idx, block_offsets=block_offsets)
+        n_kv = kv_cache.keys.shape[1]
+        q_3d = mx.reshape(q, (N_HEADS, T, D_HEAD))
+        k_3d = mx.reshape(kv_cache.keys, (n_kv, kv_cache.capacity, D_HEAD))
+        v_3d = mx.reshape(kv_cache.values, (n_kv, kv_cache.capacity, D_HEAD))
+        y_3d = scatter_sdpa(q_3d, k_3d, v_3d, block_offsets, float(D_HEAD ** -0.5), "bq32_bk32_wm2")
+        # y_3d: [N_HEADS, T, D_HEAD] → transpose to [T, N_HEADS, D_HEAD] → [1, T, N_HEADS*D_HEAD]
+        y = mx.reshape(y_3d.transpose(1, 0, 2), (1, T, N_HEADS * D_HEAD))
         y = self.attn.out_proj(y)
         x4_y = mx.reshape(y, (1, 1, T, D_MODEL))
         x = mx.reshape(x4_y * mx.expand_dims(g0, 2), (1, T, D_MODEL)) + residual
@@ -612,9 +628,18 @@ class MLXWorldModel(nn.Module):
         x_2d = mx.reshape(x, (1, C, HP * PH, WP * PW)).transpose(0, 2, 3, 1)
         x_pat = self.patchify(x_2d)
         x_seq = mx.reshape(x_pat, (1, T, D_MODEL))
+        # Precompute block offsets once per forward (same for all layers with same config)
+        _off_cache = {}
+        block_offsets_list = []
+        for kv in self.kv_caches:
+            key = (kv.capacity, kv.dilation, kv.num_buckets)
+            if key not in _off_cache:
+                _off_cache[key] = kv.compute_block_offsets(frame_idx)
+            block_offsets_list.append(_off_cache[key])
+
         v1 = None
-        for blk, kv in zip(self.transformer, self.kv_caches):
-            x_seq, v1 = blk(x_seq, cond, ctrl_emb, rope_cos, rope_sin, v1, kv, frame_idx)
+        for blk, kv, bo in zip(self.transformer, self.kv_caches, block_offsets_list):
+            x_seq, v1 = blk(x_seq, cond, ctrl_emb, rope_cos, rope_sin, v1, kv, frame_idx, bo)
         y = nn.silu(cond)
         ab = self.out_norm.fc(y)
         ab = mx.reshape(mx.broadcast_to(mx.expand_dims(ab, 2), (1, 1, T, 2 * D_MODEL)), (1, T, 2 * D_MODEL))

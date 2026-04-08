@@ -165,13 +165,18 @@ std::vector<mx::array> fused_qkv_norm_rope(
     float eps = 1e-5f,
     mx::StreamOrDevice s = {});
 
-// Ring-buffer flash attention with GQA support
-class RingFlashAttention : public mx::Primitive {
+// Scatter-read flash attention with GQA support
+class ScatterSDPA : public mx::Primitive {
  public:
-  RingFlashAttention(mx::Stream stream, uint32_t N_Q, uint32_t N_KV,
-                     uint32_t T, uint32_t capacity, uint32_t D_HEAD, float scale)
+  ScatterSDPA(mx::Stream stream, uint32_t N_Q, uint32_t N_KV,
+              uint32_t T, uint32_t capacity, uint32_t D_HEAD,
+              uint32_t n_blocks, float scale,
+              std::string kernel_name = "scatter_sdpa",
+              uint32_t bq = 32, uint32_t tg_size = 32)
       : mx::Primitive(stream), N_Q_(N_Q), N_KV_(N_KV), T_(T),
-        capacity_(capacity), D_HEAD_(D_HEAD), scale_(scale) {}
+        capacity_(capacity), D_HEAD_(D_HEAD), n_blocks_(n_blocks),
+        scale_(scale), kernel_name_(std::move(kernel_name)),
+        bq_(bq), tg_size_(tg_size) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -181,7 +186,7 @@ class RingFlashAttention : public mx::Primitive {
       const std::vector<mx::array>& inputs,
       std::vector<mx::array>& outputs) override;
 
-  const char* name() const override { return "RingFlashAttention"; }
+  const char* name() const override { return "ScatterSDPA"; }
 
   std::vector<mx::Shape> output_shapes(
       const std::vector<mx::array>& inputs) override {
@@ -190,16 +195,19 @@ class RingFlashAttention : public mx::Primitive {
   }
 
  private:
-  uint32_t N_Q_, N_KV_, T_, capacity_, D_HEAD_;
+  uint32_t N_Q_, N_KV_, T_, capacity_, D_HEAD_, n_blocks_;
   float scale_;
+  std::string kernel_name_;
+  uint32_t bq_, tg_size_;
 };
 
-mx::array ring_flash_attention(
+mx::array scatter_sdpa(
     const mx::array& Q,
     const mx::array& K,
     const mx::array& V,
-    const mx::array& written,
+    const mx::array& block_offsets,
     float scale,
+    const std::string& variant = "",
     mx::StreamOrDevice s = {});
 
 }  // namespace we_kernels

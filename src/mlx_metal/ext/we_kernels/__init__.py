@@ -117,35 +117,40 @@ def w8a8_gemm_prequantized(
     return _ext.w8a8_gemm(x_q, weight_q, x_scales, w_scales, bias_data)
 
 
-def ring_flash_attention(
+def scatter_sdpa(
     Q: mx.array,
     K: mx.array,
     V: mx.array,
-    written: mx.array,
+    block_offsets: mx.array,
     scale: float,
+    variant: str = "",
 ) -> mx.array:
-    """Ring-buffer flash attention.
+    """Scatter-read flash attention.
 
-    Custom SDPA that skips unwritten KV cache slots using the written bitvector.
-    Uses online softmax — no materialized attention matrix.
+    Fused SDPA that reads K/V directly from cache at valid block offsets.
+    No intermediate gather copy. Uses NAX MMA and online softmax.
 
     Parameters
     ----------
-    Q : mx.array, fp16, shape [N_H, T, D_HEAD]
-    K : mx.array, fp16, shape [N_H, capacity, D_HEAD]
-    V : mx.array, fp16, shape [N_H, capacity, D_HEAD]
-    written : mx.array, fp16, shape [capacity] — 1.0 valid, 0.0 empty
+    Q : mx.array, fp16, shape [N_Q, T, D_HEAD]
+    K : mx.array, fp16, shape [N_KV, capacity, D_HEAD]
+    V : mx.array, fp16, shape [N_KV, capacity, D_HEAD]
+    block_offsets : mx.array, int32, shape [N_BLOCKS] — token offsets of valid BK-aligned blocks
     scale : float — typically 1/sqrt(D_HEAD)
+    variant : str — tile config, e.g. "bq16_bk32_wm1", "bq32_bk32_wm2", etc.
 
     Returns
     -------
-    mx.array, fp16, shape [N_H, T, D_HEAD]
+    mx.array, fp16, shape [N_Q, T, D_HEAD]
     """
-    Q_3d = Q.astype(mx.float16)
-    K_3d = K.astype(mx.float16)
-    V_3d = V.astype(mx.float16)
-    w = written.astype(mx.float16)
-    return _ext.ring_flash_attention(Q_3d, K_3d, V_3d, w, scale)
+    Q_h = Q.astype(mx.float16)
+    K_h = K.astype(mx.float16)
+    V_h = V.astype(mx.float16)
+    bo = block_offsets.astype(mx.int32)
+    if variant:
+        fn = getattr(_ext, f"scatter_sdpa_{variant}")
+        return fn(Q_h, K_h, V_h, bo, scale)
+    return _ext.scatter_sdpa(Q_h, K_h, V_h, bo, scale)
 
 
 def fused_qkv_norm_rope(

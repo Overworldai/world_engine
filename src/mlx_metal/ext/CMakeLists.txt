@@ -24,7 +24,7 @@ find_package(MLX CONFIG REQUIRED)
 
 # ----------------------------- Library -----------------------------
 add_library(we_kernels_lib)
-target_sources(we_kernels_lib PUBLIC ${CMAKE_CURRENT_LIST_DIR}/kernels/w8a8_gemm.cpp)
+target_sources(we_kernels_lib PUBLIC ${CMAKE_CURRENT_LIST_DIR}/kernels/we_ops.cpp)
 target_include_directories(we_kernels_lib PUBLIC ${CMAKE_CURRENT_LIST_DIR})
 target_link_libraries(we_kernels_lib PUBLIC mlx)
 
@@ -39,7 +39,7 @@ if(MLX_BUILD_METAL)
       ${CMAKE_CURRENT_LIST_DIR}/kernels/w8a8_fused_silu_quant.metal
       ${CMAKE_CURRENT_LIST_DIR}/kernels/w8a8_fused_rmsnorm_quant.metal
       ${CMAKE_CURRENT_LIST_DIR}/kernels/fused_qkv_rope.metal
-      ${CMAKE_CURRENT_LIST_DIR}/kernels/ring_attention.metal
+      ${CMAKE_CURRENT_LIST_DIR}/kernels/scatter_sdpa.metal
     INCLUDE_DIRS ${CMAKE_CURRENT_LIST_DIR}/kernels ${CMAKE_CURRENT_LIST_DIR} ${MLX_INCLUDE_DIRS}
     OUTPUT_DIRECTORY ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}
   )

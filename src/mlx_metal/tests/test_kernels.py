@@ -19,7 +19,7 @@ from we_kernels import (
     fused_rmsnorm_quant,
     fused_rmsnorm_adaln_quant,
     fused_qkv_norm_rope,
-    ring_flash_attention,
+    scatter_sdpa,
 )
 
 
@@ -335,64 +335,17 @@ class TestFusedQKVNormRoPE:
 # Ring-buffer flash attention
 # ============================================================================
 
-def _ref_sdpa_with_written(Q, K, V, written, scale):
-    """Reference attention in numpy using written mask."""
-    # Q: [N_H, T, D], K/V: [N_H, cap, D], written: [cap]
-    N_H, T_Q, D = Q.shape
-    cap = K.shape[1]
-
-    # Build additive mask: 0 for valid, -1e4 for invalid
-    mask = np.where(written > 0.5, 0.0, -1e4).reshape(1, 1, cap)
-
-    O = np.zeros_like(Q)
-    for h in range(N_H):
-        for qi in range(T_Q):
-            q = Q[h, qi] * scale  # [D]
-            scores = q @ K[h].T + mask[0, 0]  # [cap]
-            scores_max = np.max(scores)
-            exp_scores = np.exp(scores - scores_max)
-            attn = exp_scores / (np.sum(exp_scores) + 1e-12)
-            O[h, qi] = attn @ V[h]
-    return O
+def _blocks_from_valid(valid_offsets, BK=32):
+    """Convert a list of valid token offsets to BK-aligned block offsets."""
+    blocks = sorted(set(off - (off % BK) for off in valid_offsets))
+    return np.array(blocks, dtype=np.int32)
 
 
-class TestRingFlashAttention:
-    """Tests custom ring-buffer flash attention against reference SDPA."""
+class TestScatterSDPA:
+    """Tests scatter-read flash attention against MLX SDPA."""
 
-    def test_all_written(self):
-        """When all slots are written, should match standard SDPA."""
-        mx.random.seed(42)
-        N_H, T_Q, D = 4, 16, 64
-        cap = 32
-        scale = 1.0 / np.sqrt(D)
-
-        Q = mx.random.normal((N_H, T_Q, D)).astype(mx.float16)
-        K = mx.random.normal((N_H, cap, D)).astype(mx.float16)
-        V = mx.random.normal((N_H, cap, D)).astype(mx.float16)
-        written = mx.ones((cap,), dtype=mx.float16)
-
-        result = ring_flash_attention(Q, K, V, written, scale)
-        mx.eval(result)
-
-        # Reference via MLX SDPA
-        ref = mx.fast.scaled_dot_product_attention(
-            mx.expand_dims(Q, 0), mx.expand_dims(K, 0),
-            mx.expand_dims(V, 0), scale=scale,
-        )
-        mx.eval(ref)
-        ref_3d = mx.reshape(ref, (N_H, T_Q, D))
-
-        res_np = np.array(result).astype(np.float32)
-        ref_np = np.array(ref_3d).astype(np.float32)
-
-        cos_sim = np.dot(res_np.flatten(), ref_np.flatten()) / (
-            np.linalg.norm(res_np.flatten()) * np.linalg.norm(ref_np.flatten()) + 1e-12
-        )
-        assert cos_sim > 0.99, f"All-written cosine sim {cos_sim:.6f} too low"
-        assert np.all(np.isfinite(res_np)), "Output contains NaN/Inf"
-
-    def test_partial_written(self):
-        """Only some KV slots written — kernel should ignore zeros."""
+    def test_all_valid(self):
+        """All KV slots valid — should match standard SDPA."""
         mx.random.seed(42)
         N_H, T_Q, D = 4, 16, 64
         cap = 64
@@ -401,96 +354,28 @@ class TestRingFlashAttention:
         Q = mx.random.normal((N_H, T_Q, D)).astype(mx.float16)
         K = mx.random.normal((N_H, cap, D)).astype(mx.float16)
         V = mx.random.normal((N_H, cap, D)).astype(mx.float16)
+        block_offsets = mx.array(np.arange(0, cap, 32, dtype=np.int32))  # [0, 32]
 
-        # Only first 16 and last 16 tokens are written (simulating ring + tail)
-        written_np = np.zeros(cap, dtype=np.float16)
-        written_np[:16] = 1.0
-        written_np[48:64] = 1.0
-        written = mx.array(written_np)
-
-        result = ring_flash_attention(Q, K, V, written, scale)
+        result = scatter_sdpa(Q, K, V, block_offsets, scale)
         mx.eval(result)
 
-        # Reference
-        ref = _ref_sdpa_with_written(
-            np.array(Q).astype(np.float32),
-            np.array(K).astype(np.float32),
-            np.array(V).astype(np.float32),
-            written_np.astype(np.float32),
-            scale,
+        ref = mx.fast.scaled_dot_product_attention(
+            mx.expand_dims(Q, 0), mx.expand_dims(K, 0),
+            mx.expand_dims(V, 0), scale=scale,
         )
+        ref_3d = mx.reshape(ref, (N_H, T_Q, D))
+        mx.eval(ref_3d)
 
         res_np = np.array(result).astype(np.float32)
-        cos_sim = np.dot(res_np.flatten(), ref.flatten().astype(np.float32)) / (
-            np.linalg.norm(res_np.flatten()) * np.linalg.norm(ref.flatten()) + 1e-12
+        ref_np = np.array(ref_3d).astype(np.float32)
+        cos_sim = np.dot(res_np.flatten(), ref_np.flatten()) / (
+            np.linalg.norm(res_np.flatten()) * np.linalg.norm(ref_np.flatten()) + 1e-12
         )
-        assert cos_sim > 0.99, f"Partial-written cosine sim {cos_sim:.6f} too low"
+        assert cos_sim > 0.99, f"All-valid cosine sim {cos_sim:.6f} too low"
+        assert np.all(np.isfinite(res_np))
 
-    def test_none_written_except_tail(self):
-        """Only tail written (fresh cache, frame 0)."""
-        mx.random.seed(42)
-        N_H, T_Q, D = 2, 8, 64
-        T_TAIL = 8
-        L = 32
-        cap = L + T_TAIL  # 40
-        scale = 1.0 / np.sqrt(D)
-
-        Q = mx.random.normal((N_H, T_Q, D)).astype(mx.float16)
-        K = mx.random.normal((N_H, cap, D)).astype(mx.float16)
-        V = mx.random.normal((N_H, cap, D)).astype(mx.float16)
-
-        # Only tail written
-        written_np = np.zeros(cap, dtype=np.float16)
-        written_np[L:L + T_TAIL] = 1.0
-        written = mx.array(written_np)
-
-        result = ring_flash_attention(Q, K, V, written, scale)
-        mx.eval(result)
-
-        # Reference: attention only over tail slots
-        ref = _ref_sdpa_with_written(
-            np.array(Q).astype(np.float32),
-            np.array(K).astype(np.float32),
-            np.array(V).astype(np.float32),
-            written_np.astype(np.float32),
-            scale,
-        )
-
-        res_np = np.array(result).astype(np.float32)
-        cos_sim = np.dot(res_np.flatten(), ref.flatten().astype(np.float32)) / (
-            np.linalg.norm(res_np.flatten()) * np.linalg.norm(ref.flatten()) + 1e-12
-        )
-        assert cos_sim > 0.99, f"Tail-only cosine sim {cos_sim:.6f} too low"
-
-    def test_model_shapes(self):
-        """Test with actual model shapes: local (8704) and global (66048)."""
-        mx.random.seed(42)
-        scale = 1.0 / np.sqrt(64)
-
-        # Local layer shape
-        N_H, T_Q, D = 32, 512, 64
-        cap = 8704
-        Q = mx.random.normal((N_H, T_Q, D)).astype(mx.float16)
-        K = mx.random.normal((N_H, cap, D)).astype(mx.float16)
-        V = mx.random.normal((N_H, cap, D)).astype(mx.float16)
-
-        # Simulate: 5 ring buckets written + tail
-        written_np = np.zeros(cap, dtype=np.float16)
-        for bucket in range(5):
-            s = bucket * 512
-            written_np[s:s + 512] = 1.0
-        written_np[8192:8704] = 1.0  # tail
-        written = mx.array(written_np)
-
-        result = ring_flash_attention(Q, K, V, written, scale)
-        mx.eval(result)
-
-        res_np = np.array(result).astype(np.float32)
-        assert np.all(np.isfinite(res_np)), "Local-layer output has NaN/Inf"
-        assert res_np.shape == (N_H, T_Q, D)
-
-    def test_matches_mlx_sdpa(self):
-        """Direct comparison with mx.fast.scaled_dot_product_attention + mask."""
+    def test_partial_blocks(self):
+        """Only some blocks valid — kernel should attend only to those."""
         mx.random.seed(42)
         N_H, T_Q, D = 4, 32, 64
         cap = 128
@@ -500,37 +385,31 @@ class TestRingFlashAttention:
         K = mx.random.normal((N_H, cap, D)).astype(mx.float16)
         V = mx.random.normal((N_H, cap, D)).astype(mx.float16)
 
-        # Random written pattern
-        written_np = np.zeros(cap, dtype=np.float16)
-        written_np[:48] = 1.0
-        written_np[96:128] = 1.0
-        written = mx.array(written_np)
+        # Only blocks at offsets 0, 32, 96 are valid (skip 64)
+        block_offsets = mx.array([0, 32, 96], dtype=mx.int32)
+        result = scatter_sdpa(Q, K, V, block_offsets, scale)
+        mx.eval(result)
 
-        # Our kernel
-        result = ring_flash_attention(Q, K, V, written, scale)
-
-        # MLX SDPA with equivalent mask
-        mask = mx.reshape(written, (1, 1, 1, -1)) * 1e4 - 1e4
+        # Reference: gather + SDPA
+        valid_idx = np.concatenate([np.arange(0, 64), np.arange(96, 128)]).astype(np.int32)
+        K_c = K[:, mx.array(valid_idx), :]
+        V_c = V[:, mx.array(valid_idx), :]
         ref = mx.fast.scaled_dot_product_attention(
-            mx.expand_dims(Q, 0), mx.expand_dims(K, 0),
-            mx.expand_dims(V, 0), scale=scale, mask=mask,
+            mx.expand_dims(Q, 0), mx.expand_dims(K_c, 0),
+            mx.expand_dims(V_c, 0), scale=scale,
         )
         ref_3d = mx.reshape(ref, (N_H, T_Q, D))
-
-        mx.eval(result, ref_3d)
+        mx.eval(ref_3d)
 
         res_np = np.array(result).astype(np.float32)
         ref_np = np.array(ref_3d).astype(np.float32)
-
-        # Per-head cosine similarity
-        for h in range(N_H):
-            r = res_np[h].flatten()
-            f = ref_np[h].flatten()
-            cos_sim = np.dot(r, f) / (np.linalg.norm(r) * np.linalg.norm(f) + 1e-12)
-            assert cos_sim > 0.99, f"Head {h} cosine sim {cos_sim:.6f} too low"
+        cos_sim = np.dot(res_np.flatten(), ref_np.flatten()) / (
+            np.linalg.norm(res_np.flatten()) * np.linalg.norm(ref_np.flatten()) + 1e-12
+        )
+        assert cos_sim > 0.99, f"Partial-blocks cosine sim {cos_sim:.6f} too low"
 
     def test_gqa(self):
-        """GQA: N_Q=32, N_KV=16 — each pair of Q heads shares a KV head."""
+        """GQA: N_Q=32, N_KV=16."""
         mx.random.seed(42)
         N_Q, N_KV, T_Q, D = 32, 16, 32, 64
         cap = 64
@@ -539,14 +418,14 @@ class TestRingFlashAttention:
         Q = mx.random.normal((N_Q, T_Q, D)).astype(mx.float16)
         K = mx.random.normal((N_KV, cap, D)).astype(mx.float16)
         V = mx.random.normal((N_KV, cap, D)).astype(mx.float16)
-        written = mx.ones((cap,), dtype=mx.float16)
+        block_offsets = mx.array([0, 32], dtype=mx.int32)
 
-        result = ring_flash_attention(Q, K, V, written, scale)
+        result = scatter_sdpa(Q, K, V, block_offsets, scale)
         mx.eval(result)
 
-        # Reference: expand K/V to N_Q heads then use MLX SDPA
+        # Reference: expand K/V for GQA then SDPA
         group_size = N_Q // N_KV
-        K_exp = mx.repeat(K, group_size, axis=0)  # [N_Q, cap, D]
+        K_exp = mx.repeat(K, group_size, axis=0)
         V_exp = mx.repeat(V, group_size, axis=0)
         ref = mx.fast.scaled_dot_product_attention(
             mx.expand_dims(Q, 0), mx.expand_dims(K_exp, 0),
@@ -557,32 +436,41 @@ class TestRingFlashAttention:
 
         res_np = np.array(result).astype(np.float32)
         ref_np = np.array(ref_3d).astype(np.float32)
-
         for h in range(N_Q):
             r = res_np[h].flatten()
             f = ref_np[h].flatten()
             cos_sim = np.dot(r, f) / (np.linalg.norm(r) * np.linalg.norm(f) + 1e-12)
             assert cos_sim > 0.99, f"GQA head {h} cosine sim {cos_sim:.6f} too low"
 
-    def test_deterministic(self):
-        """Same input should produce identical output."""
+    def test_model_shapes(self):
+        """Test with actual model shapes: 32 Q heads, 16 KV heads, cap=8704."""
         mx.random.seed(42)
-        N_H, T_Q, D = 4, 16, 64
-        cap = 32
+        N_Q, N_KV, T_Q, D = 32, 16, 512, 64
+        cap = 8704
         scale = 1.0 / np.sqrt(D)
 
-        Q = mx.random.normal((N_H, T_Q, D)).astype(mx.float16)
-        K = mx.random.normal((N_H, cap, D)).astype(mx.float16)
-        V = mx.random.normal((N_H, cap, D)).astype(mx.float16)
-        written = mx.ones((cap,), dtype=mx.float16)
+        Q = mx.random.normal((N_Q, T_Q, D)).astype(mx.float16)
+        K = mx.random.normal((N_KV, cap, D)).astype(mx.float16)
+        V = mx.random.normal((N_KV, cap, D)).astype(mx.float16)
 
-        r1 = ring_flash_attention(Q, K, V, written, scale)
-        r2 = ring_flash_attention(Q, K, V, written, scale)
-        mx.eval(r1, r2)
-        np.testing.assert_array_equal(np.array(r1), np.array(r2))
+        # 5 ring buckets (each 512 tokens = 16 blocks of 32) + tail (16 blocks)
+        offsets = []
+        for bucket in range(5):
+            for blk in range(16):
+                offsets.append(bucket * 512 + blk * 32)
+        for blk in range(16):
+            offsets.append(8192 + blk * 32)
+        block_offsets = mx.array(offsets, dtype=mx.int32)
 
-    def test_finite_outputs(self):
-        """No NaN/Inf with various written patterns."""
+        result = scatter_sdpa(Q, K, V, block_offsets, scale)
+        mx.eval(result)
+
+        res_np = np.array(result).astype(np.float32)
+        assert np.all(np.isfinite(res_np)), "Model-shape output has NaN/Inf"
+        assert res_np.shape == (N_Q, T_Q, D)
+
+    def test_deterministic(self):
+        """Same input produces identical output."""
         mx.random.seed(42)
         N_H, T_Q, D = 4, 16, 64
         cap = 64
@@ -591,18 +479,25 @@ class TestRingFlashAttention:
         Q = mx.random.normal((N_H, T_Q, D)).astype(mx.float16)
         K = mx.random.normal((N_H, cap, D)).astype(mx.float16)
         V = mx.random.normal((N_H, cap, D)).astype(mx.float16)
+        block_offsets = mx.array([0, 32], dtype=mx.int32)
 
-        # Test several written patterns
-        patterns = [
-            np.ones(cap, dtype=np.float16),           # all written
-            np.zeros(cap, dtype=np.float16),           # none (edge case)
-            np.eye(1, cap, 0, dtype=np.float16).flatten(),  # single token
-        ]
-        # Set at least one slot for the "none" case to avoid division by zero
-        patterns[1][0] = 1.0
+        r1 = scatter_sdpa(Q, K, V, block_offsets, scale)
+        r2 = scatter_sdpa(Q, K, V, block_offsets, scale)
+        mx.eval(r1, r2)
+        np.testing.assert_array_equal(np.array(r1), np.array(r2))
 
-        for i, pat in enumerate(patterns):
-            written = mx.array(pat)
-            result = ring_flash_attention(Q, K, V, written, scale)
-            mx.eval(result)
-            assert np.all(np.isfinite(np.array(result))), f"Pattern {i} has NaN/Inf"
+    def test_finite_single_block(self):
+        """Single block should produce finite results."""
+        mx.random.seed(42)
+        N_H, T_Q, D = 4, 32, 64
+        cap = 128
+        scale = 1.0 / np.sqrt(D)
+
+        Q = mx.random.normal((N_H, T_Q, D)).astype(mx.float16)
+        K = mx.random.normal((N_H, cap, D)).astype(mx.float16)
+        V = mx.random.normal((N_H, cap, D)).astype(mx.float16)
+        block_offsets = mx.array([64], dtype=mx.int32)
+
+        result = scatter_sdpa(Q, K, V, block_offsets, scale)
+        mx.eval(result)
+        assert np.all(np.isfinite(np.array(result)))
