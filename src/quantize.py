@@ -270,15 +270,18 @@ class INT8W8A8GemLite(nn.Module):
         return self.impl(x).type_as(x)
 
 
-def quantize_model(model: nn.Module, quant: str):
+def quantize_model(model: nn.Module, quant: str, _prefix: str = ""):
     if quant is None:
         return model
     
-    def eligible(m: nn.Module) -> bool:
+    def eligible(m: nn.Module, fqn: str) -> bool:
         w = getattr(m, "weight", None)
         if not isinstance(m, nn.Linear):
             return False
         if getattr(w, "dtype", None) != torch.bfloat16:
+            return False
+        EXCLUDED_LAYERS = ["ctrl_emb", "out_norm", "patchify"]
+        if any(s in fqn for s in EXCLUDED_LAYERS):
             return False
         o, k = w.shape
         return (o % 32 == 0) and (k % 32 == 0)
@@ -287,11 +290,11 @@ def quantize_model(model: nn.Module, quant: str):
         "intw8a8": INT8W8A8GemLite,
         "fp8w8a8": FP8W8A8Linear,
         "nvfp4": FP4Linear,
-        "fp8": FP8Linear,
     }[quant]
 
     for name, child in model.named_children():
-        setattr(model, name, new_linear(child)) if eligible(child) else quantize_model(
-            child, quant
+        fqn = f"{_prefix}.{name}" if _prefix else name
+        setattr(model, name, new_linear(child)) if eligible(child, fqn) else quantize_model(
+            child, quant, fqn
         )
     return model
