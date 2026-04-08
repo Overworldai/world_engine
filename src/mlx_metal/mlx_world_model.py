@@ -623,19 +623,22 @@ class MLXWorldModel(nn.Module):
         mlp = self.ctrl_emb.mlp
         return mlp.fc2(nn.silu(mlp.fc1(inp))).astype(DTYPE) + 1e-7
 
-    def forward_single(self, x: mx.array, cond: mx.array, rope_cos: mx.array, rope_sin: mx.array, mouse: mx.array, button: mx.array, scroll: mx.array, frame_idx: int) -> mx.array:
+    def forward_single(self, x: mx.array, cond: mx.array, rope_cos: mx.array, rope_sin: mx.array, mouse: mx.array, button: mx.array, scroll: mx.array, frame_idx: int, _block_offsets: list | None = None) -> mx.array:
         ctrl_emb = self.ctrl_embed(mouse, button, scroll)
         x_2d = mx.reshape(x, (1, C, HP * PH, WP * PW)).transpose(0, 2, 3, 1)
         x_pat = self.patchify(x_2d)
         x_seq = mx.reshape(x_pat, (1, T, D_MODEL))
-        # Precompute block offsets once per forward (same for all layers with same config)
-        _off_cache = {}
-        block_offsets_list = []
-        for kv in self.kv_caches:
-            key = (kv.capacity, kv.dilation, kv.num_buckets)
-            if key not in _off_cache:
-                _off_cache[key] = kv.compute_block_offsets(frame_idx)
-            block_offsets_list.append(_off_cache[key])
+        # Use precomputed block offsets if provided, else compute
+        if _block_offsets is not None:
+            block_offsets_list = _block_offsets
+        else:
+            _off_cache = {}
+            block_offsets_list = []
+            for kv in self.kv_caches:
+                key = (kv.capacity, kv.dilation, kv.num_buckets)
+                if key not in _off_cache:
+                    _off_cache[key] = kv.compute_block_offsets(frame_idx)
+                block_offsets_list.append(_off_cache[key])
 
         v1 = None
         for blk, kv, bo in zip(self.transformer, self.kv_caches, block_offsets_list):
@@ -653,11 +656,24 @@ class MLXWorldModel(nn.Module):
     def denoise(self, x, rope_cos, rope_sin, mouse, button, scroll, frame_idx: int) -> mx.array:
         for kv in self.kv_caches:
             kv.set_frozen(True)
+
+        # Precompute block offsets once (same for all 4 denoise steps)
+        _off_cache = {}
+        block_offsets_list = []
+        for kv in self.kv_caches:
+            key = (kv.capacity, kv.dilation, kv.num_buckets)
+            if key not in _off_cache:
+                _off_cache[key] = kv.compute_block_offsets(frame_idx)
+            block_offsets_list.append(_off_cache[key])
+
         for sigma, dsigma in zip(SIGMAS[:4], DSIGMAS):
             cond = self.noise_cond(sigma)
-            v = self.forward_single(x, cond, rope_cos, rope_sin, mouse, button, scroll, frame_idx)
+            v = self.forward_single(
+                x, cond, rope_cos, rope_sin, mouse, button, scroll, frame_idx,
+                _block_offsets=block_offsets_list,
+            )
             x = x + dsigma * v
-            mx.eval(x)  # separate lazy graphs per denoise step
+            mx.eval(x)
         for kv in self.kv_caches:
             kv.set_frozen(False)
         return x
