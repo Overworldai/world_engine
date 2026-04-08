@@ -736,6 +736,8 @@ def load_from_pytorch(model_uri: str, int8_profile: Optional[str] = "speed", kv_
     mlx_model.rope_xy = mx.array(pt_model.transformer.rope_angles.xy.detach().float().numpy())
     mlx_model.rope_inv_t = mx.array(pt_model.transformer.rope_angles.inv_t.detach().float().numpy())
     mlx_model.denoise_step_emb.freq = mx.array(pt_model.denoise_step_emb.freq.detach().float().numpy())
+    del pt_model  # Free PyTorch memory immediately
+
     from mlx.utils import tree_map
     def cast_dtype(x):
         return x.astype(DTYPE) if isinstance(x, mx.array) and x.dtype == mx.float32 and x.ndim >= 2 else x
