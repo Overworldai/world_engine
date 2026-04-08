@@ -280,7 +280,7 @@ def quantize_model(model: nn.Module, quant: str, _prefix: str = ""):
             return False
         if getattr(w, "dtype", None) != torch.bfloat16:
             return False
-        EXCLUDED_LAYERS = ["ctrl_emb", "out_norm", "patchify"]
+        EXCLUDED_LAYERS = [".ctrl_emb", ".out_norm", ".unpatchify"]
         if any(s in fqn for s in EXCLUDED_LAYERS):
             return False
         o, k = w.shape
@@ -293,7 +293,7 @@ def quantize_model(model: nn.Module, quant: str, _prefix: str = ""):
     }[quant]
 
     for name, child in model.named_children():
-        fqn = f"{_prefix}.{name}" if _prefix else name
+        fqn = f"{_prefix}.{name}"
         setattr(model, name, new_linear(child)) if eligible(child, fqn) else quantize_model(
             child, quant, fqn
         )
