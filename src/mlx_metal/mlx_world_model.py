@@ -15,7 +15,7 @@ import numpy as np
 
 from we_kernels import w8a8_gemm_nax
 from we_kernels import fused_silu_quant, fused_rmsnorm_adaln_quant, w8a8_gemm_prequantized, w8a8_silu_gemm_nax
-from we_kernels import scatter_sdpa
+from we_kernels import scatter_sdpa, fused_qkv_norm_rope
 
 DTYPE = mx.float16
 
@@ -505,34 +505,39 @@ class TransformerBlock(nn.Module):
                 k_raw = self.attn.k_proj(x_n)
                 v_raw = self.attn.v_proj(x_n)
 
-        q = mx.reshape(q_raw, (1, T, N_HEADS, D_HEAD)).transpose(0, 2, 1, 3)
-        k_new = mx.reshape(k_raw, (1, T, N_KV_HEADS, D_HEAD)).transpose(0, 2, 1, 3)
-        v_new = mx.reshape(v_raw, (1, T, N_KV_HEADS, D_HEAD)).transpose(0, 2, 1, 3)
+        # Fused QKV split + RMSNorm + OrthoRoPE (single kernel for Q/K norm+rope)
+        qkv_flat = mx.reshape(
+            mx.concatenate([q_raw, k_raw, v_raw], axis=-1),
+            (T, -1),
+        )
+        q, k_new, v_new = fused_qkv_norm_rope(
+            qkv_flat, rope_cos, rope_sin, N_HEADS, N_KV_HEADS, N_KV_HEADS,
+        )
+        # q: [N_Q, T, D], k_new: [N_KV, T, D], v_new: [N_KV, T, D]
+        # Add batch dim for KV cache: [1, N_H, T, D]
+        k_new = mx.expand_dims(k_new, 0)
+        v_new = mx.expand_dims(v_new, 0)
         if v1_in is not None and self.attn.value_residual:
             v1_r = mx.reshape(v1_in, (1, N_KV_HEADS, T, D_HEAD))
             v_new = v_new + self.attn.v_lamb * (v1_r - v_new)
             v1_out = v1_in
         else:
             v1_out = v_new
-        q = ortho_rope(mx.fast.rms_norm(q, None, 1e-5), rope_cos, rope_sin)
-        k_new = ortho_rope(mx.fast.rms_norm(k_new, None, 1e-5), rope_cos, rope_sin)
 
         # KV cache upsert + scatter-read SDPA
         kv_cache.upsert(k_new, v_new, frame_idx, block_offsets=block_offsets)
         n_kv = kv_cache.keys.shape[1]
-        q_3d = mx.reshape(q, (N_HEADS, T, D_HEAD))
         k_3d = mx.reshape(kv_cache.keys, (n_kv, kv_cache.capacity, D_HEAD))
         v_3d = mx.reshape(kv_cache.values, (n_kv, kv_cache.capacity, D_HEAD))
-        y_3d = scatter_sdpa(q_3d, k_3d, v_3d, block_offsets, float(D_HEAD ** -0.5), "bq32_bk32_wm2")
-        # y_3d: [N_HEADS, T, D_HEAD] → transpose to [T, N_HEADS, D_HEAD] → [1, T, N_HEADS*D_HEAD]
-        y = mx.reshape(y_3d.transpose(1, 0, 2), (1, T, N_HEADS * D_HEAD))
+        y_nhd = scatter_sdpa(q, k_3d, v_3d, block_offsets, float(D_HEAD ** -0.5), "bq32_bk32_wm2")
+        y = mx.reshape(y_nhd.transpose(1, 0, 2), (1, T, N_HEADS * D_HEAD))
         y = self.attn.out_proj(y)
         x4_y = mx.reshape(y, (1, 1, T, D_MODEL))
         x = mx.reshape(x4_y * mx.expand_dims(g0, 2), (1, T, D_MODEL)) + residual
         if self.has_ctrl:
             x_n2 = mx.fast.rms_norm(x, None, 1e-5)
-            c_n = mx.fast.rms_norm(ctrl_emb, None, 1e-5)
             x4_2 = mx.reshape(x_n2, (1, 1, T, D_MODEL))
+            c_n = mx.fast.rms_norm(ctrl_emb, None, 1e-5)
             fused = self.ctrl_mlpfusion(x4_2, c_n)
             x = mx.reshape(fused, (1, T, D_MODEL)) + x
 
