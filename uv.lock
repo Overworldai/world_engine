@@ -577,13 +577,19 @@ wheels = [
 [[package]]
 name = "gemlite"
 version = "0.5.1.post1"
-source = { registry = "https://pypi.org/simple" }
+source = { url = "https://github.com/dropbox/gemlite/archive/ebfcc197d694acd4ca8dfaadf5fceb3570401df3.zip" }
 dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/15/82/d3c2946dd38698624d60368518d901056199b4141e25e194598f463d5f8a/gemlite-0.5.1.post1.tar.gz", hash = "sha256:ec94d17da0f97b60b007557ff505f46edf70089bd5d11e7768ceb21cb0c096c6", size = 131671, upload-time = "2025-10-20T15:37:15.219Z" }
+sdist = { hash = "sha256:6825cd901d750d025f8aae0facd683cb9ec9e1be0763f0dd7f84e50d6a6ea970" }
+
+[package.metadata]
+requires-dist = [
+    { name = "numpy" },
+    { name = "tqdm" },
+]
 
 [[package]]
 name = "h11"
@@ -1989,8 +1995,15 @@ wheels = [
 [[package]]
 name = "taehv"
 version = "0.1.0"
-source = { git = "https://github.com/madebyollin/taehv.git?rev=7dc60ec6601af2e668e31bc70acc4cb3665e4c22#7dc60ec6601af2e668e31bc70acc4cb3665e4c22" }
+source = { url = "https://github.com/madebyollin/taehv/archive/7dc60ec6601af2e668e31bc70acc4cb3665e4c22.zip" }
 dependencies = [
+    { name = "torch" },
+    { name = "tqdm" },
+]
+sdist = { hash = "sha256:461ca4bd1b7d4441d6a6da1df8e0fbeded02c26f058be36f29f4d14d97bef25d" }
+
+[package.metadata]
+requires-dist = [
     { name = "torch" },
     { name = "tqdm" },
 ]
@@ -2352,13 +2365,13 @@ requires-dist = [
     { name = "einops" },
     { name = "fbgemm-gpu-genai", marker = "sys_platform == 'linux'", specifier = "==1.5.0" },
     { name = "ftfy" },
-    { name = "gemlite" },
+    { name = "gemlite", url = "https://github.com/dropbox/gemlite/archive/ebfcc197d694acd4ca8dfaadf5fceb3570401df3.zip" },
     { name = "huggingface-hub", specifier = ">=1.7.0" },
     { name = "matplotlib", specifier = ">=3.10.8" },
     { name = "mlx", marker = "sys_platform == 'darwin'", git = "https://github.com/Clydingus/mlx.git?branch=fix%2Fsdpa-nax-int16-overflow" },
     { name = "nanobind", marker = "sys_platform == 'darwin'", specifier = "==2.10.2" },
     { name = "omegaconf" },
-    { name = "taehv", git = "https://github.com/madebyollin/taehv.git?rev=7dc60ec6601af2e668e31bc70acc4cb3665e4c22" },
+    { name = "taehv", url = "https://github.com/madebyollin/taehv/archive/7dc60ec6601af2e668e31bc70acc4cb3665e4c22.zip" },
     { name = "tensordict", specifier = "==0.10.0" },
     { name = "torch", specifier = "==2.10.0" },
     { name = "transformers", specifier = ">=5.3.0" },
