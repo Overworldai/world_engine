@@ -1,4 +1,5 @@
 from typing import Dict, Optional, Set, Tuple
+from concurrent.futures import ThreadPoolExecutor, Future
 import torch
 from torch import Tensor
 from dataclasses import dataclass, field
@@ -25,7 +26,6 @@ COMPILE_OPTIONS = {
     # "shape_padding": True,
 }
 
-import time
 @dataclass
 class CtrlInput:
     button: Set[int] = field(default_factory=set)  # pressed button IDs
@@ -42,13 +42,15 @@ class WorldEngine:
         model_config_overrides: Optional[Dict] = None,
         device=None,
         dtype=torch.bfloat16,
-        load_weights: bool = True
+        load_weights: bool = True,
+        ane_vae: bool = False,
     ):
         """
         model_uri: HF URI or local folder containing model.safetensors and config.yaml
         quant: None | intw8a8 | fp8w8a8 | nvfp4
         model_config_overrides: Dict to override model config values
         - auto_aspect_ratio: set to False to work in ae raw space, otherwise in/out are 720p or 360p
+        ane_vae: if True, run TAEHV on Apple Neural Engine (frees GPU for world model)
         """
         self.device = torch.get_default_device() if device is None else device
         self.dtype = torch.get_default_dtype() if dtype is None else dtype
@@ -64,6 +66,7 @@ class WorldEngine:
                 self.model_cfg.ae_uri,
                 is_taehv_ae=self.model_cfg.taehv_ae,
                 auto_aspect_ratio=self.model_cfg.auto_aspect_ratio,
+                ane=ane_vae,
                 dtype=dtype,
                 device=device,
             )
@@ -103,9 +106,17 @@ class WorldEngine:
 
             self._prompt_ctx = {"prompt_emb": None, "prompt_pad_mask": None}
 
+            # Pipelined ANE decode state
+            self._ane_vae = ane_vae
+            self._decode_executor = ThreadPoolExecutor(max_workers=1) if ane_vae else None
+            self._pending_decode: Optional[Future] = None
+
     @torch.inference_mode()
     def reset(self):
         """Reset state for new generation"""
+        if self._pending_decode is not None:
+            self._pending_decode.result()  # drain any pending decode
+            self._pending_decode = None
         self.kv_cache.reset()
         self.frame_ts.zero_()
         for v in self._ctx.values():
@@ -144,6 +155,61 @@ class WorldEngine:
         x0 = self._denoise_pass(x, inputs, self.kv_cache).clone()
         self._cache_pass(x0, inputs, self.kv_cache)
         return (self.vae.decode(x0.squeeze(1)) if return_img else x0.squeeze(1))
+
+    # TODO: gen_frame_pipelined and flush_pipeline should move under mlx_metal/
+    # when WorldEngine is refactored to support MLX (subclass or method injection).
+    # Keeping here for now since it touches self._denoise_pass / self._cache_pass.
+
+    @torch.inference_mode()
+    def gen_frame_pipelined(self, ctrl: CtrlInput = None):
+        """Generate a frame with pipelined GPU+ANE execution.
+
+        When ane_vae=True, the ANE decode runs in a background thread
+        concurrently with the GPU denoise+cache pass. The pipeline overlaps
+        GPU dispatch with ANE decode collection from the previous frame.
+
+        Returns the PREVIOUS frame's decoded output (1-frame pipeline latency).
+        Returns None on the first call (no decoded frame ready yet).
+        Call flush_pipeline() after the loop to get the final frame.
+
+        Usage:
+            engine = WorldEngine(model_uri, ane_vae=True)
+            engine.append_frame(seed_img)
+            for ctrl in control_inputs:
+                img = engine.gen_frame_pipelined(ctrl)
+                if img is not None:
+                    display(img)
+            img = engine.flush_pipeline()  # get the last frame
+        """
+        if self._decode_executor is None:
+            # No ANE executor: synchronous path
+            return self.gen_frame(ctrl, return_img=True)
+
+        # GPU: dispatch denoise + cache pass (async MPS dispatch)
+        x = torch.randn(self.frm_shape, device=self.device, dtype=self.dtype)
+        inputs = self.prep_inputs(x=x, ctrl=ctrl)
+        x0 = self._denoise_pass(x, inputs, self.kv_cache).clone()
+        self._cache_pass(x0, inputs, self.kv_cache)
+
+        # While GPU may still be finishing, collect previous ANE decode
+        prev_img = None
+        if self._pending_decode is not None:
+            prev_img = self._pending_decode.result()
+            self._pending_decode = None
+
+        # Start new ANE decode in background thread
+        latent = x0.squeeze(1)
+        self._pending_decode = self._decode_executor.submit(self.vae.decode, latent)
+
+        return prev_img
+
+    def flush_pipeline(self):
+        """Retrieve the last pipelined decode result."""
+        if self._pending_decode is not None:
+            result = self._pending_decode.result()
+            self._pending_decode = None
+            return result
+        return None
 
     @torch.compile
     def _prep_inputs(self, x, ctrl=None):

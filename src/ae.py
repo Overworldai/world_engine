@@ -171,8 +171,13 @@ class InferenceAE:
         return decoded.squeeze(0).permute(1, 2, 0)[..., :3]
 
 
-def get_ae(ae_uri, is_taehv_ae=False, auto_aspect_ratio=True, **kwargs):
-    if is_taehv_ae:
+def get_ae(ae_uri, is_taehv_ae=False, auto_aspect_ratio=True, ane=False, **kwargs):
+    if is_taehv_ae and ane:
+        from .mlx_metal.ane.ae_ane import CoreMLTAEHV
+        return CoreMLTAEHV.from_pretrained(
+            ae_uri, auto_aspect_ratio=auto_aspect_ratio, **kwargs,
+        )
+    elif is_taehv_ae:
         return ChunkedStreamingTAEHV.from_pretrained(ae_uri, auto_aspect_ratio=auto_aspect_ratio, **kwargs)
     else:
         return InferenceAE.from_pretrained(ae_uri, **kwargs)

@@ -42,6 +42,7 @@ packages = [
   "world_engine",
   "world_engine.model",
   "world_engine.mlx_metal",
+  "world_engine.mlx_metal.ane",
 ]
 
 [tool.setuptools.package-dir]

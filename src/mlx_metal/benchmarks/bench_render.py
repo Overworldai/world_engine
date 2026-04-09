@@ -29,13 +29,13 @@ SMOOTHQUANT_URI = "Overworld-Models/MR160k-smoothquant"
 SEED_IMAGE = pathlib.Path(__file__).parent / "frozen_valley_sniper.jpg"
 
 
-def load_vae(model_uri: str, device: str = "cpu"):
+def load_vae(model_uri: str, device: str = "cpu", ane: bool = False):
     from src.model import WorldModel
     from src.ae import get_ae
     cfg = WorldModel.load_config(model_uri)
     ae_uri = getattr(cfg, "ae_uri", model_uri)
     is_taehv = getattr(cfg, "taehv_ae", False)
-    return get_ae(ae_uri, is_taehv_ae=is_taehv, device=device, dtype=torch.float32)
+    return get_ae(ae_uri, is_taehv_ae=is_taehv, device=device, dtype=torch.float32, ane=ane)
 
 
 def load_seed_image(path: pathlib.Path, height: int, width: int) -> torch.Tensor:
@@ -66,14 +66,14 @@ def run_stability(args):
     latent_shape = (1, 1, cfg.channels, cfg.height * pH, cfg.width * pW)
 
     # --- VAE setup ---
-    from src.ae import ChunkedStreamingTAEHV
+    _ENCODE_SIZES = {(720, 1280): (512, 1024), (360, 640): (256, 512)}
     encode_h, encode_w = pixel_h, pixel_w
-    for (src_h, src_w), (dst_h, dst_w) in ChunkedStreamingTAEHV._ENCODE_SIZES.items():
+    for (src_h, src_w), (dst_h, dst_w) in _ENCODE_SIZES.items():
         if dst_h == pixel_h and dst_w == pixel_w:
             encode_h, encode_w = src_h, src_w
             break
 
-    vae = load_vae(args.model_uri)
+    vae = load_vae(args.model_uri, ane=args.ane)
 
     print(f"Loading seed image: {args.seed_image} (resizing to {encode_w}x{encode_h})")
     seed_img = load_seed_image(pathlib.Path(args.seed_image), encode_h, encode_w)
@@ -364,6 +364,8 @@ def main():
     parser.add_argument("--smoothquant", action="store_true", help="Use SmoothQuant model")
     parser.add_argument("--stability", action="store_true",
                         help="Run stability analysis: measure latent/pixel drift over a zero-control rollout")
+    parser.add_argument("--ane", action="store_true",
+                        help="Run TAEHV on Apple Neural Engine (frees GPU for world model)")
     args = parser.parse_args()
 
     if args.smoothquant and args.model_uri == MODEL_URI:
@@ -388,15 +390,16 @@ def main():
     # The VAE expects the original video resolution (e.g. 720x1280) and
     # internally resizes to the latent pixel size (e.g. 512x1024).
     # Look up which input resolution maps to our latent pixel size.
-    from src.ae import ChunkedStreamingTAEHV
+    _ENCODE_SIZES = {(720, 1280): (512, 1024), (360, 640): (256, 512)}
     encode_h, encode_w = pixel_h, pixel_w
-    for (src_h, src_w), (dst_h, dst_w) in ChunkedStreamingTAEHV._ENCODE_SIZES.items():
+    for (src_h, src_w), (dst_h, dst_w) in _ENCODE_SIZES.items():
         if dst_h == pixel_h and dst_w == pixel_w:
             encode_h, encode_w = src_h, src_w
             break
 
-    print(f"Loading VAE from model config")
-    vae = load_vae(args.model_uri)
+    vae_label = "CoreML (stateful)" if args.ane else "CPU"
+    print(f"Loading VAE from model config ({vae_label})")
+    vae = load_vae(args.model_uri, ane=args.ane)
 
     print(f"Loading seed image: {args.seed_image} (resizing to {encode_w}x{encode_h})")
     seed_img = load_seed_image(pathlib.Path(args.seed_image), encode_h, encode_w)
