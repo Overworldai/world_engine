@@ -7,7 +7,8 @@ class ChunkedStreamingTAEHV:
     _ENCODE_SIZES = {(720, 1280): (512, 1024), (360, 640): (256, 512)}
     _DECODE_SIZES = {v: k for k, v in _ENCODE_SIZES.items()}
 
-    def __init__(self, ae_model, auto_aspect_ratio=True, device=None, dtype=torch.bfloat16):
+    def __init__(self, ae_model, auto_aspect_ratio=True, device=None, dtype=torch.bfloat16,
+                 height=None, width=None):
         """
         auto_aspect_ratio: automatically resize so encode input must be 720p or 360p (converted 16:9 to 16:8)
         and decode output is 720p or 360p
@@ -17,6 +18,8 @@ class ChunkedStreamingTAEHV:
         self.device = device
         self.dtype = dtype
         self.auto_aspect_ratio = auto_aspect_ratio
+        scale = ae_model.patch_size * 2 ** sum(getattr(m, "stride", None) == (2, 2) for m in ae_model.encoder)
+        self._img_size = None if height is None else self._DECODE_SIZES[(height * scale, width * scale)]
         self.streaming_ae_model = StreamingTAEHV(ae_model.eval().to(device=device, dtype=dtype))
 
     @classmethod
@@ -57,7 +60,9 @@ class ChunkedStreamingTAEHV:
                  .permute(0, 1, 4, 2, 3).contiguous().div(255)
 
         if self.auto_aspect_ratio:
-            rgb = self._resize(rgb, self._ENCODE_SIZES[img.shape[1:3]])
+            if img.shape[1] * 16 != img.shape[2] * 9:
+                raise ValueError(f"Expected 16:9 input, got {img.shape[1:3]}")
+            rgb = self._resize(rgb, self._ENCODE_SIZES[self._img_size or img.shape[1:3]])
 
         return self.streaming_ae_model.encode(rgb).squeeze(1)
 
@@ -83,7 +88,7 @@ class ChunkedStreamingTAEHV:
         decoded = torch.cat(frames, dim=1)
 
         if self.auto_aspect_ratio:
-            decoded = self._resize(decoded, self._DECODE_SIZES[decoded.shape[-2:]])
+            decoded = self._resize(decoded, self._img_size or self._DECODE_SIZES[decoded.shape[-2:]])
 
         decoded = (decoded.clamp(0, 1) * 255).round().to(torch.uint8)
         return decoded.squeeze(0).permute(0, 2, 3, 1)[..., :3]

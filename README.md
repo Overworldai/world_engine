@@ -74,7 +74,7 @@ for controller_input in [
 		CtrlInput(mouse=[0.1, 0.2]),
 		CtrlInput(button={95, 32, 105}),
 ]:
-	img = engine.gen_frame(ctrl=controller_input)
+	img = engine.gen_frame(ctrl=controller_input)  # see section below for img shape explanation
 ```
 
 ## Waypoint-1.5 Behavior
@@ -87,6 +87,26 @@ Whereas previously, `img` was a uint8 rgb array of shape `[Height, Width, 3]`, *
 Additionally, Waypoint-1.5 expects 720p inputs / outputs, therefore `img` is `[4, 720, 1280, 3]`.
 
 See [examples/gen_sample.py](./examples/gen_sample.py) for reference.
+
+Space each 4-frame batch evenly across the time until the next batch is ready, while the next batch is generated in parallel to keep playback smooth and latency low. Example code to accomplish this is below.
+```
+def render_batch(frames, batch_dt):
+    step = batch_dt / len(frames)
+    render(frames[0])
+    for frame in frames[1:]:
+        time.sleep(step)
+        render(frame)
+
+
+def generation_loop(engine, ctrl_input_generator):
+    frames, batch_dt = None, 0.0
+    for ctrl in ctrl_input_generator:
+        start = time.perf_counter()
+        next_frames = engine.gen_frame(ctrl=ctrl)
+        if frames is not None:
+            render_batch(frames, batch_dt)
+        frames, batch_dt = next_frames.cpu(), time.perf_counter() - start
+```
 
 ## Usage
 ```
@@ -132,17 +152,6 @@ Supported inference quantization schemes are:
 | `fp8w8a8` | FP8 (e4m3) weights + FP8 per-tensor activations via `torch._scaled_mm` | NVIDIA Ada Lovelace / Hopper+ (RTX 40xx, H100) |
 | `nvfp4` | NVFP4 weights + FP4 activations via FlashInfer/CUTLASS | NVIDIA Blackwell (B100, B200, RTX 5090) |
 
-
-### SmoothQuant
-
-SmoothQuant improves INT8/FP8 quantization quality by migrating activation outliers into weights at calibration time. It requires a checkpoint that was specifically calibrated with SmoothQuant — passing `smooth=True` with a non-calibrated checkpoint will raise an error.
-
-```python
-# Only works with a SmoothQuant-calibrated checkpoint (e.g. Overworld-Models/MR160k-smoothquant)
-engine = WorldEngine("Overworld-Models/MR160k-smoothquant", quant="intw8a8", smooth=True, device="cuda")
-```
-
-Supported with `intw8a8` and `fp8w8a8`. Has no effect (and will raise) with `nvfp4` or `fp8`.
 
 ### WorldEngine
 

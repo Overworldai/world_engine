@@ -26,6 +26,7 @@ COMPILE_OPTIONS = {
     # "shape_padding": True,
 }
 
+
 @dataclass
 class CtrlInput:
     button: Set[int] = field(default_factory=set)  # pressed button IDs
@@ -61,6 +62,7 @@ class WorldEngine:
             self.model_cfg.merge_with(model_config_overrides)
 
         with torch.device(self.device):
+            pH, pW = self.model_cfg.patch
             # Load Model / Modules
             self.vae = get_ae(
                 self.model_cfg.ae_uri,
@@ -69,6 +71,10 @@ class WorldEngine:
                 ane=ane_vae,
                 dtype=dtype,
                 device=device,
+                **(
+                    {"height": self.model_cfg.height * pH, "width": self.model_cfg.width * pW}
+                    if self.model_cfg.taehv_ae else {}
+                ),
             )
 
             self.prompt_encoder = None
@@ -80,14 +86,13 @@ class WorldEngine:
             ).eval()
             apply_inference_patches(self.model)
             if quant is not None:
-                quantize_model(self.model, quant, smoothquant=smooth)
+                quantize_model(self.model, quant)
 
             self.kv_cache = StaticKVCache(self.model_cfg, batch_size=1, dtype=dtype).to(device=device)
 
             # Inference Scheduler
             self.scheduler_sigmas = torch.tensor(self.model_cfg.scheduler_sigmas, dtype=dtype, device=device)
 
-            pH, pW = self.model_cfg.patch
             self.frm_shape = 1, 1, self.model_cfg.channels, self.model_cfg.height * pH, self.model_cfg.width * pW
 
             # State
@@ -243,11 +248,12 @@ class WorldEngine:
 
     @torch.compile(fullgraph=True, dynamic=False, options=COMPILE_OPTIONS)
     def _denoise_pass(self, x, ctx: Dict[str, Tensor], kv_cache):
+        """Run Deterministic Euler ODE Solver"""
         kv_cache.set_frozen(True)
         sigma = x.new_empty((x.size(0), x.size(1)))
         for step_sig, step_dsig in zip(self.scheduler_sigmas, self.scheduler_sigmas.diff()):
             v = self.model(x, sigma.fill_(step_sig), **ctx, kv_cache=kv_cache)
-            x = x + step_dsig * v
+            x = (x.float() + step_dsig.float() * v.float()).type_as(x)
         return x
 
     @torch.compile(fullgraph=True, dynamic=False, options=COMPILE_OPTIONS)
