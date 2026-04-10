@@ -1,5 +1,12 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = [
+  "setuptools>=68",
+  "wheel",
+  # macOS-only: needed to compile we_kernels Metal extension at build time.
+  # Harmless no-ops on Linux/Windows (cmake/nanobind install but aren't used).
+  "cmake>=3.27",
+  "nanobind==2.10.2",
+]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -24,18 +31,14 @@ dependencies = [
   "gemlite @ https://github.com/dropbox/gemlite/archive/ebfcc197d694acd4ca8dfaadf5fceb3570401df3.zip",
   # MLX / Metal (macOS only)
   "mlx; sys_platform == 'darwin'",
-  "nanobind==2.10.2; sys_platform == 'darwin'",
-  "cmake>=3.27; sys_platform == 'darwin'",
-  "we-kernels; sys_platform == 'darwin'",
   "matplotlib>=3.10.8",
 ]
 
 [tool.uv.sources]
 mlx = { git = "https://github.com/Clydingus/mlx.git", branch = "fix/sdpa-nax-int16-overflow" }
-we-kernels = { path = "src/mlx_metal/ext", editable = true }
 
 [tool.uv]
-no-build-isolation-package = ["we-kernels"]
+no-build-isolation-package = ["world-engine"]
 
 [tool.setuptools]
 packages = [
@@ -43,10 +46,12 @@ packages = [
   "world_engine.model",
   "world_engine.mlx_metal",
   "world_engine.mlx_metal.ane",
+  "we_kernels",
 ]
 
 [tool.setuptools.package-dir]
 world_engine = "src"
+we_kernels = "src/mlx_metal/ext/we_kernels"
 
 [dependency-groups]
 dev = [
