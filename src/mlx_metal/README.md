@@ -1,14 +1,18 @@
-# mlx_metal — W8A8 Quantized Inference on Apple Silicon
+# mlx_metal — Apple Silicon Inference
 
-Custom Metal kernels and MLX model code for W8A8 symmetric quantized inference
-on Apple Silicon GPUs.
+MLX model, custom Metal kernels, and Apple Neural Engine (ANE) integration for
+world model inference on Apple Silicon.
 
 ## Contents
 
 ```
 src/mlx_metal/
   __init__.py              package root
+  engine.py                MLXWorldEngine — WorldEngine subclass for Apple Silicon
   mlx_world_model.py       MLX WorldModel with selective W8A8 linear layers
+  ane/                     Apple Neural Engine (ANE) TAEHV codec
+    ae_ane.py              CoreMLTAEHV — stateful encoder/decoder on ANE via CoreML
+    test_ane.py            ANE validation test
   ext/                     C++ MLX extension (native Metal 4 / NAX path)
     CMakeLists.txt
     setup.py               built automatically via uv sync
@@ -28,7 +32,49 @@ src/mlx_metal/
     bench_fused_quant.py   ZeroQuant fused kernel benchmarks
     bench_mlx.py           full model benchmark (fp16 / speed / max_qat profiles)
     bench_render.py        full render pipeline: MLX model + TAEHV decode → PNG frames
+    bench_engine.py        MLXWorldEngine end-to-end benchmark
 ```
+
+## MLXWorldEngine
+
+`MLXWorldEngine` subclasses `WorldEngine` for Apple Silicon. It runs the world
+model on MLX (Metal GPU) and the TAEHV video codec on the Neural Engine via CoreML.
+
+```python
+from world_engine import MLXWorldEngine, CtrlInput
+
+engine = MLXWorldEngine("Overworld/Waypoint-1.5-1B", ane_vae=True)
+engine.set_prompt("A fun game")
+engine.append_frame(seed_img)  # [4, 720, 1280, 3] uint8
+
+for ctrl in controls:
+    img = engine.gen_frame_pipelined(ctrl=ctrl)
+    if img is not None:
+        display(img)  # [4, 720, 1280, 3] uint8
+img = engine.flush_pipeline()
+```
+
+### Hardware mapping
+
+| Component | Hardware | Latency |
+|-----------|----------|---------|
+| World model (denoise + cache) | Metal GPU via MLX | ~30-80ms |
+| TAEHV encoder | ANE via CoreML | ~12ms |
+| TAEHV decoder (stateful) | ANE via CoreML | ~22ms |
+
+`gen_frame_pipelined()` overlaps GPU denoise with ANE decode in a background
+thread. `gen_frame()` runs synchronously.
+
+### ANE TAEHV decoder
+
+The TAEHV decoder maintains temporal state (MemBlock memories) between frames.
+CoreML's `StateType` doesn't compile on ANE (error -14), so state is passed as
+explicit model inputs/outputs — the caller manages the state ring between
+`predict()` calls. Output state is built with `torch.cat` (not `zeros + scatter`,
+which is ~40ms slower on ANE).
+
+Exported models are cached in `diagnostics/taehv_ane/` and auto-generated on
+first use.
 
 ## Architecture
 
@@ -80,29 +126,12 @@ Fused Metal kernels:
 
 ### SmoothQuant integration
 
-Loads pre-calibrated per-channel smooth scales from `Overworld-Models/MR160k-smoothquant`.
+Loads pre-calibrated per-channel smooth scales from any applicable smoothquant model checkpoint.
 96 smooth scales total: per block × 4 (q_proj, k_proj, v_proj, mlp.fc1).
 
 For merged QKV projections, the three separate q/k/v scales are unified via element-wise
 max (matching PyTorch's `merge_qkv_smoothscales`), with weight compensation applied.
 Smooth scales are fused directly into the Metal quantization kernels — no fallback path.
-
-Benchmark (standalone kernel, M=512):
-| Kernel | Shape | Separate | Fused | Speedup |
-|--------|-------|----------|-------|---------|
-| SiLU+Quant | 512×8192 | 525μs | 203μs | **2.59×** |
-| RMSNorm+AdaLN+Quant | 512×2048 | 258μs | 174μs | **1.48×** |
-
-End-to-end (fused quant + GEMM vs fp16 baseline):
-| Operation | fp16 | W8A8 fused | Speedup |
-|-----------|------|-----------|---------|
-| QKV proj (2048→6144) | 484μs | 348μs | **0.72×** |
-| MLP fc2 (8192→2048) | 593μs | 478μs | **0.81×** |
-| **Forward pass total** | **44.3ms** | **36.8ms** | **0.83×** |
-
-## Known Issues
-
-### Quality degredation after a few frames
 
 ## Setup
 
@@ -116,15 +145,24 @@ End-to-end (fused quant + GEMM vs fp16 baseline):
 ### Running benchmarks
 
 ```bash
+# Engine (end-to-end via MLXWorldEngine — ANE decode by default)
+uv run python -m src.mlx_metal.benchmarks.bench_engine
+uv run python -m src.mlx_metal.benchmarks.bench_engine --save-frames
+uv run python -m src.mlx_metal.benchmarks.bench_engine --no-ane        # CPU decode
+
+# Render (detailed model/decode split timing, stability analysis)
+uv run python -m src.mlx_metal.benchmarks.bench_render --ane --save-frames
+uv run python -m src.mlx_metal.benchmarks.bench_render --smoothquant --save-frames
+uv run python -m src.mlx_metal.benchmarks.bench_render --stability --frames 60
+
+# ANE TAEHV validation
+uv run python -m src.mlx_metal.ane.test_ane
+
+# Kernels
 uv run python -m src.mlx_metal.benchmarks.bench_gemm
 uv run python -m src.mlx_metal.benchmarks.bench_gemm --shapes sweep --accuracy
 uv run python -m src.mlx_metal.benchmarks.bench_e2e
-uv run python -m src.mlx_metal.benchmarks.bench_e2e --accuracy
 uv run python -m src.mlx_metal.benchmarks.bench_fused_quant
-uv run python -m src.mlx_metal.benchmarks.bench_fused_quant --accuracy
 uv run python -m src.mlx_metal.benchmarks.bench_mlx
 uv run python -m src.mlx_metal.benchmarks.bench_mlx --smoothquant
-uv run python -m src.mlx_metal.benchmarks.bench_mlx --model-uri Overworld-Models/MR160k-smoothquant
-uv run python -m src.mlx_metal.benchmarks.bench_render --save-frames
-uv run python -m src.mlx_metal.benchmarks.bench_render --smoothquant --save-frames
 ```
