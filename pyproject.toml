@@ -1,13 +1,7 @@
 [build-system]
-requires = [
-  "setuptools>=68",
-  "wheel",
-  # macOS-only: needed to compile we_kernels Metal extension at build time.
-  # Harmless no-ops on Linux/Windows (cmake/nanobind install but aren't used).
-  "cmake>=3.27",
-  "nanobind==2.10.2",
-]
-build-backend = "setuptools.build_meta"
+requires = ["setuptools>=68", "wheel", "cmake>=3.27"]
+build-backend = "backend"
+backend-path = ["_build_backend"]
 
 [project]
 name = "world_engine"
@@ -36,9 +30,6 @@ dependencies = [
 
 [tool.uv.sources]
 mlx = { git = "https://github.com/Clydingus/mlx.git", branch = "fix/sdpa-nax-int16-overflow" }
-
-[tool.uv]
-no-build-isolation-package = ["world-engine"]
 
 [tool.setuptools]
 packages = [

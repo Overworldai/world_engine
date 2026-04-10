@@ -1,6 +1,11 @@
 """World Engine Metal kernels — custom MLX C++ extensions for Apple Silicon."""
 from __future__ import annotations
 
+import sys as _sys
+
+if _sys.platform != "darwin":
+    raise ImportError("we_kernels requires macOS (Apple Silicon)")
+
 import mlx.core as mx
 
 from we_kernels import _ext
