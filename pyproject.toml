@@ -29,7 +29,7 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-mlx = { git = "https://github.com/Clydingus/mlx.git", branch = "fix/sdpa-nax-int16-overflow" }
+mlx = { git = "https://github.com/ml-explore/mlx.git", branch = "main" }
 
 [tool.setuptools]
 packages = [
