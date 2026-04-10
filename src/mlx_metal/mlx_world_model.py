@@ -709,7 +709,7 @@ def _extract_smooth_scales(pt_model) -> dict:
 
 def load_from_pytorch(model_uri: str, int8_profile: Optional[str] = "speed", kv_cache_mode: str = "fp16", attention_mode: str = "fp16") -> Tuple[MLXWorldModel, object]:
     import torch
-    from src.model import WorldModel
+    from world_engine.model import WorldModel
 
     cfg = WorldModel.load_config(model_uri)
     global N_LAYERS, D_MODEL, N_HEADS, N_KV_HEADS, D_HEAD, D_ROPE, T, C, HP, WP, PH, PW, N_BUTTONS, SIGMAS, DSIGMAS
