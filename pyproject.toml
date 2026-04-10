@@ -25,6 +25,7 @@ dependencies = [
   "gemlite @ https://github.com/dropbox/gemlite/archive/ebfcc197d694acd4ca8dfaadf5fceb3570401df3.zip",
   # MLX / Metal (macOS only)
   "mlx; sys_platform == 'darwin'",
+  "coremltools; sys_platform == 'darwin'",
   "matplotlib>=3.10.8",
 ]
 
