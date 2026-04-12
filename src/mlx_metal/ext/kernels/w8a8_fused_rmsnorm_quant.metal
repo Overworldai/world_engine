@@ -13,7 +13,7 @@ struct FusedRMSNormQuantParams {
 };
 
 constant constexpr int TG_SIZE = 256;
-constant constexpr int MAX_K = 8192;
+constant constexpr int MAX_K = 2048;  // D_MODEL; saves 12KB TG mem vs 8192
 
 // RMSNorm + AdaLN(*(1+s)+b) + int8 quantization
 [[kernel, max_total_threads_per_threadgroup(TG_SIZE)]]
@@ -255,7 +255,8 @@ void fused_rmsnorm_quant(
 
 // Plain per-row symmetric int8 quantization (no RMSNorm, no AdaLN).
 // Replaces Python-side quant (abs+max+div+round+clip) with a single dispatch.
-// Used by out_proj and other Int8NaxLinear paths without pre-quantization.
+// No threadgroup cache — re-reads from device on second pass (matches MLX's
+// pattern for simple two-pass kernels). Saves 16KB TG memory → higher occupancy.
 [[kernel, max_total_threads_per_threadgroup(TG_SIZE)]]
 void fused_quant(
     device const half* x        [[buffer(0)]],
@@ -273,15 +274,12 @@ void fused_quant(
     const device half* x_row = x + row * K;
     device int8_t* q_row = x_q + row * K;
 
-    threadgroup half x_cache[MAX_K];
     threadgroup float sg_reduce[TG_SIZE / 32];
 
-    // Phase 1: read + cache + absmax
+    // Pass 1: absmax
     float local_max = 0.0f;
     for (uint k = tid; k < K; k += TG_SIZE) {
-        float v = (float)x_row[k];
-        x_cache[k] = (half)v;
-        local_max = max(local_max, abs(v));
+        local_max = max(local_max, abs((float)x_row[k]));
     }
 
     local_max = simd_max(local_max);
@@ -302,9 +300,9 @@ void fused_quant(
 
     float inv_scale = 1.0f / sg_reduce[0];
 
-    // Phase 2: quantize from cache
+    // Pass 2: re-read from device + quantize
     for (uint k = tid; k < K; k += TG_SIZE) {
-        float v = (float)x_cache[k] * inv_scale;
+        float v = (float)x_row[k] * inv_scale;
         q_row[k] = (int8_t)clamp(rint(v), -127.0f, 127.0f);
     }
 }

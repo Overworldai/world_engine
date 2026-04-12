@@ -144,23 +144,25 @@ class MLXWorldEngine(WorldEngine):
         rope_cos, rope_sin = self._rope(frame_idx)
         mouse, button, scroll = self._ctrl_to_mlx(ctrl)
 
-        # MLX denoise + cache write (GPU)
+        # MLX denoise (GPU)
         shape = self._mlx_latent_shape()
         x = mx.array(np.random.randn(*shape).astype(np.float16))
         x0 = self.mlx_model.denoise(x, rope_cos, rope_sin, mouse, button, scroll, frame_idx)
         mx.eval(x0)
-        self.mlx_model.cache_write(x0, rope_cos, rope_sin, mouse, button, scroll, frame_idx)
-        self.frame_ts.add_(1)
 
-        # Collect previous ANE decode
+        # Collect previous ANE decode (should already be done — 17ms ANE < 147ms GPU)
         prev_img = None
         if self._pending_decode is not None:
             prev_img = self._pending_decode.result()
             self._pending_decode = None
 
-        # Start new ANE decode in background
+        # Submit ANE decode BEFORE cache_write so they overlap on GPU + ANE
         latent_pt = self._mlx_to_torch_latent(x0)
         self._pending_decode = self._decode_executor.submit(self.vae.decode, latent_pt)
+
+        # Cache write (GPU) — runs in parallel with ANE decode above
+        self.mlx_model.cache_write(x0, rope_cos, rope_sin, mouse, button, scroll, frame_idx)
+        self.frame_ts.add_(1)
 
         return prev_img
 

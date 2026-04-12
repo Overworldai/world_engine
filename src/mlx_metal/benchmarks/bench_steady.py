@@ -92,15 +92,12 @@ def main():
         print(f"  Global — {len(global_kv.written_slots)}/{global_kv.num_buckets} slots, "
               f"capacity={global_kv.capacity} tokens, dilation={global_kv.dilation}")
 
-    # Show block offset count (= attention span per layer)
-    fi_sample = total_fill + 1
-    local_bo = local_kv.compute_block_offsets(fi_sample)
-    n_local_blocks = local_bo.shape[0]
-    print(f"  Local  attention blocks: {n_local_blocks} (= {n_local_blocks * 32} tokens)")
+    # Show attention span per layer
+    n_local_tokens = len(local_kv.written_slots) * 512
+    print(f"  Local  attention tokens: {n_local_tokens}")
     if global_kv:
-        global_bo = global_kv.compute_block_offsets(fi_sample)
-        n_global_blocks = global_bo.shape[0]
-        print(f"  Global attention blocks: {n_global_blocks} (= {n_global_blocks * 32} tokens)")
+        n_global_tokens = len(global_kv.written_slots) * 512
+        print(f"  Global attention tokens: {n_global_tokens}")
 
     # --- Phase 2: timed frames ---
     print(f"\nBenchmarking {args.frames} frames at steady state...")

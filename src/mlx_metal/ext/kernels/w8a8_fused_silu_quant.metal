@@ -12,7 +12,6 @@ struct FusedSiLUQuantParams {
 };
 
 constant constexpr int TG_SIZE = 256;
-constant constexpr int MAX_K = 8192;
 
 [[kernel, max_total_threads_per_threadgroup(TG_SIZE)]]
 void fused_silu_quant(
@@ -31,22 +30,17 @@ void fused_silu_quant(
     const device half* x_row = x + row * K;
     device int8_t* q_row = x_q + row * K;
 
-    threadgroup half silu_cache[MAX_K];
     threadgroup float sg_max[TG_SIZE / 32];
 
-    // Phase 1: SiLU + cache + absmax
+    // Pass 1: SiLU + absmax (no cache — re-read + recompute on pass 2)
     float local_max = 0.0f;
     for (uint k = tid; k < K; k += TG_SIZE) {
         float v = (float)x_row[k];
-        float s = v / (1.0f + exp(-v));  // SiLU
-        silu_cache[k] = (half)s;
+        float s = v / (1.0f + fast::exp(-v));
         local_max = max(local_max, abs(s));
     }
 
-    // SIMD reduce
     local_max = simd_max(local_max);
-
-    // Cross-simdgroup reduce
     uint sgid = tid / 32;
     uint lane = tid % 32;
     if (lane == 0) sg_max[sgid] = local_max;
@@ -64,9 +58,10 @@ void fused_silu_quant(
 
     float inv_scale = 1.0f / sg_max[0];
 
-    // Phase 2: quantize from cache
+    // Pass 2: re-read + SiLU + quantize
     for (uint k = tid; k < K; k += TG_SIZE) {
-        float v = (float)silu_cache[k] * inv_scale;
-        q_row[k] = (int8_t)clamp(rint(v), -127.0f, 127.0f);
+        float v = (float)x_row[k];
+        float s = v / (1.0f + fast::exp(-v));
+        q_row[k] = (int8_t)clamp(rint(s * inv_scale), -127.0f, 127.0f);
     }
 }

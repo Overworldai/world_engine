@@ -15,7 +15,7 @@ import numpy as np
 
 from we_kernels import w8a8_gemm_nax
 from we_kernels import fused_silu_quant, fused_rmsnorm_adaln_quant, w8a8_gemm_prequantized, w8a8_silu_gemm_nax
-from we_kernels import scatter_sdpa, fused_qkv_norm_rope, kv_cache_upsert
+from we_kernels import seq_sdpa, fused_qkv_norm_rope, kv_cache_upsert
 
 DTYPE = mx.float16
 
@@ -369,8 +369,6 @@ def compute_rope_angles(frame_idx: int, ts_mult: float, rope_xy: mx.array, rope_
 
 
 class RingKVCache:
-    BK = 32  # scatter_sdpa block granularity
-
     def __init__(self, L: int, dilation: int, num_buckets: int):
         # No separate tail — the stale slot doubles as scratch space.
         self.capacity = L
@@ -406,27 +404,7 @@ class RingKVCache:
         """Whether this frame persists to the ring (respects dilation)."""
         return (frame_idx % self.dilation) == 0
 
-    def compute_block_offsets(self, frame_idx: int) -> mx.array:
-        """Precompute BK-aligned block offsets for scatter-read SDPA.
-
-        Includes all written slots plus the scratch slot (which holds the
-        current frame's KV after upsert).
-        """
-        scratch = self._scratch_slot(frame_idx)
-
-        # All written slots + scratch (current frame's KV lives here)
-        active = self.written_slots | {scratch}
-
-        offsets = []
-        for slot in sorted(active):
-            start = slot * T
-            for blk in range(T // self.BK):
-                offsets.append(start + blk * self.BK)
-
-        return mx.array(np.array(offsets, dtype=np.int32))
-
-    def upsert(self, k_new: mx.array, v_new: mx.array, frame_idx: int,
-               block_offsets: mx.array | None = None) -> None:
+    def upsert(self, k_new: mx.array, v_new: mx.array, frame_idx: int) -> None:
         """Write current frame's KV to the scratch slot.
 
         Always writes to scratch (used as working space during denoise).
@@ -516,7 +494,7 @@ class TransformerBlock(nn.Module):
         if has_ctrl:
             self.ctrl_mlpfusion = CtrlFusion()
 
-    def __call__(self, x: mx.array, cond: mx.array, ctrl_emb: mx.array, rope_cos: mx.array, rope_sin: mx.array, v1_in: Optional[mx.array], kv_cache: RingKVCache, frame_idx: int, block_offsets: mx.array | None = None) -> Tuple[mx.array, mx.array]:
+    def __call__(self, x: mx.array, cond: mx.array, ctrl_emb: mx.array, rope_cos: mx.array, rope_sin: mx.array, v1_in: Optional[mx.array], kv_cache: RingKVCache, frame_idx: int) -> Tuple[mx.array, mx.array]:
         s0, b0, g0, s1, b1, g1 = self.cond_head(cond)
         residual = x
 
@@ -564,12 +542,14 @@ class TransformerBlock(nn.Module):
         else:
             v1_out = v_new
 
-        # KV cache upsert + scatter-read SDPA
-        kv_cache.upsert(k_new, v_new, frame_idx, block_offsets=block_offsets)
+        # KV cache upsert + SDPA
+        kv_cache.upsert(k_new, v_new, frame_idx)
         n_kv = kv_cache.keys.shape[1]
         k_3d = mx.reshape(kv_cache.keys, (n_kv, kv_cache.capacity, D_HEAD))
         v_3d = mx.reshape(kv_cache.values, (n_kv, kv_cache.capacity, D_HEAD))
-        y_nhd = scatter_sdpa(q, k_3d, v_3d, block_offsets, float(D_HEAD ** -0.5))
+        # Slots fill sequentially from 0, so active range is always [0, num_kv_tokens).
+        num_kv_tokens = (len(kv_cache.written_slots | {kv_cache._scratch_slot(frame_idx)})) * T
+        y_nhd = seq_sdpa(q, k_3d, v_3d, num_kv_tokens, float(D_HEAD ** -0.5))
         y = mx.reshape(y_nhd.transpose(1, 0, 2), (1, T, N_HEADS * D_HEAD))
         y = self.attn.out_proj(y)
         x4_y = mx.reshape(y, (1, 1, T, D_MODEL))
@@ -644,15 +624,16 @@ class MLXWorldModel(nn.Module):
             TransformerBlock(i, ((i - off) % period == 0), (ctrl_period is not None and i % ctrl_period == 0), cfg, shared_cond_proj)
             for i in range(N_LAYERS)
         ]
-        local_L = cfg.local_window * T
-        global_L = cfg.global_window * T
         self.kv_caches: List[RingKVCache] = []
         for i in range(N_LAYERS):
             is_global = ((i - off) % period == 0)
-            L = global_L if is_global else local_L
+            window = cfg.global_window if is_global else cfg.local_window
             dilation = cfg.global_pinned_dilation if is_global else 1
-            num_buckets = (L // T) // dilation
-            self.kv_caches.append(RingKVCache(L, dilation, num_buckets))
+            num_buckets = window // dilation
+            # Allocate only num_buckets * T tokens, not window * T.
+            # With dilation>1 (global layers), this compacts the cache from
+            # 65536 to 8192 tokens — eliminating 7MB dead stride between heads.
+            self.kv_caches.append(RingKVCache(num_buckets * T, dilation, num_buckets))
 
     def noise_cond(self, sigma: float) -> mx.array:
         s = mx.array([sigma], dtype=mx.float32) * 1000.0
@@ -668,26 +649,15 @@ class MLXWorldModel(nn.Module):
         mlp = self.ctrl_emb.mlp
         return mlp.fc2(nn.silu(mlp.fc1(inp))).astype(DTYPE) + 1e-7
 
-    def forward_single(self, x: mx.array, cond: mx.array, rope_cos: mx.array, rope_sin: mx.array, mouse: mx.array, button: mx.array, scroll: mx.array, frame_idx: int, _block_offsets: list | None = None, _ctrl_emb: mx.array | None = None) -> mx.array:
+    def forward_single(self, x: mx.array, cond: mx.array, rope_cos: mx.array, rope_sin: mx.array, mouse: mx.array, button: mx.array, scroll: mx.array, frame_idx: int, _ctrl_emb: mx.array | None = None) -> mx.array:
         ctrl_emb = _ctrl_emb if _ctrl_emb is not None else self.ctrl_embed(mouse, button, scroll)
         x_2d = mx.reshape(x, (1, C, HP * PH, WP * PW)).transpose(0, 2, 3, 1)
         x_pat = self.patchify(x_2d)
         x_seq = mx.reshape(x_pat, (1, T, D_MODEL))
-        # Use precomputed block offsets if provided, else compute
-        if _block_offsets is not None:
-            block_offsets_list = _block_offsets
-        else:
-            _off_cache = {}
-            block_offsets_list = []
-            for kv in self.kv_caches:
-                key = (kv.capacity, kv.dilation, kv.num_buckets)
-                if key not in _off_cache:
-                    _off_cache[key] = kv.compute_block_offsets(frame_idx)
-                block_offsets_list.append(_off_cache[key])
 
         v1 = None
-        for blk, kv, bo in zip(self.transformer, self.kv_caches, block_offsets_list):
-            x_seq, v1 = blk(x_seq, cond, ctrl_emb, rope_cos, rope_sin, v1, kv, frame_idx, bo)
+        for blk, kv in zip(self.transformer, self.kv_caches):
+            x_seq, v1 = blk(x_seq, cond, ctrl_emb, rope_cos, rope_sin, v1, kv, frame_idx)
         if isinstance(self.out_norm.fc, Int8NaxSiLULinear):
             ab = self.out_norm.fc(cond)  # SiLU fused inside
         else:
@@ -707,29 +677,15 @@ class MLXWorldModel(nn.Module):
         for kv in self.kv_caches:
             kv.set_frozen(True)
 
-        # Precompute block offsets once (same for all 4 denoise steps)
-        _off_cache = {}
-        block_offsets_list = []
-        for kv in self.kv_caches:
-            key = (kv.capacity, kv.dilation, kv.num_buckets)
-            if key not in _off_cache:
-                _off_cache[key] = kv.compute_block_offsets(frame_idx)
-            block_offsets_list.append(_off_cache[key])
-
-        # Precompute ctrl_embed (same inputs for all 4 steps)
         ctrl_emb = self.ctrl_embed(mouse, button, scroll)
-
-        # Precompute noise conditionings (sigmas are constants)
         conds = [self.noise_cond(sigma) for sigma in SIGMAS[:4]]
 
         for cond, dsigma in zip(conds, DSIGMAS):
             v = self.forward_single(
                 x, cond, rope_cos, rope_sin, mouse, button, scroll, frame_idx,
-                _block_offsets=block_offsets_list,
                 _ctrl_emb=ctrl_emb,
             )
             x = x + dsigma * v
-            mx.eval(x)
         for kv in self.kv_caches:
             kv.set_frozen(False)
         return x

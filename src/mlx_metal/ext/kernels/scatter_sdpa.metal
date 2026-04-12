@@ -321,7 +321,7 @@ void scatter_sdpa_seq_direct_impl(
     }
 
     const uint N_BLK = (KV_LEN + BK - 1) / BK;
-    constexpr uint KV_STRIDE = BK * BD;
+    const uint KV_STRIDE = BK * D;
     const device T* K_blk = K_base;
     const device T* V_blk = V_base;
     for (uint blk = 0; blk < N_BLK; blk++, K_blk += KV_STRIDE, V_blk += KV_STRIDE) {
@@ -420,7 +420,7 @@ void scatter_sdpa_seq_direct_impl(
     }
 }
 
-// No TG memory needed — Q reads from L2 cache
+// BK=32: 256 blocks for 8192 tokens
 [[kernel, max_total_threads_per_threadgroup(64)]]
 void scatter_sdpa_seq_direct_bq32_bk32_wm2(
     const device half* Q [[buffer(0)]],
@@ -432,6 +432,22 @@ void scatter_sdpa_seq_direct_bq32_bk32_wm2(
     uint3 tgid [[threadgroup_position_in_grid]])
 {
     scatter_sdpa_seq_direct_impl<half, 32, 32, 64, 2, 1>(
+        Q, K, V, O, params,
+        simd_group_id, tgid);
+}
+
+// BK=64: 128 blocks — halves per-block overhead (softmax, barrier, loop control)
+[[kernel, max_total_threads_per_threadgroup(64)]]
+void scatter_sdpa_seq_direct_bq32_bk64_wm2(
+    const device half* Q [[buffer(0)]],
+    const device half* K [[buffer(1)]],
+    const device half* V [[buffer(2)]],
+    device half* O [[buffer(3)]],
+    constant SeqAttnParams& params [[buffer(4)]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint3 tgid [[threadgroup_position_in_grid]])
+{
+    scatter_sdpa_seq_direct_impl<half, 32, 64, 64, 2, 1>(
         Q, K, V, O, params,
         simd_group_id, tgid);
 }

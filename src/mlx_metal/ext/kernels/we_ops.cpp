@@ -267,6 +267,12 @@ void FusedRMSNormQuant::eval_gpu(
   auto& x_q = outputs[0];
   auto& x_scales = outputs[1];
 
+  if (K_ > 2048) {
+    throw std::runtime_error(
+        "FusedRMSNormQuant: K=" + std::to_string(K_) +
+        " exceeds MAX_K=2048. Increase MAX_K in w8a8_fused_rmsnorm_quant.metal.");
+  }
+
   x_q.set_data(mx::allocator::malloc(x_q.nbytes()));
   x_scales.set_data(mx::allocator::malloc(x_scales.nbytes()));
 
@@ -459,8 +465,10 @@ void FusedQKVNormRoPE::eval_gpu(
   enc.set_bytes(params, 6);
 
   uint32_t N_TOTAL = N_Q_ + N_K_ + N_V_;
-  MTL::Size grid(T_, N_TOTAL, 1);
-  MTL::Size group(32, 1, 1);  // one simdgroup per (token, head)
+  constexpr uint32_t HEADS_PER_TG = 8;
+  uint32_t head_groups = (N_TOTAL + HEADS_PER_TG - 1) / HEADS_PER_TG;
+  MTL::Size grid(T_, head_groups, 1);
+  MTL::Size group(HEADS_PER_TG * 32, 1, 1);  // 8 simdgroups, each handles one head
   enc.dispatch_threadgroups(grid, group);
 }
 
