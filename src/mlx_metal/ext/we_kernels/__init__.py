@@ -11,6 +11,18 @@ import mlx.core as mx
 from we_kernels import _ext
 
 
+def fused_quant(x: mx.array) -> tuple[mx.array, mx.array]:
+    """Plain per-row symmetric int8 quantization (no RMSNorm).
+
+    Single Metal dispatch replacing Python-side abs+max+div+round+clip.
+
+    Returns (x_q [M, K] int8, x_scales [M] fp32).
+    """
+    x_2d = mx.reshape(x, (-1, x.shape[-1])).astype(mx.float16)
+    result = _ext.fused_quant(x_2d)
+    return result[0], result[1]
+
+
 def w8a8_gemm_nax(
     x: mx.array,
     weight_q: mx.array,
@@ -35,24 +47,16 @@ def w8a8_gemm_nax(
     K = orig_shape[-1]
     N = weight_q.shape[0]
 
-    x_2d = mx.reshape(x, (-1, K)).astype(mx.float16)
+    # Minimize graph nodes: skip redundant reshape/astype when possible
+    x_2d = x if (x.ndim == 2 and x.dtype == mx.float16) else mx.reshape(x, (-1, K)).astype(mx.float16)
 
-    # Dynamic int8 quantisation of activations
-    x_f32 = x_2d.astype(mx.float32)
-    x_absmax = mx.max(mx.abs(x_f32), axis=-1)
-    x_scales = mx.maximum(x_absmax / 127.0, 1e-6)
-    x_q = mx.clip(
-        mx.round(x_f32 / mx.expand_dims(x_scales, -1)),
-        -127, 127,
-    ).astype(mx.int8)
+    # Fused Metal kernel: single dispatch for activation quantization
+    x_q, x_scales = _ext.fused_quant(x_2d)
 
-    w_scales = w_scales.astype(mx.float32)
     bias_data = bias if bias is not None else mx.zeros((N,), dtype=mx.float32)
-
     y = _ext.w8a8_gemm(x_q, weight_q, x_scales, w_scales, bias_data)
 
-    out_shape = orig_shape[:-1] + (N,)
-    return mx.reshape(y, out_shape)
+    return y if len(orig_shape) == 2 else mx.reshape(y, orig_shape[:-1] + (N,))
 
 
 def fused_silu_quant(x: mx.array) -> tuple[mx.array, mx.array]:
@@ -117,7 +121,6 @@ def w8a8_gemm_prequantized(
 ) -> mx.array:
     """W8A8 GEMM with pre-quantized int8 activations (no activation quant step)."""
     N = weight_q.shape[0]
-    w_scales = w_scales.astype(mx.float32)
     bias_data = bias if bias is not None else mx.zeros((N,), dtype=mx.float32)
     return _ext.w8a8_gemm(x_q, weight_q, x_scales, w_scales, bias_data)
 
@@ -128,34 +131,83 @@ def scatter_sdpa(
     V: mx.array,
     block_offsets: mx.array,
     scale: float,
-    variant: str = "",
 ) -> mx.array:
     """Scatter-read flash attention.
 
-    Fused SDPA that reads K/V directly from cache at valid block offsets.
-    No intermediate gather copy. Uses NAX MMA and online softmax.
+    Fused SDPA that reads K/V from cache at valid block offsets.
+    Uses NAX MMA and online softmax. Tile config selected in C++.
 
     Parameters
     ----------
     Q : mx.array, fp16, shape [N_Q, T, D_HEAD]
     K : mx.array, fp16, shape [N_KV, capacity, D_HEAD]
     V : mx.array, fp16, shape [N_KV, capacity, D_HEAD]
-    block_offsets : mx.array, int32, shape [N_BLOCKS] — token offsets of valid BK-aligned blocks
+    block_offsets : mx.array, int32, shape [N_BLOCKS] — BK-aligned token offsets
     scale : float — typically 1/sqrt(D_HEAD)
-    variant : str — tile config, e.g. "bq16_bk32_wm1", "bq32_bk32_wm2", etc.
 
     Returns
     -------
     mx.array, fp16, shape [N_Q, T, D_HEAD]
     """
-    Q_h = Q.astype(mx.float16)
-    K_h = K.astype(mx.float16)
-    V_h = V.astype(mx.float16)
-    bo = block_offsets.astype(mx.int32)
-    if variant:
-        fn = getattr(_ext, f"scatter_sdpa_{variant}")
-        return fn(Q_h, K_h, V_h, bo, scale)
-    return _ext.scatter_sdpa(Q_h, K_h, V_h, bo, scale)
+    return _ext.scatter_sdpa(
+        Q.astype(mx.float16),
+        K.astype(mx.float16),
+        V.astype(mx.float16),
+        block_offsets.astype(mx.int32),
+        float(scale),
+    )
+
+
+def seq_sdpa(
+    Q: mx.array,
+    K: mx.array,
+    V: mx.array,
+    num_kv_tokens: int,
+    scale: float,
+) -> mx.array:
+    """Sequential-scan attention with contiguous K/V (no block_offsets).
+
+    K/V are read sequentially from offset 0 to num_kv_tokens. Q reads
+    from device memory (L2 cached). Tile config selected in C++.
+
+    Parameters
+    ----------
+    Q : mx.array, fp16, shape [N_Q, T, D_HEAD]
+    K : mx.array, fp16, shape [N_KV, capacity, D_HEAD] — reads [0, num_kv_tokens)
+    V : mx.array, fp16, shape [N_KV, capacity, D_HEAD]
+    num_kv_tokens : int — number of valid KV tokens (contiguous from 0)
+    scale : float — typically 1/sqrt(D_HEAD)
+
+    Returns
+    -------
+    mx.array, fp16, shape [N_Q, T, D_HEAD]
+    """
+    return _ext.seq_sdpa(
+        Q.astype(mx.float16),
+        K.astype(mx.float16),
+        V.astype(mx.float16),
+        int(num_kv_tokens),
+        float(scale),
+    )
+
+
+def kv_cache_upsert(
+    cache_k: mx.array,
+    cache_v: mx.array,
+    k_new: mx.array,
+    v_new: mx.array,
+    rs: int,
+) -> tuple[mx.array, mx.array]:
+    """In-place KV cache ring buffer upsert.
+
+    Writes k_new/v_new [N_KV, T, D] into cache [N_KV, L, D] at token
+    offset rs. Single Metal dispatch instead of MLX slice assignment
+    which copies the entire cache tensor.
+
+    Returns (cache_k_updated, cache_v_updated).
+    """
+    result = _ext.kv_cache_upsert(cache_k, cache_v, k_new, v_new, int(rs))
+    return result[0], result[1]
 
 
 def fused_qkv_norm_rope(
@@ -204,13 +256,10 @@ def w8a8_silu_gemm_nax(
     K = orig_shape[-1]
     N = weight_q.shape[0]
 
-    x_2d = mx.reshape(x, (-1, K)).astype(mx.float16)
+    x_2d = x if (x.ndim == 2 and x.dtype == mx.float16) else mx.reshape(x, (-1, K)).astype(mx.float16)
     x_q, x_scales = _ext.fused_silu_quant(x_2d)
 
-    w_scales = w_scales.astype(mx.float32)
     bias_data = bias if bias is not None else mx.zeros((N,), dtype=mx.float32)
-
     y = _ext.w8a8_gemm(x_q, weight_q, x_scales, w_scales, bias_data)
 
-    out_shape = orig_shape[:-1] + (N,)
-    return mx.reshape(y, out_shape)
+    return y if len(orig_shape) == 2 else mx.reshape(y, orig_shape[:-1] + (N,))

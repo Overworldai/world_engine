@@ -31,17 +31,20 @@ static constexpr TileConfig V2_WIDE_N   = { 64, 128, 128, 2, 4, "w8a8_gemm_v2_bm
 static constexpr TileConfig V2_LARGE    = {128, 128,  64, 4, 4, "w8a8_gemm_v2_bm128_bn128_bk64_wm4_wn4"};
 
 static const TileConfig& select_tile(uint32_t M, uint32_t N, uint32_t K) {
-  // Thresholds from bench_gemm.py on M5 Max (see w8a8_gemm.metal header).
-  // N >= 4096: v1 both-staged wins (mlp.fc1 N=8192, qkv N=6144)
-  // N < 4096:  v2 A-direct wins (attn.out N=2048, mlp.fc2 K=8192)
-  if (M >= 128 && N >= 128) {
-    return (N >= 4096) ? V1_LARGE : V2_LARGE;
-  }
-  if (M >= 64 && N >= 128) {
-    return (N >= 4096) ? V1_WIDE_N : V2_WIDE_N;
-  }
-  // K >= 192: deep-K v1 tile fits BK=128 in threadgroup budget, better K-reuse
-  if (K >= 192) return V1_DEEP_K;
+  // bench_steady validated (M5 Max, saturated KV cache, all optimizations):
+  //
+  // V1_SMALL (64×64×64) wins for ALL shapes. Maximum TG count gives best
+  // occupancy and load balancing across 40 GPU cores in lazy eval.
+  //
+  // Tested alternatives (all slower in end-to-end):
+  //   V2_DEEP_K for fc2 (K=8192): +15ms despite fewer K-loop iters
+  //   V1_DEEP_K for QKV/fc1 (N>=4096): +10ms despite halved K-loop
+  //   V1_LARGE, V1_WIDE_N: +10-20ms
+  //
+  // CAUTION: isolated GEMM benchmarks with mx.eval() are misleading.
+  // V2_DEEP_K appears ~20% faster in isolation but ~10% slower end-to-end
+  // because lazy eval batches kernels differently than per-call sync.
+  // Always validate with bench_steady, never isolated mx.eval() timings.
   return V1_SMALL;
 }
 
@@ -189,6 +192,61 @@ std::vector<mx::array> fused_silu_quant(
        mx::Shape{static_cast<int>(M)}},
       {mx::int8, mx::float32},
       std::make_shared<FusedSiLUQuant>(stream, M, K),
+      {mx::contiguous(x, false, stream)});
+}
+
+// ===========================================================================
+// Plain per-row int8 quantization (no RMSNorm)
+// ===========================================================================
+
+void FusedQuant::eval_cpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  throw std::runtime_error("FusedQuant: CPU not supported");
+}
+
+void FusedQuant::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& x = inputs[0];
+  auto& x_q = outputs[0];
+  auto& x_scales = outputs[1];
+
+  x_q.set_data(mx::allocator::malloc(x_q.nbytes()));
+  x_scales.set_data(mx::allocator::malloc(x_scales.nbytes()));
+
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+  auto mtl_lib = d.get_library("we_kernels", lib_path());
+  auto kernel = d.get_kernel("fused_quant", mtl_lib);
+
+  auto& enc = mx::metal::get_command_encoder(s);
+  enc.set_compute_pipeline_state(kernel);
+
+  enc.set_input_array(x, 0);
+  enc.set_output_array(x_q, 1);
+  enc.set_output_array(x_scales, 2);
+
+  struct Params { uint32_t M; uint32_t K; float eps; };
+  Params params{M_, K_, 0.0f};  // eps unused but matches struct layout
+  enc.set_bytes(params, 3);
+
+  MTL::Size grid(M_, 1, 1);
+  MTL::Size group(256, 1, 1);
+  enc.dispatch_threadgroups(grid, group);
+}
+
+std::vector<mx::array> fused_quant(
+    const mx::array& x,
+    mx::StreamOrDevice s) {
+  uint32_t M = static_cast<uint32_t>(x.shape(0));
+  uint32_t K = static_cast<uint32_t>(x.shape(1));
+  auto stream = mx::to_stream(s);
+  return mx::array::make_arrays(
+      {mx::Shape{static_cast<int>(M), static_cast<int>(K)},
+       mx::Shape{static_cast<int>(M)}},
+      {mx::int8, mx::float32},
+      std::make_shared<FusedQuant>(stream, M, K),
       {mx::contiguous(x, false, stream)});
 }
 
@@ -457,7 +515,9 @@ void ScatterSDPA::eval_gpu(
   auto& s = stream();
   auto& d = mx::metal::device(s.device);
   auto mtl_lib = d.get_library("we_kernels", lib_path());
-  auto kernel = d.get_kernel(kernel_name_, mtl_lib);
+
+  // BQ=32, BK=32, WM=2: best for T=512 N_HEADS=32 (bench_tune validated)
+  auto kernel = d.get_kernel("scatter_sdpa_bq32_bk32_wm2", mtl_lib);
 
   auto& enc = mx::metal::get_command_encoder(s);
   enc.set_compute_pipeline_state(kernel);
@@ -475,27 +535,11 @@ void ScatterSDPA::eval_gpu(
   Params params{N_Q_, N_KV_, T_, capacity_, D_HEAD_, n_blocks_, scale_};
   enc.set_bytes(params, 5);
 
-  uint32_t q_blocks = (T_ + bq_ - 1) / bq_;
+  constexpr uint32_t BQ = 32;
+  uint32_t q_blocks = (T_ + BQ - 1) / BQ;
   MTL::Size grid(q_blocks, N_Q_, 1);
-  MTL::Size group(tg_size_, 1, 1);
+  MTL::Size group(64, 1, 1);  // 2 simdgroups
   enc.dispatch_threadgroups(grid, group);
-}
-
-// Variant configs: kernel_name, BQ, tg_size
-struct VariantConfig {
-  const char* kernel_name;
-  uint32_t bq;
-  uint32_t tg_size;
-};
-
-static VariantConfig resolve_variant(const std::string& variant) {
-  if (variant == "bq16_bk32_wm1")  return {"scatter_sdpa_bq16_bk32_wm1",  16, 32};
-  if (variant == "bq32_bk32_wm1")  return {"scatter_sdpa_bq32_bk32_wm1",  32, 32};
-  if (variant == "bq32_bk32_wm2")  return {"scatter_sdpa_bq32_bk32_wm2",  32, 64};
-  if (variant == "bq64_bk32_wm2")  return {"scatter_sdpa_bq64_bk32_wm2",  64, 64};
-  if (variant == "bq32_bk64_wm1")  return {"scatter_sdpa_bq32_bk64_wm1",  32, 32};
-  // Default
-  return {"scatter_sdpa", 32, 32};
 }
 
 mx::array scatter_sdpa(
@@ -504,7 +548,6 @@ mx::array scatter_sdpa(
     const mx::array& V,
     const mx::array& block_offsets,
     float scale,
-    const std::string& variant,
     mx::StreamOrDevice s) {
   uint32_t N_Q = static_cast<uint32_t>(Q.shape(0));
   uint32_t N_KV = static_cast<uint32_t>(K.shape(0));
@@ -513,19 +556,164 @@ mx::array scatter_sdpa(
   uint32_t capacity = static_cast<uint32_t>(K.shape(1));
   uint32_t n_blocks = static_cast<uint32_t>(block_offsets.shape(0));
 
-  auto cfg = resolve_variant(variant);
-
+  // BQ=32 BK=32 WM=2: best for T=512 N_HEADS=32 (512 TGs, 72% NAX eff)
   auto stream = mx::to_stream(s);
   return mx::array(
       {static_cast<int>(N_Q), static_cast<int>(T), static_cast<int>(D)},
       mx::float16,
       std::make_shared<ScatterSDPA>(
-          stream, N_Q, N_KV, T, capacity, D, n_blocks, scale,
-          cfg.kernel_name, cfg.bq, cfg.tg_size),
+          stream, N_Q, N_KV, T, capacity, D, n_blocks, scale),
       {mx::contiguous(Q, false, stream),
        mx::contiguous(K, false, stream),
        mx::contiguous(V, false, stream),
        mx::contiguous(block_offsets, false, stream)});
+}
+
+// ===========================================================================
+// Sequential-scan attention (contiguous K/V, no block_offsets)
+// ===========================================================================
+
+void SeqSDPA::eval_cpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  throw std::runtime_error("SeqSDPA: CPU not supported");
+}
+
+void SeqSDPA::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& Q = inputs[0];
+  auto& K = inputs[1];
+  auto& V = inputs[2];
+  auto& O = outputs[0];
+
+  O.set_data(mx::allocator::malloc(O.nbytes()));
+
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+  auto mtl_lib = d.get_library("we_kernels", lib_path());
+  auto kernel = d.get_kernel("scatter_sdpa_seq_direct_bq32_bk32_wm2", mtl_lib);
+
+  auto& enc = mx::metal::get_command_encoder(s);
+  enc.set_compute_pipeline_state(kernel);
+
+  enc.set_input_array(Q, 0);
+  enc.set_input_array(K, 1);
+  enc.set_input_array(V, 2);
+  enc.set_output_array(O, 3);
+
+  uint32_t capacity = static_cast<uint32_t>(K.shape(1));
+  struct Params {
+    uint32_t N_Q_HEADS, N_KV_HEADS, T_Q, D_HEAD, CAPACITY, NUM_KV_TOKENS;
+    float scale;
+  };
+  Params params{N_Q_, N_KV_, T_, D_HEAD_, capacity, num_kv_tokens_, scale_};
+  enc.set_bytes(params, 4);
+
+  // BQ=32, WM=2 → 64 threads, no TG memory
+  constexpr uint32_t BQ = 32;
+  uint32_t q_blocks = (T_ + BQ - 1) / BQ;
+  MTL::Size grid(q_blocks, N_Q_, 1);
+  MTL::Size group(64, 1, 1);
+  enc.dispatch_threadgroups(grid, group);
+}
+
+mx::array seq_sdpa(
+    const mx::array& Q,
+    const mx::array& K,
+    const mx::array& V,
+    uint32_t num_kv_tokens,
+    float scale,
+    mx::StreamOrDevice s) {
+  uint32_t N_Q = static_cast<uint32_t>(Q.shape(0));
+  uint32_t N_KV = static_cast<uint32_t>(K.shape(0));
+  uint32_t T = static_cast<uint32_t>(Q.shape(1));
+  uint32_t D = static_cast<uint32_t>(Q.shape(2));
+
+  auto stream = mx::to_stream(s);
+  return mx::array(
+      {static_cast<int>(N_Q), static_cast<int>(T), static_cast<int>(D)},
+      mx::float16,
+      std::make_shared<SeqSDPA>(
+          stream, N_Q, N_KV, T, D, num_kv_tokens, scale),
+      {mx::contiguous(Q, false, stream),
+       mx::contiguous(K, false, stream),
+       mx::contiguous(V, false, stream)});
+}
+
+// ===========================================================================
+// In-place KV cache ring buffer upsert
+// ===========================================================================
+
+void KVCacheUpsert::eval_cpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  throw std::runtime_error("KVCacheUpsert: CPU not supported");
+}
+
+void KVCacheUpsert::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  // inputs: [cache_k, cache_v, k_new, v_new]
+  // outputs: [cache_k_updated, cache_v_updated] — share buffers with inputs
+  auto& cache_k = inputs[0];
+  auto& cache_v = inputs[1];
+  auto& k_new = inputs[2];
+  auto& v_new = inputs[3];
+
+  // Donate input buffers to outputs (in-place mutation)
+  outputs[0].copy_shared_buffer(cache_k);
+  outputs[1].copy_shared_buffer(cache_v);
+
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+  auto mtl_lib = d.get_library("we_kernels", lib_path());
+  const char* kname = "kv_cache_upsert";
+  auto kernel = d.get_kernel(kname, mtl_lib);
+
+  auto& enc = mx::metal::get_command_encoder(s);
+  enc.set_compute_pipeline_state(kernel);
+
+  enc.set_output_array(outputs[0], 0);
+  enc.set_output_array(outputs[1], 1);
+  enc.set_input_array(k_new, 2);
+  enc.set_input_array(v_new, 3);
+
+  struct Params {
+    uint32_t N_KV, L, T, D, rs;
+  };
+  Params params{N_KV_, L_, T_, D_, rs_};
+  enc.set_bytes(params, 4);
+
+  constexpr uint32_t tg_size = 256;
+  uint32_t n_groups = (T_ + tg_size - 1) / tg_size;
+  MTL::Size grid(n_groups, N_KV_, 2);
+  MTL::Size group(tg_size, 1, 1);
+  enc.dispatch_threadgroups(grid, group);
+}
+
+std::vector<mx::array> kv_cache_upsert(
+    const mx::array& cache_k,
+    const mx::array& cache_v,
+    const mx::array& k_new,
+    const mx::array& v_new,
+    uint32_t rs,
+    mx::StreamOrDevice s) {
+  // Support both [N_KV, L, D] and [1, N_KV, L, D] — use last 3 dims
+  int nd = k_new.ndim();
+  uint32_t N_KV = static_cast<uint32_t>(k_new.shape(nd - 3));
+  uint32_t T = static_cast<uint32_t>(k_new.shape(nd - 2));
+  uint32_t D = static_cast<uint32_t>(k_new.shape(nd - 1));
+  uint32_t L = static_cast<uint32_t>(cache_k.shape(cache_k.ndim() - 2));
+
+  auto stream = mx::to_stream(s);
+  return mx::array::make_arrays(
+      {cache_k.shape(), cache_v.shape()},
+      {mx::float16, mx::float16},
+      std::make_shared<KVCacheUpsert>(stream, N_KV, L, T, D, rs),
+      {cache_k, cache_v,
+       mx::contiguous(k_new, false, stream),
+       mx::contiguous(v_new, false, stream)});
 }
 
 }  // namespace we_kernels

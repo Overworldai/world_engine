@@ -99,6 +99,36 @@ class FusedRMSNormQuant : public mx::Primitive {
   bool has_smooth_;
 };
 
+// Plain per-row symmetric int8 quantization (no RMSNorm)
+class FusedQuant : public mx::Primitive {
+ public:
+  FusedQuant(mx::Stream stream, uint32_t M, uint32_t K)
+      : mx::Primitive(stream), M_(M), K_(K) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  const char* name() const override { return "FusedQuant"; }
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override {
+    return {mx::Shape{static_cast<int>(M_), static_cast<int>(K_)},
+            mx::Shape{static_cast<int>(M_)}};
+  }
+
+ private:
+  uint32_t M_, K_;
+};
+
+std::vector<mx::array> fused_quant(
+    const mx::array& x,
+    mx::StreamOrDevice s = {});
+
 std::vector<mx::array> fused_rmsnorm_quant(
     const mx::array& x,
     float eps = 1e-5f,
@@ -170,13 +200,10 @@ class ScatterSDPA : public mx::Primitive {
  public:
   ScatterSDPA(mx::Stream stream, uint32_t N_Q, uint32_t N_KV,
               uint32_t T, uint32_t capacity, uint32_t D_HEAD,
-              uint32_t n_blocks, float scale,
-              std::string kernel_name = "scatter_sdpa",
-              uint32_t bq = 32, uint32_t tg_size = 32)
+              uint32_t n_blocks, float scale)
       : mx::Primitive(stream), N_Q_(N_Q), N_KV_(N_KV), T_(T),
         capacity_(capacity), D_HEAD_(D_HEAD), n_blocks_(n_blocks),
-        scale_(scale), kernel_name_(std::move(kernel_name)),
-        bq_(bq), tg_size_(tg_size) {}
+        scale_(scale) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -197,8 +224,6 @@ class ScatterSDPA : public mx::Primitive {
  private:
   uint32_t N_Q_, N_KV_, T_, capacity_, D_HEAD_, n_blocks_;
   float scale_;
-  std::string kernel_name_;
-  uint32_t bq_, tg_size_;
 };
 
 mx::array scatter_sdpa(
@@ -207,7 +232,77 @@ mx::array scatter_sdpa(
     const mx::array& V,
     const mx::array& block_offsets,
     float scale,
-    const std::string& variant = "",
     mx::StreamOrDevice s = {});
+
+// Sequential-scan attention: K/V contiguous from offset 0, no block_offsets.
+class SeqSDPA : public mx::Primitive {
+ public:
+  SeqSDPA(mx::Stream stream, uint32_t N_Q, uint32_t N_KV,
+          uint32_t T, uint32_t D_HEAD, uint32_t num_kv_tokens,
+          float scale)
+      : mx::Primitive(stream), N_Q_(N_Q), N_KV_(N_KV), T_(T),
+        D_HEAD_(D_HEAD), num_kv_tokens_(num_kv_tokens),
+        scale_(scale) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  const char* name() const override { return "SeqSDPA"; }
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override {
+    return {mx::Shape{static_cast<int>(N_Q_), static_cast<int>(T_),
+                      static_cast<int>(D_HEAD_)}};
+  }
+
+ private:
+  uint32_t N_Q_, N_KV_, T_, D_HEAD_, num_kv_tokens_;
+  float scale_;
+};
+
+mx::array seq_sdpa(
+    const mx::array& Q,
+    const mx::array& K,
+    const mx::array& V,
+    uint32_t num_kv_tokens,
+    float scale,
+    mx::StreamOrDevice s = {});
+
+// In-place KV cache ring buffer upsert
+class KVCacheUpsert : public mx::Primitive {
+ public:
+  KVCacheUpsert(mx::Stream stream, uint32_t N_KV, uint32_t L, uint32_t T,
+                uint32_t D, uint32_t rs)
+      : mx::Primitive(stream), N_KV_(N_KV), L_(L), T_(T), D_(D), rs_(rs) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  const char* name() const override { return "KVCacheUpsert"; }
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override {
+    return {inputs[0].shape(), inputs[1].shape()};
+  }
+
+ private:
+  uint32_t N_KV_, L_, T_, D_, rs_;
+};
+
+std::vector<mx::array> kv_cache_upsert(
+    const mx::array& cache_k, const mx::array& cache_v,
+    const mx::array& k_new, const mx::array& v_new,
+    uint32_t rs, mx::StreamOrDevice s = {});
+
 
 }  // namespace we_kernels

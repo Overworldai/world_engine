@@ -15,7 +15,7 @@ import numpy as np
 
 from we_kernels import w8a8_gemm_nax
 from we_kernels import fused_silu_quant, fused_rmsnorm_adaln_quant, w8a8_gemm_prequantized, w8a8_silu_gemm_nax
-from we_kernels import scatter_sdpa, fused_qkv_norm_rope
+from we_kernels import scatter_sdpa, fused_qkv_norm_rope, kv_cache_upsert
 
 DTYPE = mx.float16
 
@@ -125,7 +125,9 @@ class Int8NaxLinear(nn.Module):
         super().__init__()
         self.weight_q = weight_q
         self.weight_scale = weight_scale
-        self.bias = bias.astype(mx.float32) if bias is not None else None
+        N = weight_q.shape[0]
+        # Pre-allocate bias (zero if None) to avoid repeated mx.zeros() in hot path
+        self.bias = bias.astype(mx.float32) if bias is not None else mx.zeros((N,), dtype=mx.float32)
         self.output_splits = tuple(output_splits) if output_splits is not None else None
         self.smooth_scale = smooth_scale.astype(mx.float16) if smooth_scale is not None else None
         self.freeze()
@@ -172,19 +174,23 @@ class Int8NaxLinear(nn.Module):
             return mx.split(y, np.cumsum(self.output_splits[:-1]).tolist(), axis=-1)
         return y
 
+    def forward_prequantized_unsplit(self, x_q: mx.array, x_scales: mx.array):
+        """GEMM without output splitting — caller handles downstream ops directly."""
+        return w8a8_gemm_prequantized(x_q, x_scales, self.weight_q, w_scales=self.weight_scale, bias=self.bias)
+
 
 class Int8NaxSiLULinear(nn.Module):
     """W8A8 linear that applies fused SiLU+Quant before the GEMM.
 
-    Used for MLP fc2 where the input is fc1's fp16 output and SiLU
-    is applied before fc2's GEMM. Fuses SiLU + int8 quantization
-    into a single Metal kernel dispatch.
+    Fuses SiLU + int8 quantization into a single Metal kernel dispatch.
     """
-    def __init__(self, weight_q: mx.array, weight_scale: mx.array, bias: Optional[mx.array] = None):
+    def __init__(self, weight_q: mx.array, weight_scale: mx.array, bias: Optional[mx.array] = None, output_splits: Optional[Sequence[int]] = None):
         super().__init__()
         self.weight_q = weight_q
         self.weight_scale = weight_scale
-        self.bias = bias.astype(mx.float32) if bias is not None else None
+        N = weight_q.shape[0]
+        self.bias = bias.astype(mx.float32) if bias is not None else mx.zeros((N,), dtype=mx.float32)
+        self.output_splits = tuple(output_splits) if output_splits is not None else None
         self.freeze()
 
     @classmethod
@@ -192,8 +198,25 @@ class Int8NaxSiLULinear(nn.Module):
         weight_q, weight_scale = _symmetric_int8_quantize_rows(lin.weight)
         return cls(weight_q, weight_scale, getattr(lin, "bias", None))
 
+    @classmethod
+    def from_linears(cls, linears: Sequence[nn.Linear]):
+        weights, scales, biases, splits = [], [], [], []
+        for lin in linears:
+            w_q, w_scale = _symmetric_int8_quantize_rows(lin.weight)
+            weights.append(w_q)
+            scales.append(w_scale)
+            splits.append(lin.weight.shape[0])
+            lin_bias = getattr(lin, "bias", None)
+            if lin_bias is not None:
+                biases.append(lin_bias.astype(mx.float32))
+        bias = mx.concatenate(biases, axis=0) if biases else None
+        return cls(mx.concatenate(weights, axis=0), mx.concatenate(scales, axis=0), bias=bias, output_splits=splits)
+
     def __call__(self, x: mx.array):
-        return w8a8_silu_gemm_nax(x, self.weight_q, w_scales=self.weight_scale, bias=self.bias)
+        y = w8a8_silu_gemm_nax(x, self.weight_q, w_scales=self.weight_scale, bias=self.bias)
+        if self.output_splits is not None:
+            return mx.split(y, np.cumsum(self.output_splits[:-1]).tolist(), axis=-1)
+        return y
 
 
 def enable_int8_nax_components(model: nn.Module, components: Sequence[str], smooth_scales: Optional[dict] = None) -> dict:
@@ -275,7 +298,7 @@ def enable_int8_nax_linear(
         cond_path = f"transformer.blocks.{idx}.cond_head"
         if _path_matches(cond_path, cond_patterns):
             if all(_linear_is_eligible(lin) for lin in blk.cond_head.cond_proj):
-                blk.cond_head.cond_proj_group = Int8NaxLinear.from_linears(blk.cond_head.cond_proj)
+                blk.cond_head.cond_proj_group = Int8NaxSiLULinear.from_linears(blk.cond_head.cond_proj)
                 stats["fused_cond_groups"] += 1
                 stats["replaced_linears"] += len(blk.cond_head.cond_proj)
 
@@ -301,8 +324,10 @@ def enable_int8_nax_linear(
             ("denoise_step_emb.mlp.fc2", model.denoise_step_emb.mlp.fc2),
             ("out_norm.fc", model.out_norm.fc),
         ])
-        # Patterns where fc2 receives SiLU output — use fused SiLU+Quant variant
+        # Patterns where the linear receives SiLU output — use fused SiLU+Quant variant
         _silu_fc2_patterns = {f"transformer.blocks.{idx}.mlp.fc2" for idx in range(len(model.transformer))}
+        _silu_fc2_patterns |= {f"transformer.blocks.{idx}.ctrl_mlpfusion.fc2" for idx in range(len(model.transformer))}
+        _silu_fc2_patterns |= {"unpatchify", "out_norm.fc", "denoise_step_emb.mlp.fc2"}
         for path, mod in candidates:
             if not isinstance(mod, nn.Linear):
                 continue
@@ -346,66 +371,74 @@ def compute_rope_angles(frame_idx: int, ts_mult: float, rope_xy: mx.array, rope_
 class RingKVCache:
     BK = 32  # scatter_sdpa block granularity
 
-    def __init__(self, capacity: int, L: int, dilation: int, num_buckets: int):
-        self.capacity = capacity
+    def __init__(self, L: int, dilation: int, num_buckets: int):
+        # No separate tail — the stale slot doubles as scratch space.
+        self.capacity = L
         self.L = L
         self.dilation = dilation
         self.num_buckets = num_buckets
-        self.keys = mx.zeros((1, N_KV_HEADS, capacity, D_HEAD), dtype=DTYPE)
-        self.values = mx.zeros((1, N_KV_HEADS, capacity, D_HEAD), dtype=DTYPE)
-        # Track which ring slots are populated (pure Python — no GPU sync needed)
+        self.keys = mx.zeros((1, N_KV_HEADS, L, D_HEAD), dtype=DTYPE)
+        self.values = mx.zeros((1, N_KV_HEADS, L, D_HEAD), dtype=DTYPE)
         self.written_slots: set[int] = set()
 
     def set_frozen(self, frozen: bool):
         self.frozen = frozen
 
+    def _scratch_slot(self, frame_idx: int) -> int:
+        """The ring slot that will be written on the next persist (cache_write).
+
+        For dilation > 1, only certain frames trigger a ring write. The scratch
+        slot is the one that WOULD be overwritten — it's safe to use as scratch
+        because during denoise (frozen) it either:
+        - Contains stale data that's about to be overwritten (write frame), or
+        - Is simply the next slot in the ring (non-write frame).
+
+        On non-write frames, we still need scratch space. We use the same slot
+        the next write will target — its current data is the oldest in the ring
+        and will be overwritten soonest.
+        """
+        if self.num_buckets == 0:
+            return 0
+        bucket = (frame_idx + (self.dilation - 1)) // self.dilation
+        return bucket % self.num_buckets
+
+    def _is_write_frame(self, frame_idx: int) -> bool:
+        """Whether this frame persists to the ring (respects dilation)."""
+        return (frame_idx % self.dilation) == 0
+
     def compute_block_offsets(self, frame_idx: int) -> mx.array:
         """Precompute BK-aligned block offsets for scatter-read SDPA.
 
-        Slightly differs from pytorch implementation, usually would use .argwhere or 
-        .nonzero, but mlx doesn't have those equivalent primitives. Using np could 
-        force GPU->CPU sync, so we instead track the indices with a python set.
-        Uses self.written_slots to know which ring buckets are populated.
-        Called once per forward_single.
+        Includes all written slots plus the scratch slot (which holds the
+        current frame's KV after upsert).
         """
-        # Determine stale bucket to exclude (being overwritten this frame)
-        stale_slot = -1
-        write_step = (frame_idx % self.dilation) == 0
-        if self.num_buckets > 0 and write_step:
-            bucket = (frame_idx + (self.dilation - 1)) // self.dilation
-            stale_slot = bucket % self.num_buckets
+        scratch = self._scratch_slot(frame_idx)
 
-        # Collect BK-aligned block offsets for written, non-stale ring buckets
+        # All written slots + scratch (current frame's KV lives here)
+        active = self.written_slots | {scratch}
+
         offsets = []
-        for slot in sorted(self.written_slots):
-            if slot == stale_slot:
-                continue
+        for slot in sorted(active):
             start = slot * T
             for blk in range(T // self.BK):
                 offsets.append(start + blk * self.BK)
-
-        # Tail is always valid
-        for blk in range(T // self.BK):
-            offsets.append(self.L + blk * self.BK)
 
         return mx.array(np.array(offsets, dtype=np.int32))
 
     def upsert(self, k_new: mx.array, v_new: mx.array, frame_idx: int,
                block_offsets: mx.array | None = None) -> None:
-        """Write current frame to tail, optionally persist to ring."""
-        # 1. Always write current frame to tail
-        self.keys[:, :, self.L:self.L + T, :] = k_new
-        self.values[:, :, self.L:self.L + T, :] = v_new
+        """Write current frame's KV to the scratch slot.
 
-        # 2. Persist to ring (only when unfrozen — cache_write pass)
-        write_step = (frame_idx % self.dilation) == 0
-        if write_step and self.num_buckets > 0 and not getattr(self, "frozen", False):
-            bucket = (frame_idx + (self.dilation - 1)) // self.dilation
-            slot = bucket % self.num_buckets
-            rs = slot * T
-            self.keys[:, :, rs:rs + T, :] = k_new
-            self.values[:, :, rs:rs + T, :] = v_new
-            self.written_slots.add(slot)
+        Always writes to scratch (used as working space during denoise).
+        Only marks the slot as persisted on write frames (respects dilation).
+        """
+        scratch = self._scratch_slot(frame_idx)
+        rs = scratch * T
+        self.keys, self.values = kv_cache_upsert(
+            self.keys, self.values, k_new, v_new, rs)
+
+        if not getattr(self, "frozen", False) and self._is_write_frame(frame_idx):
+            self.written_slots.add(scratch)
 
 
 class MLP(nn.Module):
@@ -432,8 +465,10 @@ class CtrlFusion(nn.Module):
         self.fc2 = nn.Linear(D_MODEL, D_MODEL, bias=False)
 
     def __call__(self, x4: mx.array, cond: mx.array):
-        h = nn.silu(self.fc1_x(x4) + mx.expand_dims(self.fc1_c(cond), 2))
-        return self.fc2(h)
+        h = self.fc1_x(x4) + mx.expand_dims(self.fc1_c(cond), 2)
+        if isinstance(self.fc2, Int8NaxSiLULinear):
+            return self.fc2(h)  # SiLU fused inside
+        return self.fc2(nn.silu(h))
 
 
 class CondHead(nn.Module):
@@ -447,9 +482,9 @@ class CondHead(nn.Module):
 
     def __call__(self, cond: mx.array):
         c = cond + self.bias_in if self.bias_in is not None else cond
-        h = nn.silu(c)
         if self.cond_proj_group is not None:
-            return self.cond_proj_group(h)
+            return self.cond_proj_group(c)  # SiLU fused inside Int8NaxSiLULinear
+        h = nn.silu(c)
         return tuple(p(h) for p in self.cond_proj)
 
 
@@ -493,7 +528,12 @@ class TransformerBlock(nn.Module):
                 x_2d, mx.reshape(s0, (-1,)), mx.reshape(b0, (-1,)),
                 smooth_scale=self.attn.qkv_proj.smooth_scale,
             )
-            q_raw, k_raw, v_raw = self.attn.qkv_proj.forward_prequantized(x_q, x_scales)
+            # Use unsplit path: QKV GEMM output is already [M, N_Q*D+N_K*D+N_V*D],
+            # which is exactly what fused_qkv_norm_rope expects. Skip split+concat.
+            qkv_flat = mx.reshape(
+                self.attn.qkv_proj.forward_prequantized_unsplit(x_q, x_scales),
+                (T, -1),
+            )
         else:
             x4 = mx.reshape(x, (1, 1, T, D_MODEL))
             x_n = mx.fast.rms_norm(x4, None, 1e-5) * (1 + mx.expand_dims(s0, 2)) + mx.expand_dims(b0, 2)
@@ -504,12 +544,12 @@ class TransformerBlock(nn.Module):
                 q_raw = self.attn.q_proj(x_n)
                 k_raw = self.attn.k_proj(x_n)
                 v_raw = self.attn.v_proj(x_n)
+            qkv_flat = mx.reshape(
+                mx.concatenate([q_raw, k_raw, v_raw], axis=-1),
+                (T, -1),
+            )
 
         # Fused QKV split + RMSNorm + OrthoRoPE (single kernel for Q/K norm+rope)
-        qkv_flat = mx.reshape(
-            mx.concatenate([q_raw, k_raw, v_raw], axis=-1),
-            (T, -1),
-        )
         q, k_new, v_new = fused_qkv_norm_rope(
             qkv_flat, rope_cos, rope_sin, N_HEADS, N_KV_HEADS, N_KV_HEADS,
         )
@@ -529,7 +569,7 @@ class TransformerBlock(nn.Module):
         n_kv = kv_cache.keys.shape[1]
         k_3d = mx.reshape(kv_cache.keys, (n_kv, kv_cache.capacity, D_HEAD))
         v_3d = mx.reshape(kv_cache.values, (n_kv, kv_cache.capacity, D_HEAD))
-        y_nhd = scatter_sdpa(q, k_3d, v_3d, block_offsets, float(D_HEAD ** -0.5), "bq32_bk32_wm2")
+        y_nhd = scatter_sdpa(q, k_3d, v_3d, block_offsets, float(D_HEAD ** -0.5))
         y = mx.reshape(y_nhd.transpose(1, 0, 2), (1, T, N_HEADS * D_HEAD))
         y = self.attn.out_proj(y)
         x4_y = mx.reshape(y, (1, 1, T, D_MODEL))
@@ -610,17 +650,17 @@ class MLXWorldModel(nn.Module):
         for i in range(N_LAYERS):
             is_global = ((i - off) % period == 0)
             L = global_L if is_global else local_L
-            cap = L + T
             dilation = cfg.global_pinned_dilation if is_global else 1
             num_buckets = (L // T) // dilation
-            self.kv_caches.append(RingKVCache(cap, L, dilation, num_buckets))
+            self.kv_caches.append(RingKVCache(L, dilation, num_buckets))
 
     def noise_cond(self, sigma: float) -> mx.array:
         s = mx.array([sigma], dtype=mx.float32) * 1000.0
         phase = mx.expand_dims(s, -1) * mx.expand_dims(self.denoise_step_emb.freq, 0)
         emb = mx.concatenate([mx.sin(phase), mx.cos(phase)], axis=-1) * (2 ** 0.5)
         mlp = self.denoise_step_emb.mlp
-        emb = mlp.fc2(nn.silu(mlp.fc1(emb)))
+        h = mlp.fc1(emb)
+        emb = mlp.fc2(h) if isinstance(mlp.fc2, Int8NaxSiLULinear) else mlp.fc2(nn.silu(h))
         return mx.reshape(emb, (1, 1, D_MODEL)).astype(DTYPE)
 
     def ctrl_embed(self, mouse, button, scroll) -> mx.array:
@@ -628,8 +668,8 @@ class MLXWorldModel(nn.Module):
         mlp = self.ctrl_emb.mlp
         return mlp.fc2(nn.silu(mlp.fc1(inp))).astype(DTYPE) + 1e-7
 
-    def forward_single(self, x: mx.array, cond: mx.array, rope_cos: mx.array, rope_sin: mx.array, mouse: mx.array, button: mx.array, scroll: mx.array, frame_idx: int, _block_offsets: list | None = None) -> mx.array:
-        ctrl_emb = self.ctrl_embed(mouse, button, scroll)
+    def forward_single(self, x: mx.array, cond: mx.array, rope_cos: mx.array, rope_sin: mx.array, mouse: mx.array, button: mx.array, scroll: mx.array, frame_idx: int, _block_offsets: list | None = None, _ctrl_emb: mx.array | None = None) -> mx.array:
+        ctrl_emb = _ctrl_emb if _ctrl_emb is not None else self.ctrl_embed(mouse, button, scroll)
         x_2d = mx.reshape(x, (1, C, HP * PH, WP * PW)).transpose(0, 2, 3, 1)
         x_pat = self.patchify(x_2d)
         x_seq = mx.reshape(x_pat, (1, T, D_MODEL))
@@ -648,12 +688,17 @@ class MLXWorldModel(nn.Module):
         v1 = None
         for blk, kv, bo in zip(self.transformer, self.kv_caches, block_offsets_list):
             x_seq, v1 = blk(x_seq, cond, ctrl_emb, rope_cos, rope_sin, v1, kv, frame_idx, bo)
-        y = nn.silu(cond)
-        ab = self.out_norm.fc(y)
+        if isinstance(self.out_norm.fc, Int8NaxSiLULinear):
+            ab = self.out_norm.fc(cond)  # SiLU fused inside
+        else:
+            ab = self.out_norm.fc(nn.silu(cond))
         ab = mx.reshape(mx.broadcast_to(mx.expand_dims(ab, 2), (1, 1, T, 2 * D_MODEL)), (1, T, 2 * D_MODEL))
         a, b_ = mx.split(ab, 2, axis=-1)
-        x_seq = nn.silu(mx.fast.rms_norm(x_seq, None, 1e-5) * (1 + a) + b_)
-        x_out = self.unpatchify(x_seq)
+        x_adaln = mx.fast.rms_norm(x_seq, None, 1e-5) * (1 + a) + b_
+        if isinstance(self.unpatchify, Int8NaxSiLULinear):
+            x_out = self.unpatchify(x_adaln)  # SiLU fused inside
+        else:
+            x_out = self.unpatchify(nn.silu(x_adaln))
         x_out = mx.reshape(x_out, (1, HP, WP, C, PH, PW))
         x_out = x_out.transpose(0, 3, 1, 4, 2, 5)
         return mx.reshape(x_out, (1, 1, C, HP * PH, WP * PW))
@@ -671,11 +716,17 @@ class MLXWorldModel(nn.Module):
                 _off_cache[key] = kv.compute_block_offsets(frame_idx)
             block_offsets_list.append(_off_cache[key])
 
-        for sigma, dsigma in zip(SIGMAS[:4], DSIGMAS):
-            cond = self.noise_cond(sigma)
+        # Precompute ctrl_embed (same inputs for all 4 steps)
+        ctrl_emb = self.ctrl_embed(mouse, button, scroll)
+
+        # Precompute noise conditionings (sigmas are constants)
+        conds = [self.noise_cond(sigma) for sigma in SIGMAS[:4]]
+
+        for cond, dsigma in zip(conds, DSIGMAS):
             v = self.forward_single(
                 x, cond, rope_cos, rope_sin, mouse, button, scroll, frame_idx,
                 _block_offsets=block_offsets_list,
+                _ctrl_emb=ctrl_emb,
             )
             x = x + dsigma * v
             mx.eval(x)
@@ -705,6 +756,7 @@ def _extract_smooth_scales(pt_model) -> dict:
         arr = mx.array(buf.detach().float().numpy()).astype(DTYPE)
         smooth_scales[layer_path] = arr
     return smooth_scales
+
 
 
 def load_from_pytorch(model_uri: str, int8_profile: Optional[str] = "speed", kv_cache_mode: str = "fp16", attention_mode: str = "fp16") -> Tuple[MLXWorldModel, object]:
@@ -763,6 +815,7 @@ def load_from_pytorch(model_uri: str, int8_profile: Optional[str] = "speed", kv_
     def cast_dtype(x):
         return x.astype(DTYPE) if isinstance(x, mx.array) and x.dtype == mx.float32 and x.ndim >= 2 else x
     mlx_model.update(tree_map(cast_dtype, mlx_model.parameters()))
+
     if int8_profile is not None:
         stats = enable_int8_nax_profile(mlx_model, int8_profile, smooth_scales=smooth_scales if smooth_scales else None)
         mlx_model.int8_profile = int8_profile

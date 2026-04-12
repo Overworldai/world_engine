@@ -40,6 +40,7 @@ if(MLX_BUILD_METAL)
       ${CMAKE_CURRENT_LIST_DIR}/kernels/w8a8_fused_rmsnorm_quant.metal
       ${CMAKE_CURRENT_LIST_DIR}/kernels/fused_qkv_rope.metal
       ${CMAKE_CURRENT_LIST_DIR}/kernels/scatter_sdpa.metal
+      ${CMAKE_CURRENT_LIST_DIR}/kernels/kv_cache_upsert.metal
     INCLUDE_DIRS ${CMAKE_CURRENT_LIST_DIR}/kernels ${CMAKE_CURRENT_LIST_DIR} ${MLX_INCLUDE_DIRS}
     OUTPUT_DIRECTORY ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}
   )

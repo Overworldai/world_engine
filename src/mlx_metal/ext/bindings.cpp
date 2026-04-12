@@ -51,6 +51,20 @@ Returns:
     list[int8 x_q [M, K], fp32 x_scales [M]])");
 
   m.def(
+      "fused_quant",
+      [](const mx::array& x) {
+        return we_kernels::fused_quant(x);
+      },
+      nb::arg("x"),
+      R"(Plain per-row symmetric int8 quantization (no RMSNorm).
+
+Args:
+    x: fp16 activations [M, K]
+
+Returns:
+    list[int8 x_q [M, K], fp32 x_scales [M]])");
+
+  m.def(
       "fused_rmsnorm_quant",
       [](const mx::array& x, float eps) {
         return we_kernels::fused_rmsnorm_quant(x, eps);
@@ -174,38 +188,34 @@ Returns:
          float scale) {
         return we_kernels::scatter_sdpa(Q, K, V, block_offsets, scale);
       },
-      nb::arg("Q"),
-      nb::arg("K"),
-      nb::arg("V"),
-      nb::arg("block_offsets"),
-      nb::arg("scale"),
-      R"(Scatter-read flash attention.
+      nb::arg("Q"), nb::arg("K"), nb::arg("V"),
+      nb::arg("block_offsets"), nb::arg("scale"));
 
-Args:
-    Q: fp16 [N_Q, T, D_HEAD] — query
-    K: fp16 [N_KV, capacity, D_HEAD] — key cache
-    V: fp16 [N_KV, capacity, D_HEAD] — value cache
-    block_offsets: int32 [N_BLOCKS] — token offsets of valid BK=32 blocks
-    scale: float — 1/sqrt(D_HEAD)
+  m.def(
+      "seq_sdpa",
+      [](const mx::array& Q,
+         const mx::array& K,
+         const mx::array& V,
+         int num_kv_tokens,
+         float scale) {
+        return we_kernels::seq_sdpa(Q, K, V,
+            static_cast<uint32_t>(num_kv_tokens), scale);
+      },
+      nb::arg("Q"), nb::arg("K"), nb::arg("V"),
+      nb::arg("num_kv_tokens"), nb::arg("scale"));
 
-Returns:
-    fp16 [N_Q, T, D_HEAD])");
+  m.def(
+      "kv_cache_upsert",
+      [](const mx::array& cache_k,
+         const mx::array& cache_v,
+         const mx::array& k_new,
+         const mx::array& v_new,
+         int rs) {
+        return we_kernels::kv_cache_upsert(cache_k, cache_v, k_new, v_new,
+            static_cast<uint32_t>(rs));
+      },
+      nb::arg("cache_k"), nb::arg("cache_v"),
+      nb::arg("k_new"), nb::arg("v_new"), nb::arg("rs"),
+      "In-place KV cache upsert (coalesced half4).");
 
-  // Named variant dispatchers for autotuning
-  auto make_variant = [&](const char* py_name, const char* variant) {
-    m.def(
-        py_name,
-        [variant](const mx::array& Q, const mx::array& K, const mx::array& V,
-                  const mx::array& block_offsets, float scale) {
-          return we_kernels::scatter_sdpa(Q, K, V, block_offsets, scale,
-                                          std::string(variant));
-        },
-        nb::arg("Q"), nb::arg("K"), nb::arg("V"),
-        nb::arg("block_offsets"), nb::arg("scale"));
-  };
-  make_variant("scatter_sdpa_bq16_bk32_wm1", "bq16_bk32_wm1");
-  make_variant("scatter_sdpa_bq32_bk32_wm1", "bq32_bk32_wm1");
-  make_variant("scatter_sdpa_bq32_bk32_wm2", "bq32_bk32_wm2");
-  make_variant("scatter_sdpa_bq64_bk32_wm2", "bq64_bk32_wm2");
-  make_variant("scatter_sdpa_bq32_bk64_wm1", "bq32_bk64_wm1");
 }
