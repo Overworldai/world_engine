@@ -258,6 +258,13 @@ struct SeqAttnParams {
     float scale;
 };
 
+// Sequential-scan attention with Q staged in threadgroup memory.
+// Q loaded once from device → TG memory, reused across all KV blocks.
+// K/V read directly from device (sequential scan, no block_offsets).
+//
+// BQ=32, BD=64: Q_smem = 32×64 halfs = 4KB threadgroup memory.
+// TG layout: Q_smem[BQ][BD] with compile-time stride BD.
+
 template <
     typename T,
     int BQ,
@@ -266,13 +273,15 @@ template <
     int WM,
     int WN,
     typename AccumType = float>
-void scatter_sdpa_seq_direct_impl(
+void scatter_sdpa_seq_staged_impl(
     const device T* Q,
     const device T* K_head,
     const device T* V_head,
     device T* O,
+    threadgroup T* Q_smem,
     constant SeqAttnParams& params,
     uint simd_group_id,
+    uint simd_lane_id,
     uint3 tgid)
 {
     const uint N_Q = params.N_Q_HEADS;
@@ -289,7 +298,7 @@ void scatter_sdpa_seq_direct_impl(
 
     const uint kv_head = q_head / (N_Q / N_KV);
 
-    Q += q_head * T_Q_len * D + q_off * D;
+    const device T* Q_dev = Q + q_head * T_Q_len * D + q_off * D;
     O += q_head * T_Q_len * D + q_off * D;
     const device T* K_base = K_head + kv_head * CAP * D;
     const device T* V_base = V_head + kv_head * CAP * D;
@@ -303,11 +312,28 @@ void scatter_sdpa_seq_direct_impl(
     constexpr short TK = BK / kU;
 
     const short tm = kU * TQ * simd_group_id;
-    Q += tm * D;
 
     const uint n_q = min(q_off + (uint)BQ, T_Q_len) - q_off;
     const short lim_rows_q = n_q - tm;
     const bool is_last_q = (q_off + BQ > T_Q_len);
+
+    // Stage Q into threadgroup memory — cooperative load across all threads.
+    // Layout: Q_smem[BQ * BD], row-major with compile-time stride BD.
+    {
+        const uint tid = simd_group_id * 32 + simd_lane_id;
+        const uint total = BQ * BD;
+        const uint stride = kNWarps * 32;
+        for (uint i = tid; i < total; i += stride) {
+            uint row = i / BD;
+            uint col = i % BD;
+            Q_smem[row * BD + col] = (q_off + row < T_Q_len)
+                ? Q_dev[row * D + col] : T(0);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Pointer to this simdgroup's Q rows in threadgroup memory
+    const threadgroup T* Q_tg = Q_smem + tm * BD;
 
     using otile_t = NAXTile<AccumType, TQ, TD>;
     otile_t Otile;
@@ -339,15 +365,10 @@ void scatter_sdpa_seq_direct_impl(
                     NAXTile<T, 1, 1> Qtile;
                     NAXTile<T, 2, 1> Ktile;
 
-                    const int Q_off = iq * kU * D + id * kU;
-                    const int K_off = ik * kU * D + id * kU;
-
-                    if (is_last_q) {
-                        Qtile.load_rows(Q + Q_off, D, lim_rows_q - iq * kU);
-                    } else {
-                        Qtile.load(Q + Q_off, D);
-                    }
-                    Ktile.load(K_blk + K_off, D);
+                    // Q from threadgroup (compile-time stride BD)
+                    Qtile.template load<T, BD, 1>(Q_tg + iq * kU * BD + id * kU);
+                    // K from device
+                    Ktile.load(K_blk + ik * kU * D + id * kU, D);
 
                     stile_t::NAXFrag_t::mma(
                         Stile.frag_at(iq, ik),
@@ -390,8 +411,7 @@ void scatter_sdpa_seq_direct_impl(
                 STEEL_PRAGMA_UNROLL
                 for (short ik = 0; ik < TK; ik++) {
                     NAXTile<T, 1, 2> Vtile;
-                    const int V_off = ik * kU * D + id * kU;
-                    Vtile.load(V_blk + V_off, D);
+                    Vtile.load(V_blk + ik * kU * D + id * kU, D);
 
                     otile_t::NAXFrag_t::mma(
                         Otile.frag_at(iq, id),
@@ -420,7 +440,7 @@ void scatter_sdpa_seq_direct_impl(
     }
 }
 
-// BK=32: 256 blocks for 8192 tokens
+// BQ=32, WM=2: 512 TGs, 4KB Q staging
 [[kernel, max_total_threads_per_threadgroup(64)]]
 void scatter_sdpa_seq_direct_bq32_bk32_wm2(
     const device half* Q [[buffer(0)]],
@@ -428,28 +448,32 @@ void scatter_sdpa_seq_direct_bq32_bk32_wm2(
     const device half* V [[buffer(2)]],
     device half* O [[buffer(3)]],
     constant SeqAttnParams& params [[buffer(4)]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tgid [[threadgroup_position_in_grid]])
 {
-    scatter_sdpa_seq_direct_impl<half, 32, 32, 64, 2, 1>(
-        Q, K, V, O, params,
-        simd_group_id, tgid);
+    threadgroup half Q_smem[32 * 64];  // 4KB
+    scatter_sdpa_seq_staged_impl<half, 32, 32, 64, 2, 1>(
+        Q, K, V, O, Q_smem, params,
+        simd_group_id, simd_lane_id, tgid);
 }
 
-// BK=64: 128 blocks — halves per-block overhead (softmax, barrier, loop control)
-[[kernel, max_total_threads_per_threadgroup(64)]]
-void scatter_sdpa_seq_direct_bq32_bk64_wm2(
+// BQ=64, WM=4: 256 TGs, 8KB Q staging — 2× Q rows per TG
+[[kernel, max_total_threads_per_threadgroup(128)]]
+void scatter_sdpa_seq_direct_bq64_bk32_wm4(
     const device half* Q [[buffer(0)]],
     const device half* K [[buffer(1)]],
     const device half* V [[buffer(2)]],
     device half* O [[buffer(3)]],
     constant SeqAttnParams& params [[buffer(4)]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tgid [[threadgroup_position_in_grid]])
 {
-    scatter_sdpa_seq_direct_impl<half, 32, 64, 64, 2, 1>(
-        Q, K, V, O, params,
-        simd_group_id, tgid);
+    threadgroup half Q_smem[64 * 64];  // 8KB
+    scatter_sdpa_seq_staged_impl<half, 64, 32, 64, 4, 1>(
+        Q, K, V, O, Q_smem, params,
+        simd_group_id, simd_lane_id, tgid);
 }
 
 // Default entry point — dispatches to bq32_bk32_wm1

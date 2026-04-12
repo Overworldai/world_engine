@@ -618,7 +618,7 @@ void SeqSDPA::eval_gpu(
   Params params{N_Q_, N_KV_, T_, D_HEAD_, capacity, num_kv_tokens_, scale_};
   enc.set_bytes(params, 4);
 
-  // BQ=32, WM=2 → 64 threads, no TG memory
+  // BQ=32, WM=2 → 64 threads, 4KB Q staging
   constexpr uint32_t BQ = 32;
   uint32_t q_blocks = (T_ + BQ - 1) / BQ;
   MTL::Size grid(q_blocks, N_Q_, 1);
