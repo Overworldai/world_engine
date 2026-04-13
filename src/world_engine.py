@@ -92,7 +92,8 @@ class WorldEngine:
 
             # State
             latent_fps = self.model_cfg.inference_fps / self.model_cfg.temporal_compression
-            self.ts_mult = int(self.model_cfg.base_fps) // latent_fps
+            assert self.model_cfg.base_fps % latent_fps == 0
+            self.ts_mult = int(self.model_cfg.base_fps // latent_fps)
             self.frame_ts = torch.tensor([[0]], dtype=torch.long)
 
             # Static input context tensors
