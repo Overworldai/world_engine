@@ -43,7 +43,9 @@ class BaseModel(nn.Module):
 
         if load_weights:
             safetensors_path = os.path.join(path, "model.safetensors")
-            model.load_state_dict(load_file(safetensors_path), strict=True)
+            assert device.type != "cuda" or device.index is not None
+            load_device = device.index if device.type == "cuda" else device.type
+            model.load_state_dict(load_file(safetensors_path, device=load_device), strict=True)
 
         return model
 
