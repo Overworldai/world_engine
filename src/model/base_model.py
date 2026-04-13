@@ -43,7 +43,7 @@ class BaseModel(nn.Module):
 
         if load_weights:
             safetensors_path = os.path.join(path, "model.safetensors")
-            model.load_state_dict(load_file(safetensors_path, device=device), strict=True)
+            model.load_state_dict(load_file(safetensors_path), strict=True)
 
         return model
 

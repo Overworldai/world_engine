@@ -49,8 +49,10 @@ class WorldEngine:
         model_config_overrides: Dict to override model config values
         - auto_aspect_ratio: set to False to work in ae raw space, otherwise in/out are 720p or 360p
         """
-        self.device = torch.get_default_device() if device is None else device
         self.dtype = torch.get_default_dtype() if dtype is None else dtype
+        self.device = torch.device(torch.get_default_device() if device is None else device)
+        if self.device.type == "cuda" and self.device.index is None:
+            self.device = torch.device("cuda", torch.cuda.current_device())
 
         self.model_cfg = WorldModel.load_config(model_uri)
 
@@ -65,7 +67,7 @@ class WorldEngine:
                 is_taehv_ae=self.model_cfg.taehv_ae,
                 auto_aspect_ratio=self.model_cfg.auto_aspect_ratio,
                 dtype=dtype,
-                device=device,
+                device=self.device,
                 **(
                     {"height": self.model_cfg.height * pH, "width": self.model_cfg.width * pW}
                     if self.model_cfg.taehv_ae else {}
@@ -83,10 +85,10 @@ class WorldEngine:
             if quant is not None:
                 quantize_model(self.model, quant)
 
-            self.kv_cache = StaticKVCache(self.model_cfg, batch_size=1, dtype=dtype).to(device=device)
+            self.kv_cache = StaticKVCache(self.model_cfg, batch_size=1, dtype=dtype).to(device=self.device)
 
             # Inference Scheduler
-            self.scheduler_sigmas = torch.tensor(self.model_cfg.scheduler_sigmas, dtype=dtype, device=device)
+            self.scheduler_sigmas = torch.tensor(self.model_cfg.scheduler_sigmas, dtype=dtype, device=self.device)
 
             self.frm_shape = 1, 1, self.model_cfg.channels, self.model_cfg.height * pH, self.model_cfg.width * pW
 
