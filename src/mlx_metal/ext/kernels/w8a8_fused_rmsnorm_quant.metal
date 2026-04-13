@@ -307,6 +307,73 @@ void fused_quant(
     }
 }
 
+// Fused transpose + quantization for SDPA output → out_proj input.
+// Reads [N_Q, T, D] head-major, writes [T, N_Q*D] token-major int8 + scales.
+// Eliminates the intermediate fp16 transpose materialization.
+struct FusedTransposeQuantParams {
+    uint N_Q;    // number of Q heads
+    uint T;      // sequence length
+    uint D;      // head dimension
+};
+
+[[kernel, max_total_threads_per_threadgroup(TG_SIZE)]]
+void fused_transpose_quant(
+    device const half* x        [[buffer(0)]],   // [N_Q, T, D] head-major
+    device int8_t*     x_q      [[buffer(1)]],   // [T, N_Q*D] token-major
+    device float*      x_scales [[buffer(2)]],   // [T]
+    constant FusedTransposeQuantParams& params [[buffer(3)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint  tid  [[thread_index_in_threadgroup]])
+{
+    const uint N_Q = params.N_Q;
+    const uint T = params.T;
+    const uint D = params.D;
+    const uint K = N_Q * D;  // output row width
+    const uint t = tgid.x;   // which token
+    if (t >= T) return;
+
+    // Output row: token t, all heads concatenated
+    device int8_t* q_row = x_q + t * K;
+
+    threadgroup float sg_reduce[TG_SIZE / 32];
+
+    // Pass 1: absmax across all heads for this token
+    // Input layout: x[head * T * D + t * D + d]
+    float local_max = 0.0f;
+    for (uint k = tid; k < K; k += TG_SIZE) {
+        uint head = k / D;
+        uint d = k % D;
+        float v = (float)x[head * T * D + t * D + d];
+        local_max = max(local_max, abs(v));
+    }
+
+    local_max = simd_max(local_max);
+    uint sgid = tid / 32;
+    uint lane = tid % 32;
+    if (lane == 0) sg_reduce[sgid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgid == 0) {
+        float v = (lane < (TG_SIZE / 32)) ? sg_reduce[lane] : 0.0f;
+        v = simd_max(v);
+        if (lane == 0) {
+            sg_reduce[0] = max(v / 127.0f, 1e-6f);
+            x_scales[t] = sg_reduce[0];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float inv_scale = 1.0f / sg_reduce[0];
+
+    // Pass 2: re-read with transpose + quantize
+    for (uint k = tid; k < K; k += TG_SIZE) {
+        uint head = k / D;
+        uint d = k % D;
+        float v = (float)x[head * T * D + t * D + d] * inv_scale;
+        q_row[k] = (int8_t)clamp(rint(v), -127.0f, 127.0f);
+    }
+}
+
 // RMSNorm + SmoothQuant + int8 quantization (no AdaLN)
 [[kernel, max_total_threads_per_threadgroup(TG_SIZE)]]
 void fused_rmsnorm_smooth_quant(

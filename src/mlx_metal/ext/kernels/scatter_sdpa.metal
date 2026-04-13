@@ -317,8 +317,9 @@ void scatter_sdpa_seq_staged_impl(
     const short lim_rows_q = n_q - tm;
     const bool is_last_q = (q_off + BQ > T_Q_len);
 
-    // Stage Q into threadgroup memory — cooperative load across all threads.
-    // Layout: Q_smem[BQ * BD], row-major with compile-time stride BD.
+    // Stage Q into threadgroup memory with pre-scaling.
+    // Pre-multiply Q by scale2 so MMA output is already in log2 domain —
+    // eliminates the per-block Stile *= scale2 element-wise multiply (256 saves).
     {
         const uint tid = simd_group_id * 32 + simd_lane_id;
         const uint total = BQ * BD;
@@ -326,8 +327,8 @@ void scatter_sdpa_seq_staged_impl(
         for (uint i = tid; i < total; i += stride) {
             uint row = i / BD;
             uint col = i % BD;
-            Q_smem[row * BD + col] = (q_off + row < T_Q_len)
-                ? Q_dev[row * D + col] : T(0);
+            float v = (q_off + row < T_Q_len) ? (float)Q_dev[row * D + col] : 0.0f;
+            Q_smem[row * BD + col] = (T)(v * scale2);
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -382,10 +383,11 @@ void scatter_sdpa_seq_staged_impl(
             }
         }
 
-        STEEL_PRAGMA_UNROLL
-        for (short ii = 0; ii < stile_t::kElemsPerTile; ii++) {
-            Stile.elems()[ii] *= scale2;
-        }
+        // scale2 baked into Q during TG staging
+
+
+
+
 
         metal::vec<AccumType, kRowsPT> new_max;
         metal::vec<AccumType, kRowsPT> factor;
@@ -458,23 +460,17 @@ void scatter_sdpa_seq_direct_bq32_bk32_wm2(
         simd_group_id, simd_lane_id, tgid);
 }
 
-// BQ=64, WM=4: 256 TGs, 8KB Q staging — 2× Q rows per TG
-[[kernel, max_total_threads_per_threadgroup(128)]]
-void scatter_sdpa_seq_direct_bq64_bk32_wm4(
-    const device half* Q [[buffer(0)]],
-    const device half* K [[buffer(1)]],
-    const device half* V [[buffer(2)]],
-    device half* O [[buffer(3)]],
-    constant SeqAttnParams& params [[buffer(4)]],
-    uint simd_lane_id [[thread_index_in_simdgroup]],
-    uint simd_group_id [[simdgroup_index_in_threadgroup]],
-    uint3 tgid [[threadgroup_position_in_grid]])
-{
-    threadgroup half Q_smem[64 * 64];  // 8KB
-    scatter_sdpa_seq_staged_impl<half, 64, 32, 64, 4, 1>(
-        Q, K, V, O, Q_smem, params,
-        simd_group_id, simd_lane_id, tgid);
-}
+// ---------------------------------------------------------------------------
+// [REMOVED] Experimental variants tested and not adopted:
+//   - BQ=32 WM=1 single SG (slower: TQ=2 register pressure)
+//   - BQ=64 WM=4 (slower: larger TGs reduce occupancy)
+//   - K/V cooperative TG staging (3.6× slower: barriers dominate on Apple
+//     Silicon; L2 already serves multi-SG reads cheaply)
+//   - Split-KV Flash-Decoding (slower at our occupancy: 512 TGs already
+//     saturates 40 cores; reduction overhead exceeds gain)
+//   - On-the-fly int8 Q@K MMA (5.5× slower: per-block K quantization loop
+//     dominates. Viable only with pre-quantized int8 KV cache)
+
 
 // Default entry point — dispatches to bq32_bk32_wm1
 [[kernel, max_total_threads_per_threadgroup(32)]]
@@ -494,3 +490,4 @@ void scatter_sdpa(
         Q, K, V, block_offsets, O, params,
         simd_group_id, tid);
 }
+

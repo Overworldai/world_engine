@@ -304,5 +304,4 @@ std::vector<mx::array> kv_cache_upsert(
     const mx::array& k_new, const mx::array& v_new,
     uint32_t rs, mx::StreamOrDevice s = {});
 
-
 }  // namespace we_kernels
