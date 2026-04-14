@@ -36,12 +36,15 @@
 #
 #   pace_s = max(batch_dt * SLEEP_RATIO, target_s - overhead)
 #
-# where target_s = T / inference_fps (the model's intended visual frame time),
-# batch_dt is the previous cycle's wall-clock time, and overhead is the
-# measured non-render portion of the cycle (dispatch + .cpu() + events).
+# where:
+# - batch_dt is the previous cycle's wall-clock time.
+# - overhead is the measured non-render portion of the cycle (dispatch +
+#   .cpu() + events).
+# - target_s = T / fps_cap. When fps_cap is 0 (--uncap-fps), target_s is 0
+#   and pace_s falls back to `batch_dt * SLEEP_RATIO` — pure GPU-bound pacing.
 #
 # - The `target_s - overhead` term ensures the *total* cycle (render + overhead)
-#   hits the model's target framerate.
+#   hits the model's target framerate when a cap is active.
 # - The `batch_dt * SLEEP_RATIO` floor prevents the render from filling the
 #   entire cycle, which would create a diverging feedback loop (batch_dt
 #   includes render time, so pacing to 100% of it grows without bound).
@@ -297,6 +300,7 @@ class GameState:
     engine: Engine
     clock: pygame.time.Clock
     mouse_sensitivity: float
+    uncap_fps: bool = False
     paused: bool = True
     held_vks: set[int] = field(default_factory=set)
     """Currently pressed Windows VK codes, forwarded as `CtrlInput.button`."""
@@ -317,17 +321,14 @@ class GameState:
         return self.engine.temporal_compression
 
     @property
-    def inference_fps(self) -> int:
-        return self.engine.inference_fps
+    def fps_cap(self) -> int:
+        """0 = uncapped; otherwise the model's inference_fps."""
+        return 0 if self.uncap_fps else self.engine.inference_fps
 
     def _compute_pace(self) -> float:
         """Compute pacing interval for render_frame, accounting for overhead."""
         # Target interval from the model's intended visual framerate.
-        target_s = (
-            self.temporal_compression / self.inference_fps
-            if self.inference_fps > 0
-            else 0.0
-        )
+        target_s = self.temporal_compression / self.fps_cap if self.fps_cap > 0 else 0.0
         # Subtract measured non-render overhead so the *total* cycle hits target_s.
         # Use SLEEP_RATIO of batch_dt as a floor so the render never fills the entire
         # overlap window (batch_dt includes render time — pacing to 100% diverges).
@@ -439,7 +440,7 @@ class GameState:
 
             if self.paused:
                 self.renderer.draw_pause()
-                self.clock.tick(self.inference_fps)
+                self.clock.tick(self.engine.inference_fps)
                 continue
 
             dx, dy = pygame.mouse.get_rel()
@@ -506,6 +507,11 @@ def main() -> None:
     )
     ap.add_argument("-d", "--device", default="cuda")
     ap.add_argument("-m", "--mouse-sensitivity", type=float, default=1.5)
+    ap.add_argument(
+        "--uncap-fps",
+        action="store_true",
+        help="Disable the inference_fps framerate cap (run as fast as the GPU allows)",
+    )
     args = ap.parse_args()
 
     pygame.init()
@@ -521,7 +527,14 @@ def main() -> None:
         engine.prime()
         renderer.draw_status("Warming up (torch.compile)…")
         first = engine.warmup()
-        GameState(renderer, engine, clock, args.mouse_sensitivity, pending=first).run()
+        GameState(
+            renderer,
+            engine,
+            clock,
+            args.mouse_sensitivity,
+            uncap_fps=args.uncap_fps,
+            pending=first,
+        ).run()
     except KeyboardInterrupt:
         pass
     finally:
