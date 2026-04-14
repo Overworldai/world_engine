@@ -51,15 +51,7 @@ logging.basicConfig(
 log = logging.getLogger("interactive")
 
 
-# GitHub contents API for the Biome `seeds/` directory, pinned to a known ref.
-# Same source as examples/gen_sample.py.
-BIOME_SEEDS_API = (
-    "https://api.github.com/repos/Overworldai/Biome/contents/seeds?ref=14343a6"
-)
-
 WINDOW_SIZE = (1280, 720)
-# Aspect ratio for the center-crop applied to seed images.
-CROP_ASPECT_W, CROP_ASPECT_H = 16, 9
 
 # Map pygame keys / mouse buttons to the Windows VK integers that CtrlInput.button
 # expects (see https://github.com/Overworldai/owl-control keycode table). Covers
@@ -82,38 +74,6 @@ PYGAME_TO_VK: dict[int, int] = (
 MOUSE_TO_VK: dict[int, int] = {1: 0x01, 2: 0x04, 3: 0x02}
 
 
-# --- seed loading -----------------------------------------------------------
-
-def center_crop(img: Image.Image) -> np.ndarray:
-    """Center-crop to CROP_ASPECT_W:CROP_ASPECT_H. Returns uint8 (H, W, 3)."""
-    w, h = img.size
-    # Pick whichever dimension is the limiting factor and derive the other.
-    if w * CROP_ASPECT_H > h * CROP_ASPECT_W:
-        new_w, new_h = h * CROP_ASPECT_W // CROP_ASPECT_H, h
-    else:
-        new_w, new_h = w, w * CROP_ASPECT_H // CROP_ASPECT_W
-    left = (w - new_w) // 2
-    top = (h - new_h) // 2
-    # `.copy()` — PIL's buffer is read-only and torch.from_numpy requires writable.
-    return np.asarray(img.crop((left, top, left + new_w, top + new_h)).convert("RGB")).copy()
-
-
-def load_seed_from_path(path: str) -> np.ndarray:
-    """Load a local image as uint8 (H, W, 3), center-cropped."""
-    log.info("loading seed from local file: %s", path)
-    return center_crop(Image.open(path))
-
-
-def load_seed_from_github() -> np.ndarray:
-    """Download a random seed from the pinned Biome `seeds/` directory."""
-    log.info("fetching Biome seeds index")
-    with urllib.request.urlopen(BIOME_SEEDS_API) as res:
-        entries = [e for e in json.load(res) if e["type"] == "file"]
-    url = random.choice(entries)["download_url"]
-    log.info("downloading random Biome seed: %s", url)
-    with urllib.request.urlopen(url) as res:
-        img_bytes = res.read()
-    return center_crop(Image.open(io.BytesIO(img_bytes)))
 
 
 
@@ -199,50 +159,42 @@ class Renderer:
 class Engine:
     """Wraps WorldEngine with seed management and the generation pipeline.
 
-    After construction, the first generated frame is available as `self.pending`.
-    Subsequent frames are produced by `next_frame()` and should be `.cpu()`'d
-    into `self.pending` by the caller before the next `next_frame()` call.
+    Frames are produced by `next_frame()` and should be `.cpu()`'d into
+    `self.pending` by the caller before the next `next_frame()` call.
     """
 
-    inner: WorldEngine
-    seed: np.ndarray
-    model_uri: str
-    pending: torch.Tensor | None
-
-    def __init__(
-        self,
-        renderer: "Renderer",
-        model_uri: str,
-        quant: str | None,
-        device: str,
-        seed_path: str | None,
-    ) -> None:
-        """Load model, seed, prime, compile-warmup. Shows status via *renderer*."""
-        renderer.draw_status("Loading model…")
+    def __init__(self, model_uri: str, quant: str | None, device: str) -> None:
         log.info("loading model %s (quant=%s, device=%s)", model_uri, quant, device)
         self.inner = WorldEngine(model_uri, quant=quant, device=device)
+        self.model_uri = model_uri
+        self.seed: np.ndarray | None = None
+        self.pending: torch.Tensor | None = None
         log.info(
             "model loaded: type=%s, temporal_compression=%d",
             self.inner.model_cfg.model_type, self.inner.model_cfg.temporal_compression,
         )
 
-        renderer.draw_status("Loading seed…")
-        self.seed = load_seed_from_path(seed_path) if seed_path else load_seed_from_github()
-        self.model_uri = model_uri
+    def set_seed(self, img: Image.Image) -> None:
+        """Center-crop the image to the expected aspect ratio and store as seed."""
+        # TODO: Calculate aspect ratio automatically once
+        # https://github.com/Overworldai/world_engine/issues/43 lands
+        crop_w, crop_h = 16, 9
+        w, h = img.size
+        if w * crop_h > h * crop_w:
+            new_w, new_h = h * crop_w // crop_h, h
+        else:
+            new_w, new_h = w, w * crop_h // crop_w
+        left = (w - new_w) // 2
+        top = (h - new_h) // 2
+        cropped = img.crop((left, top, left + new_w, top + new_h)).convert("RGB")
+        # .copy() — PIL's buffer is read-only and torch.from_numpy requires writable.
+        self.seed = np.asarray(cropped).copy()
 
-        renderer.draw_status("Priming engine…")
+    def prime(self) -> None:
+        """Reset state and encode the seed frame into the KV cache."""
+        assert self.seed is not None, "call set_seed() first"
+        self.pending = None
         self.inner.reset()
-        self._prime_seed()
-
-        # The first gen_frame triggers torch.compile — the most expensive step.
-        renderer.draw_status("Warming up (torch.compile)…")
-        log.info("warming up torch.compile")
-        w0 = time.perf_counter()
-        self.pending = self.next_frame(ctrl=CtrlInput()).cpu()
-        log.info("warmup complete in %.1fs", time.perf_counter() - w0)
-
-    def _prime_seed(self) -> None:
-        """Encode the seed frame into the KV cache."""
         t = torch.from_numpy(self.seed).to(self.inner.device)  # uint8 (H, W, 3)
         tc = self.inner.model_cfg.temporal_compression
         if tc > 1:
@@ -251,6 +203,13 @@ class Engine:
             t = t.unsqueeze(0).expand(tc, -1, -1, -1).contiguous()
         log.info("priming engine with seed shape=%s", tuple(t.shape))
         self.inner.append_frame(t)
+
+    def warmup(self) -> None:
+        """Run one gen_frame to trigger torch.compile. Result stored in `self.pending`."""
+        log.info("warming up torch.compile")
+        w0 = time.perf_counter()
+        self.pending = self.next_frame(ctrl=CtrlInput()).cpu()
+        log.info("warmup complete in %.1fs", time.perf_counter() - w0)
 
     def next_frame(self, ctrl: CtrlInput) -> torch.Tensor:
         """Generate the next frame. Returns a GPU tensor; caller must .cpu() before the next call."""
@@ -262,9 +221,7 @@ class Engine:
         reset() clears the KV cache and all state, so the model must be
         re-seeded with append_frame before it can produce coherent output.
         """
-        self.pending = None
-        self.inner.reset()
-        self._prime_seed()
+        self.prime()
 
 
 # --- gameplay ----------------------------------------------------------------
@@ -391,6 +348,22 @@ def gameplay(
 
 # --- entry point -------------------------------------------------------------
 
+def get_seed(path: str | None) -> Image.Image:
+    """Load a seed image from a local path, or download a random one from Biome."""
+    if path is not None:
+        log.info("loading seed from local file: %s", path)
+        return Image.open(path)
+    # GitHub contents API for the Biome `seeds/` directory, pinned to a known ref.
+    biome_api = "https://api.github.com/repos/Overworldai/Biome/contents/seeds?ref=14343a6"
+    log.info("fetching Biome seeds index")
+    with urllib.request.urlopen(biome_api) as res:
+        entries = [e for e in json.load(res) if e["type"] == "file"]
+    url = random.choice(entries)["download_url"]
+    log.info("downloading random Biome seed: %s", url)
+    with urllib.request.urlopen(url) as res:
+        return Image.open(io.BytesIO(res.read()))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("model_uri", help="HF model id, e.g. Overworld/Waypoint-1.5-1B")
@@ -405,7 +378,14 @@ def main() -> None:
     clock = pygame.time.Clock()
 
     try:
-        engine = Engine(renderer, args.model_uri, args.quant, args.device, args.seed)
+        renderer.draw_status("Loading model…")
+        engine = Engine(args.model_uri, args.quant, args.device)
+        renderer.draw_status("Loading seed…")
+        engine.set_seed(get_seed(args.seed))
+        renderer.draw_status("Priming engine…")
+        engine.prime()
+        renderer.draw_status("Warming up (torch.compile)…")
+        engine.warmup()
         gameplay(renderer, clock, engine, args.mouse_sensitivity)
     except KeyboardInterrupt:
         pass
