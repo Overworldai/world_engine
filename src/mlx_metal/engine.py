@@ -43,7 +43,7 @@ class MLXWorldEngine(WorldEngine):
         # load_weights=False avoids loading PyTorch world model weights we'd immediately discard.
         super().__init__(model_uri, model_config_overrides=model_config_overrides, load_weights=False)
 
-        # Replace VAE with ANE version
+        # Replace VAE with ANE version (exports CoreML models on first run)
         if ane_vae:
             pH, pW = self.model_cfg.patch
             self.vae = get_ae(
@@ -52,6 +52,8 @@ class MLXWorldEngine(WorldEngine):
                 auto_aspect_ratio=self.model_cfg.auto_aspect_ratio,
                 ane=True,
                 dtype=torch.float32,
+                height=self.model_cfg.height * pH,
+                width=self.model_cfg.width * pW,
             )
 
         # Load MLX world model (replaces the PyTorch model from super().__init__)

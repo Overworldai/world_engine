@@ -35,31 +35,43 @@ class CoreMLTAEHV:
         compute_units: str = "CPU_AND_NE",
         auto_aspect_ratio: bool = True,
         dtype=torch.bfloat16,
+        height: int = None,
+        width: int = None,
     ):
         cu = getattr(ct.ComputeUnit, compute_units)
         self.encoder_ml = ct.models.MLModel(encoder_path, compute_units=cu)
         self.decoder_ml = ct.models.MLModel(decoder_path, compute_units=cu)
         self.auto_aspect_ratio = auto_aspect_ratio
         self.dtype = dtype
+        # Derive spatial dims from model config (or default to 720p).
+        # pixel_size = latent × 16 (8× VAE spatial compression × 2 pixel_unshuffle).
+        # Encoder CoreML input = pixel_size / 2 (post pixel_unshuffle).
+        if height is not None and width is not None:
+            pix_h, pix_w = height * 16, width * 16
+        else:
+            pix_h, pix_w = 512, 1024  # 720p default
+        self._target_encode_size = (pix_h, pix_w)
+        self._enc_h, self._enc_w = pix_h // 2, pix_w // 2
+        self._lat_h, self._lat_w = pix_h // 16, pix_w // 16
 
         self._enc_key = None
         self._frames_key = None
-        self._state_lo = None
-        self._state_mid = None
-        self._state_hi = None
         self._primed = False
 
         self._warmup()
 
     def _warmup(self):
-        enc_pred = self.encoder_ml.predict({"x": np.zeros((4, 12, 256, 512), dtype=np.float16)})
+        h, w = self._lat_h, self._lat_w
+        enc_pred = self.encoder_ml.predict({
+            "x": np.zeros((4, 12, self._enc_h, self._enc_w), dtype=np.float16),
+        })
         self._enc_key = list(enc_pred.keys())[0]
 
         dec_pred = self.decoder_ml.predict({
-            "x": np.zeros((1, 32, 32, 64), dtype=np.float16),
-            "state_lo": np.zeros((3, 256, 32, 64), dtype=np.float16),
-            "state_mid": np.zeros((3, 128, 64, 128), dtype=np.float16),
-            "state_hi": np.zeros((3, 64, 128, 256), dtype=np.float16),
+            "x": np.zeros((1, 32, h, w), dtype=np.float16),
+            "state_lo": np.zeros((3, 256, h, w), dtype=np.float16),
+            "state_mid": np.zeros((3, 128, h * 2, w * 2), dtype=np.float16),
+            "state_hi": np.zeros((3, 64, h * 4, w * 4), dtype=np.float16),
         })
         for k, v in dec_pred.items():
             if v.shape[0] == 4:
@@ -75,22 +87,32 @@ class CoreMLTAEHV:
         dtype=torch.bfloat16,
         device=None,
         export_dir: str = "diagnostics/taehv_ane",
+        height: int = None,
+        width: int = None,
         **kwargs,
     ):
-        enc_path = os.path.join(export_dir, "taehv_encoder.mlpackage")
-        dec_path = os.path.join(export_dir, "taehv_decoder_ane.mlpackage")
+        # Encoder input size = latent_spatial × 8 (VAE spatial compression).
+        enc_h = height * 8 if height else 256
+        enc_w = width * 8 if width else 512
+
+        # Resolution-specific subdirectory so 720p and 360p coexist.
+        res_dir = os.path.join(export_dir, f"{enc_h}x{enc_w}")
+        enc_path = os.path.join(res_dir, "taehv_encoder.mlpackage")
+        dec_path = os.path.join(res_dir, "taehv_decoder_ane.mlpackage")
 
         if not os.path.exists(enc_path) or not os.path.exists(dec_path):
-            print(f"[CoreMLTAEHV] Exporting models to {export_dir}...")
-            _export_taehv(model_uri, export_dir)
+            print(f"[CoreMLTAEHV] Exporting {enc_h}x{enc_w} models to {res_dir}...")
+            _export_taehv(model_uri, res_dir, enc_h=enc_h, enc_w=enc_w)
 
         return cls(enc_path, dec_path, compute_units=compute_units,
-                   auto_aspect_ratio=auto_aspect_ratio, dtype=dtype)
+                   auto_aspect_ratio=auto_aspect_ratio, dtype=dtype,
+                   height=height, width=width)
 
     def reset(self):
-        self._state_lo = np.zeros((3, 256, 32, 64), dtype=np.float16)
-        self._state_mid = np.zeros((3, 128, 64, 128), dtype=np.float16)
-        self._state_hi = np.zeros((3, 64, 128, 256), dtype=np.float16)
+        h, w = self._lat_h, self._lat_w
+        self._state_lo = np.zeros((3, 256, h, w), dtype=np.float16)
+        self._state_mid = np.zeros((3, 128, h * 2, w * 2), dtype=np.float16)
+        self._state_hi = np.zeros((3, 64, h * 4, w * 4), dtype=np.float16)
         self._primed = False
 
     def _resize(self, x: Tensor, size: tuple[int, int]) -> Tensor:
@@ -105,11 +127,11 @@ class CoreMLTAEHV:
             "state_hi": self._state_hi,
         })
         for k, v in pred.items():
-            if v.shape == (3, 256, 32, 64):
+            if v.shape == self._state_lo.shape:
                 self._state_lo = v
-            elif v.shape == (3, 128, 64, 128):
+            elif v.shape == self._state_mid.shape:
                 self._state_mid = v
-            elif v.shape == (3, 64, 128, 256):
+            elif v.shape == self._state_hi.shape:
                 self._state_hi = v
         return pred[self._frames_key]
 
@@ -120,7 +142,8 @@ class CoreMLTAEHV:
 
         rgb = img.unsqueeze(0).to(dtype=torch.float32).permute(0, 1, 4, 2, 3).contiguous().div(255)
         if self.auto_aspect_ratio:
-            rgb = self._resize(rgb, self._ENCODE_SIZES[img.shape[1:3]])
+            encode_size = self._target_encode_size or self._ENCODE_SIZES[img.shape[1:3]]
+            rgb = self._resize(rgb, encode_size)
 
         rgb_4d = rgb.reshape(4, 3, rgb.shape[3], rgb.shape[4])
         enc_input = F.pixel_unshuffle(rgb_4d, 2)
@@ -153,40 +176,42 @@ class CoreMLTAEHV:
 # ---------------------------------------------------------------------------
 
 class _EncoderStatic(nn.Module):
-    """Stateless encoder. Hardcoded for taehv1_5: T=4, patch_size=2, 512x1024.
+    """Stateless encoder. Hardcoded for taehv1_5: T=4, patch_size=2.
 
-    Input:  [4, 12, 256, 512]  (4 frames after pixel_unshuffle)
-    Output: [1, 32, 32, 64]    (1 latent)
+    Input:  [4, 12, H, W]  (4 frames after pixel_unshuffle)
+    Output: [1, 32, H/8, W/8]    (1 latent)
     """
 
-    def __init__(self, taehv):
+    def __init__(self, taehv, h=256, w=512):
         super().__init__()
         self.blocks = nn.ModuleList(list(taehv.encoder))
+        self._h, self._w = h, w
 
     def forward(self, x):
-        x = self.blocks[0](x)  # Conv [4, 64, 256, 512]
+        h, w = self._h, self._w
+        x = self.blocks[0](x)  # Conv [4, 64, h, w]
         x = self.blocks[1](x)  # ReLU
 
-        x = self.blocks[2].conv(x.reshape(2, 128, 256, 512))  # TPool(2): 4→2
-        x = self.blocks[3](x)  # Conv stride=2: [2, 64, 128, 256]
+        x = self.blocks[2].conv(x.reshape(2, 128, h, w))  # TPool(2): 4→2
+        x = self.blocks[3](x)  # Conv stride=2: [2, 64, h/2, w/2]
 
         for i in [4, 5, 6]:
             past = torch.cat([torch.zeros_like(x[:1]), x[:-1]], dim=0)
             x = self.blocks[i](x, past)
 
-        x = self.blocks[7].conv(x.reshape(1, 128, 128, 256))  # TPool(2): 2→1
-        x = self.blocks[8](x)  # Conv stride=2: [1, 64, 64, 128]
+        x = self.blocks[7].conv(x.reshape(1, 128, h // 2, w // 2))  # TPool(2): 2→1
+        x = self.blocks[8](x)  # Conv stride=2: [1, 64, h/4, w/4]
 
         for i in [9, 10, 11]:
             x = self.blocks[i](x, torch.zeros_like(x))
 
         x = self.blocks[12].conv(x)  # TPool(1): no change
-        x = self.blocks[13](x)       # Conv stride=2: [1, 64, 32, 64]
+        x = self.blocks[13](x)       # Conv stride=2: [1, 64, h/8, w/8]
 
         for i in [14, 15, 16]:
             x = self.blocks[i](x, torch.zeros_like(x))
 
-        return self.blocks[17](x)  # Conv 64→32: [1, 32, 32, 64]
+        return self.blocks[17](x)  # Conv 64→32: [1, 32, h/8, w/8]
 
 
 class _DecoderExplicitState(nn.Module):
@@ -197,14 +222,18 @@ class _DecoderExplicitState(nn.Module):
     Uses torch.cat (not zeros+scatter) to build output state — scatter
     ops are ~40ms slower on ANE.
 
-    Input:  x [1, 32, 32, 64], state_lo [3, 256, 32, 64],
-            state_mid [3, 128, 64, 128], state_hi [3, 64, 128, 256]
-    Output: frames [4, 3, 512, 1024], new_state_lo, new_state_mid, new_state_hi
+    Input:  x [1, 32, lat_h, lat_w], state_lo/mid/hi at matching sizes
+    Output: frames [4, 3, lat_h*16, lat_w*16], new_state_lo/mid/hi
     """
 
-    def __init__(self, taehv):
+    def __init__(self, taehv, lat_h=32, lat_w=64):
         super().__init__()
         self.blocks = nn.ModuleList(list(taehv.decoder))
+        # Spatial dims at each decoder resolution level:
+        # TGrow at b13: input is (1, C, lat_h*4, lat_w*4) → reshape to (2, C/2, lat_h*4, lat_w*4)
+        # TGrow at b19: input is (2, C, lat_h*8, lat_w*8) → reshape to (4, C/2, lat_h*8, lat_w*8)
+        self._h2, self._w2 = lat_h * 4, lat_w * 4   # after 2× upsample twice
+        self._h4, self._w4 = lat_h * 8, lat_w * 8   # after 3× upsample
 
     def forward(self, x, state_lo, state_mid, state_hi):
         x = self.blocks[0](x)   # Clamp
@@ -235,7 +264,7 @@ class _DecoderExplicitState(nn.Module):
 
         x = self.blocks[12](x)         # Upsample(2)
         x = self.blocks[13].conv(x)    # TGrow(2): 1→2
-        x = x.reshape(2, 128, 128, 256)
+        x = x.reshape(2, 128, self._h2, self._w2)
         x = self.blocks[14](x)         # Conv 128→64
 
         # Group 3 (blocks 15-17, T=2): save LAST frame's input
@@ -254,12 +283,12 @@ class _DecoderExplicitState(nn.Module):
 
         x = self.blocks[18](x)         # Upsample(2)
         x = self.blocks[19].conv(x)    # TGrow(2): 2→4
-        x = x.reshape(4, 64, 256, 512)
+        x = x.reshape(4, 64, self._h4, self._w4)
         x = self.blocks[20](x)         # Conv 64→64
         x = self.blocks[21](x)         # ReLU
         x = self.blocks[22](x)         # Conv 64→12
 
-        x = F.pixel_shuffle(x, 2)      # [4, 3, 512, 1024]
+        x = F.pixel_shuffle(x, 2)      # [4, 3, H_out, W_out]
         x = x.clamp(0, 1)
 
         return x, new_lo, new_mid, new_hi
@@ -269,8 +298,13 @@ class _DecoderExplicitState(nn.Module):
 # Export function
 # ---------------------------------------------------------------------------
 
-def _export_taehv(model_uri: str, out_dir: str):
-    """Export TAEHV encoder (stateless) and decoder (explicit-state) for ANE."""
+def _export_taehv(model_uri: str, out_dir: str, enc_h: int = 256, enc_w: int = 512):
+    """Export TAEHV encoder (stateless) and decoder (explicit-state) for ANE.
+
+    Resolution is set by enc_h × enc_w (encode target).
+    Default 256×512 produces 32×64 latent (720p model).
+    Pass 128×256 for 16×32 latent (360p model).
+    """
     import pathlib
     import huggingface_hub
     from taehv import TAEHV
@@ -284,43 +318,45 @@ def _export_taehv(model_uri: str, out_dir: str):
     taehv = TAEHV(str(ckpt)).eval().to(torch.float32)
     os.makedirs(out_dir, exist_ok=True)
 
+    lat_h, lat_w = enc_h // 8, enc_w // 8  # after encoder's 8× spatial compression
+
     # Encoder — stateless
     enc_path = os.path.join(out_dir, "taehv_encoder.mlpackage")
     if not os.path.exists(enc_path):
-        enc = _EncoderStatic(taehv).eval()
+        enc = _EncoderStatic(taehv, h=enc_h, w=enc_w).eval()
         with torch.no_grad():
-            traced = torch.jit.trace(enc, torch.randn(4, 12, 256, 512))
+            traced = torch.jit.trace(enc, torch.randn(4, 12, enc_h, enc_w))
         ct.convert(
             traced,
-            inputs=[ct.TensorType(name="x", shape=(4, 12, 256, 512))],
+            inputs=[ct.TensorType(name="x", shape=(4, 12, enc_h, enc_w))],
             convert_to="mlprogram",
             compute_precision=ct.precision.FLOAT16,
             minimum_deployment_target=ct.target.macOS15,
         ).save(enc_path)
 
-    # Decoder — explicit I/O state (no StateType, ANE-compatible)
+    # Decoder — explicit I/O state
     dec_path = os.path.join(out_dir, "taehv_decoder_ane.mlpackage")
     if not os.path.exists(dec_path):
-        dec = _DecoderExplicitState(taehv).eval()
+        dec = _DecoderExplicitState(taehv, lat_h=lat_h, lat_w=lat_w).eval()
         dummy = (
-            torch.randn(1, 32, 32, 64),
-            torch.zeros(3, 256, 32, 64),
-            torch.zeros(3, 128, 64, 128),
-            torch.zeros(3, 64, 128, 256),
+            torch.randn(1, 32, lat_h, lat_w),
+            torch.zeros(3, 256, lat_h, lat_w),
+            torch.zeros(3, 128, lat_h * 2, lat_w * 2),
+            torch.zeros(3, 64, lat_h * 4, lat_w * 4),
         )
         with torch.no_grad():
             traced = torch.jit.trace(dec, dummy, strict=False)
         ct.convert(
             traced,
             inputs=[
-                ct.TensorType(name="x", shape=(1, 32, 32, 64)),
-                ct.TensorType(name="state_lo", shape=(3, 256, 32, 64)),
-                ct.TensorType(name="state_mid", shape=(3, 128, 64, 128)),
-                ct.TensorType(name="state_hi", shape=(3, 64, 128, 256)),
+                ct.TensorType(name="x", shape=(1, 32, lat_h, lat_w)),
+                ct.TensorType(name="state_lo", shape=(3, 256, lat_h, lat_w)),
+                ct.TensorType(name="state_mid", shape=(3, 128, lat_h * 2, lat_w * 2)),
+                ct.TensorType(name="state_hi", shape=(3, 64, lat_h * 4, lat_w * 4)),
             ],
             convert_to="mlprogram",
             compute_precision=ct.precision.FLOAT16,
             minimum_deployment_target=ct.target.macOS15,
         ).save(dec_path)
 
-    print(f"[CoreMLTAEHV] Exported to {out_dir}")
+    print(f"[CoreMLTAEHV] Exported {enc_h}×{enc_w} models to {out_dir}")
