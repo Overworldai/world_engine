@@ -33,6 +33,7 @@ import logging
 import random
 import time
 import urllib.request
+from dataclasses import dataclass, field
 
 import numpy as np
 import pygame
@@ -212,20 +213,6 @@ def draw_status(screen: pygame.Surface, font: pygame.font.Font, text: str) -> No
     pygame.display.flip()
 
 
-# --- mouse helpers -----------------------------------------------------------
-
-def grab_mouse(screen: pygame.Surface) -> None:
-    """Confine + hide the cursor for FPS-style gameplay."""
-    pygame.event.set_grab(True)
-    pygame.mouse.set_visible(False)
-    pygame.mouse.get_rel()  # discard any pre-grab accumulated delta
-
-
-def release_mouse() -> None:
-    pygame.event.set_grab(False)
-    pygame.mouse.set_visible(True)
-
-
 # --- engine init -------------------------------------------------------------
 
 def init_engine(
@@ -271,6 +258,94 @@ def init_engine(
 
 # --- gameplay ----------------------------------------------------------------
 
+
+@dataclass
+class GameState:
+    """Mutable state shared between event handling and the generation loop."""
+
+    screen: pygame.Surface
+    engine: WorldEngine
+    seed: np.ndarray
+    hud_font: pygame.font.Font
+    model_uri: str
+    paused: bool = True
+    held_vks: set[int] = field(default_factory=set)
+    scroll: int = 0
+    # Pipeline state: `pending` holds the not-yet-rendered CPU frame from the
+    # previous gen_frame call. We render it while the GPU computes the next one.
+    pending: torch.Tensor | None = None
+    batch_dt: float = 0.0
+    last_surface: pygame.Surface | None = None
+
+    def enter_pause(self) -> None:
+        """Flush any in-flight batch and enter paused state."""
+        if self.pending is not None:
+            self.last_surface = render(self.screen, self.pending, self.batch_dt, self.hud_font, self.model_uri)
+            self.pending = None
+        self.paused = True
+        pygame.event.set_grab(False)
+        pygame.mouse.set_visible(True)
+
+    def exit_pause(self) -> None:
+        """Re-grab the cursor and resume gameplay."""
+        self.paused = False
+        pygame.event.set_grab(True)
+        pygame.mouse.set_visible(False)
+        pygame.mouse.get_rel()  # discard accumulated delta during pause
+
+    def process_events(self) -> bool:
+        """Drain pygame events and update state. Returns False to quit."""
+        self.scroll = 0
+
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT:
+                return False
+
+            # Auto-pause when the cursor leaves the window. Safety net for
+            # WMs where `set_grab` is advisory and the cursor can escape.
+            elif e.type == pygame.WINDOWLEAVE and not self.paused:
+                self.enter_pause()
+
+            elif e.type == pygame.KEYDOWN:
+                if e.key == pygame.K_ESCAPE and not self.paused:
+                    self.enter_pause()
+                elif e.key == pygame.K_u and not self.paused:
+                    # reset() clears the KV cache and all state, so the model
+                    # must be re-seeded with append_frame before it can produce
+                    # coherent output again.
+                    self.pending = None
+                    self.engine.reset()
+                    prime_seed(self.engine, self.seed)
+                else:
+                    vk = PYGAME_TO_VK.get(e.key)
+                    if vk is not None:
+                        self.held_vks.add(vk)
+
+            elif e.type == pygame.KEYUP:
+                vk = PYGAME_TO_VK.get(e.key)
+                if vk is not None:
+                    self.held_vks.discard(vk)
+
+            elif e.type == pygame.MOUSEBUTTONDOWN:
+                if self.paused and e.button == 1:
+                    self.exit_pause()
+                else:
+                    vk = MOUSE_TO_VK.get(e.button)
+                    if vk is not None:
+                        self.held_vks.add(vk)
+                    if e.button == 4:
+                        self.scroll += 1
+                    elif e.button == 5:
+                        self.scroll -= 1
+
+            elif e.type == pygame.MOUSEBUTTONUP:
+                vk = MOUSE_TO_VK.get(e.button)
+                if vk is not None:
+                    self.held_vks.discard(vk)
+
+        return True
+
+
 def gameplay(
     screen: pygame.Surface,
     font: pygame.font.Font,
@@ -288,86 +363,28 @@ def gameplay(
     and returns immediately; we render the *previous* batch (with pacing sleeps)
     while the GPU works; then .cpu() syncs and transfers the result.
     """
-    last_surface: pygame.Surface = render(screen, first_frame, 0.0)
-    paused = True
+    state = GameState(
+        screen=screen, engine=engine, seed=seed,
+        hud_font=hud_font, model_uri=model_uri,
+        last_surface=render(screen, first_frame, 0.0),
+    )
     log.info("ready")
 
-    held_vks: set[int] = set()
-    # Pipeline state: `pending` holds the not-yet-rendered CPU frame from the
-    # previous gen_frame call. We render it while the GPU computes the next one.
-    pending: torch.Tensor | None = None
-    batch_dt = 0.0
-
     while True:
-        scroll = 0
+        if not state.process_events():
+            return
 
-        for e in pygame.event.get():
-            if e.type == pygame.QUIT:
-                return
-
-            # Auto-pause when the cursor leaves the window. Safety net for
-            # WMs where `set_grab` is advisory and the cursor can escape.
-            elif e.type == pygame.WINDOWLEAVE and not paused:
-                if pending is not None:
-                    last_surface = render(screen, pending, batch_dt, hud_font, model_uri)
-                    pending = None
-                paused = True
-                release_mouse()
-                continue
-
-            elif e.type == pygame.KEYDOWN:
-                if e.key == pygame.K_ESCAPE and not paused:
-                    if pending is not None:
-                        last_surface = render(screen, pending, batch_dt, hud_font, model_uri)
-                        pending = None
-                    paused = True
-                    release_mouse()
-                    continue
-                if e.key == pygame.K_u and not paused:
-                    # reset() clears the KV cache and all state, so the model
-                    # must be re-seeded with append_frame before it can produce
-                    # coherent output again.
-                    pending = None
-                    engine.reset()
-                    prime_seed(engine, seed)
-                    continue
-                vk = PYGAME_TO_VK.get(e.key)
-                if vk is not None:
-                    held_vks.add(vk)
-
-            elif e.type == pygame.KEYUP:
-                vk = PYGAME_TO_VK.get(e.key)
-                if vk is not None:
-                    held_vks.discard(vk)
-
-            elif e.type == pygame.MOUSEBUTTONDOWN:
-                if paused and e.button == 1:
-                    paused = False
-                    grab_mouse(screen)
-                    continue
-                vk = MOUSE_TO_VK.get(e.button)
-                if vk is not None:
-                    held_vks.add(vk)
-                if e.button == 4:
-                    scroll += 1
-                elif e.button == 5:
-                    scroll -= 1
-
-            elif e.type == pygame.MOUSEBUTTONUP:
-                vk = MOUSE_TO_VK.get(e.button)
-                if vk is not None:
-                    held_vks.discard(vk)
-
-        if paused:
-            draw_pause_overlay(screen, last_surface, font)
+        if state.paused:
+            assert state.last_surface is not None
+            draw_pause_overlay(screen, state.last_surface, font)
             clock.tick(60)
             continue
 
         dx, dy = pygame.mouse.get_rel()
         ctrl = CtrlInput(
-            button=set(held_vks),
+            button=set(state.held_vks),
             mouse=(dx * mouse_sensitivity, dy * mouse_sensitivity),
-            scroll_wheel=scroll,
+            scroll_wheel=state.scroll,
         )
 
         # Pipeline: kick off generation (GPU kernels queued, returns fast),
@@ -375,10 +392,10 @@ def gameplay(
         # syncs and transfers the just-computed batch to CPU.
         t0 = time.perf_counter()
         next_frames = engine.gen_frame(ctrl=ctrl)
-        if pending is not None:
-            last_surface = render(screen, pending, batch_dt, hud_font, model_uri)
-        pending = next_frames.cpu()
-        batch_dt = time.perf_counter() - t0
+        if state.pending is not None:
+            state.last_surface = render(screen, state.pending, state.batch_dt, hud_font, model_uri)
+        state.pending = next_frames.cpu()
+        state.batch_dt = time.perf_counter() - t0
 
 
 # --- entry point -------------------------------------------------------------
