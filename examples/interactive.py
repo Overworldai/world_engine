@@ -120,87 +120,77 @@ def load_seed_from_github() -> np.ndarray:
 
 # --- rendering --------------------------------------------------------------
 
-def _blit_frame(screen: pygame.Surface, frame: np.ndarray) -> pygame.Surface:
-    """Blit a single (H, W, 3) uint8 numpy frame, scaled to the window. Returns the scaled surface."""
-    # pygame.surfarray expects (W, H, 3), so swap the first two axes.
-    surf = pygame.surfarray.make_surface(frame.swapaxes(0, 1))
-    surf = pygame.transform.scale(surf, screen.get_size())
-    screen.blit(surf, (0, 0))
-    return surf
 
+class Renderer:
+    """Owns the screen surface and fonts; handles all drawing."""
 
-def _draw_hud(
-    screen: pygame.Surface,
-    font: pygame.font.Font | None,
-    model_uri: str,
-    batch_dt: float,
-) -> None:
-    """Draw FPS / frametime and model name at the top-right corner. No-op if font is None."""
-    if font is None:
-        return
-    lines: list[tuple[str, tuple[int, int, int]]] = []
-    if batch_dt > 0:
-        lines.append((f"{1.0 / batch_dt:.1f} fps / {batch_dt * 1000:.1f} ms", (255, 255, 255)))
-    lines.append((model_uri, (160, 160, 160)))
-    for i, (text, color) in enumerate(lines):
-        label = font.render(text, True, color)
-        x = screen.get_width() - label.get_width() - 12
-        y = 12 + i * (label.get_height() + 4)
-        screen.blit(label, (x, y))
+    def __init__(self, model_uri: str) -> None:
+        self.screen = pygame.display.set_mode(WINDOW_SIZE, pygame.RESIZABLE)
+        pygame.display.set_caption(model_uri)
+        self.model_uri = model_uri
+        self.font = pygame.font.SysFont(None, 36)
+        self.hud_font = pygame.font.SysFont(None, 22)
+        self.status_font = pygame.font.SysFont(None, 24)
+        self._last_surface: pygame.Surface | None = None
 
+    def _present(self, frame: np.ndarray, batch_dt: float) -> None:
+        """Blit a single (H, W, 3) frame, draw HUD, flip, and cache for pause."""
+        # pygame.surfarray expects (W, H, 3), so swap the first two axes.
+        surf = pygame.surfarray.make_surface(frame.swapaxes(0, 1))
+        surf = pygame.transform.scale(surf, self.screen.get_size())
+        self.screen.blit(surf, (0, 0))
+        self._last_surface = surf
 
-def render(
-    screen: pygame.Surface,
-    frame_cpu: torch.Tensor,
-    batch_dt: float,
-    hud_font: pygame.font.Font | None = None,
-    model_uri: str = "",
-) -> pygame.Surface:
-    """Display an already-on-CPU frame; return the last surface for pause caching.
+        lines: list[tuple[str, tuple[int, int, int]]] = []
+        if batch_dt > 0:
+            lines.append((f"{1.0 / batch_dt:.1f} fps / {batch_dt * 1000:.1f} ms", (255, 255, 255)))
+        lines.append((self.model_uri, (160, 160, 160)))
+        for i, (text, color) in enumerate(lines):
+            label = self.hud_font.render(text, True, color)
+            x = self.screen.get_width() - label.get_width() - 12
+            y = 12 + i * (label.get_height() + 4)
+            self.screen.blit(label, (x, y))
 
-    For multi-frame models the tensor is (T, H, W, 3) — we spread the T
-    sub-frames evenly across `batch_dt` (per README "Waypoint-1.5 Behavior").
-    The sleeps are what let the pipeline overlap: while we pace here, the GPU
-    is already computing the next batch.
-    """
-    arr = frame_cpu.numpy()
-    if arr.ndim == 3:  # single-frame model: (H, W, 3)
-        last = _blit_frame(screen, arr)
-        _draw_hud(screen, hud_font, model_uri, batch_dt)
         pygame.display.flip()
-        return last
 
-    # Multi-frame model: (T, H, W, 3)
-    step_ms = max(0, int(batch_dt * 1000 / arr.shape[0]))
-    last: pygame.Surface | None = None
-    for i, sub in enumerate(arr):
-        if i > 0 and step_ms:
-            pygame.time.wait(step_ms)
-        last = _blit_frame(screen, sub)
-        _draw_hud(screen, hud_font, model_uri, batch_dt)
+    def render_frame(self, frame_cpu: torch.Tensor, batch_dt: float) -> None:
+        """Display an already-on-CPU frame and cache it for the pause overlay.
+
+        For multi-frame models the tensor is (T, H, W, 3) — we spread the T
+        sub-frames evenly across `batch_dt` (per README "Waypoint-1.5 Behavior").
+        The sleeps are what let the pipeline overlap: while we pace here, the
+        GPU is already computing the next batch.
+        """
+        arr = frame_cpu.numpy()
+        if arr.ndim == 3:  # single-frame model: (H, W, 3)
+            self._present(arr, batch_dt)
+            return
+
+        # Multi-frame model: (T, H, W, 3)
+        step_ms = max(0, int(batch_dt * 1000 / arr.shape[0]))
+        for i, sub in enumerate(arr):
+            if i > 0 and step_ms:
+                pygame.time.wait(step_ms)
+            self._present(sub, batch_dt)
+
+    def draw_pause(self) -> None:
+        """Redraw the cached last frame with a dimmed overlay and centered pause text."""
+        assert self._last_surface is not None
+        self.screen.blit(self._last_surface, (0, 0))
+        dim = pygame.Surface(self.screen.get_size(), pygame.SRCALPHA)
+        dim.fill((0, 0, 0, 128))  # 50% black
+        self.screen.blit(dim, (0, 0))
+        label = self.font.render("Paused — click to resume", True, (255, 255, 255))
+        rect = label.get_rect(center=self.screen.get_rect().center)
+        self.screen.blit(label, rect)
         pygame.display.flip()
-    assert last is not None
-    return last
 
-
-def draw_pause_overlay(screen: pygame.Surface, last: pygame.Surface, font: pygame.font.Font) -> None:
-    """Redraw the cached last frame with a dimmed overlay and centered pause text."""
-    screen.blit(last, (0, 0))
-    dim = pygame.Surface(screen.get_size(), pygame.SRCALPHA)
-    dim.fill((0, 0, 0, 128))  # 50% black
-    screen.blit(dim, (0, 0))
-    label = font.render("Paused — click to resume", True, (255, 255, 255))
-    rect = label.get_rect(center=screen.get_rect().center)
-    screen.blit(label, rect)
-    pygame.display.flip()
-
-
-def draw_status(screen: pygame.Surface, font: pygame.font.Font, text: str) -> None:
-    """Clear to black and draw a status line in the bottom-left corner."""
-    screen.fill((0, 0, 0))
-    label = font.render(text, True, (220, 220, 220))
-    screen.blit(label, (16, screen.get_height() - label.get_height() - 16))
-    pygame.display.flip()
+    def draw_status(self, text: str) -> None:
+        """Clear to black and draw a status line in the bottom-left corner."""
+        self.screen.fill((0, 0, 0))
+        label = self.status_font.render(text, True, (220, 220, 220))
+        self.screen.blit(label, (16, self.screen.get_height() - label.get_height() - 16))
+        pygame.display.flip()
 
 
 # --- engine ------------------------------------------------------------------
@@ -221,15 +211,14 @@ class Engine:
 
     def __init__(
         self,
-        screen: pygame.Surface,
-        font: pygame.font.Font,
+        renderer: "Renderer",
         model_uri: str,
         quant: str | None,
         device: str,
         seed_path: str | None,
     ) -> None:
-        """Load model, seed, prime, compile-warmup. Shows status on *screen*."""
-        draw_status(screen, font, "Loading model…")
+        """Load model, seed, prime, compile-warmup. Shows status via *renderer*."""
+        renderer.draw_status("Loading model…")
         log.info("loading model %s (quant=%s, device=%s)", model_uri, quant, device)
         self.inner = WorldEngine(model_uri, quant=quant, device=device)
         log.info(
@@ -237,16 +226,16 @@ class Engine:
             self.inner.model_cfg.model_type, self.inner.model_cfg.temporal_compression,
         )
 
-        draw_status(screen, font, "Loading seed…")
+        renderer.draw_status("Loading seed…")
         self.seed = load_seed_from_path(seed_path) if seed_path else load_seed_from_github()
         self.model_uri = model_uri
 
-        draw_status(screen, font, "Priming engine…")
+        renderer.draw_status("Priming engine…")
         self.inner.reset()
         self._prime_seed()
 
         # The first gen_frame triggers torch.compile — the most expensive step.
-        draw_status(screen, font, "Warming up (torch.compile)…")
+        renderer.draw_status("Warming up (torch.compile)…")
         log.info("warming up torch.compile")
         w0 = time.perf_counter()
         self.pending = self.next_frame(ctrl=CtrlInput()).cpu()
@@ -285,21 +274,17 @@ class Engine:
 class GameState:
     """Mutable state shared between event handling and the generation loop."""
 
-    screen: pygame.Surface
+    renderer: Renderer
     engine: Engine
-    hud_font: pygame.font.Font
     paused: bool = True
     held_vks: set[int] = field(default_factory=set)
     scroll: int = 0
     batch_dt: float = 0.0
-    last_surface: pygame.Surface | None = None
 
     def enter_pause(self) -> None:
         """Flush any in-flight batch and enter paused state."""
         if self.engine.pending is not None:
-            self.last_surface = render(
-                self.screen, self.engine.pending, self.batch_dt, self.hud_font, self.engine.model_uri,
-            )
+            self.renderer.render_frame(self.engine.pending, self.batch_dt)
             self.engine.pending = None
         self.paused = True
         pygame.event.set_grab(False)
@@ -361,9 +346,7 @@ class GameState:
 
 
 def gameplay(
-    screen: pygame.Surface,
-    font: pygame.font.Font,
-    hud_font: pygame.font.Font,
+    renderer: Renderer,
     clock: pygame.time.Clock,
     engine: Engine,
     mouse_sensitivity: float,
@@ -374,11 +357,9 @@ def gameplay(
     and returns immediately; we render the *previous* batch (with pacing sleeps)
     while the GPU works; then .cpu() syncs and transfers the result.
     """
-    state = GameState(
-        screen=screen, engine=engine, hud_font=hud_font,
-        last_surface=render(screen, engine.pending, 0.0),
-    )
+    renderer.render_frame(engine.pending, 0.0)
     engine.pending = None
+    state = GameState(renderer=renderer, engine=engine)
     log.info("ready")
 
     while True:
@@ -386,8 +367,7 @@ def gameplay(
             return
 
         if state.paused:
-            assert state.last_surface is not None
-            draw_pause_overlay(screen, state.last_surface, font)
+            renderer.draw_pause()
             clock.tick(60)
             continue
 
@@ -404,7 +384,7 @@ def gameplay(
         t0 = time.perf_counter()
         next_frames = engine.next_frame(ctrl=ctrl)
         if engine.pending is not None:
-            state.last_surface = render(screen, engine.pending, state.batch_dt, hud_font, engine.model_uri)
+            renderer.render_frame(engine.pending, state.batch_dt)
         engine.pending = next_frames.cpu()
         state.batch_dt = time.perf_counter() - t0
 
@@ -421,16 +401,12 @@ def main() -> None:
     args = ap.parse_args()
 
     pygame.init()
-    screen = pygame.display.set_mode(WINDOW_SIZE, pygame.RESIZABLE)
-    pygame.display.set_caption(args.model_uri)
-    font = pygame.font.SysFont(None, 36)
-    hud_font = pygame.font.SysFont(None, 22)
-    status_font = pygame.font.SysFont(None, 24)
+    renderer = Renderer(args.model_uri)
     clock = pygame.time.Clock()
 
     try:
-        engine = Engine(screen, status_font, args.model_uri, args.quant, args.device, args.seed)
-        gameplay(screen, font, hud_font, clock, engine, args.mouse_sensitivity)
+        engine = Engine(renderer, args.model_uri, args.quant, args.device, args.seed)
+        gameplay(renderer, clock, engine, args.mouse_sensitivity)
     except KeyboardInterrupt:
         pass
     finally:
