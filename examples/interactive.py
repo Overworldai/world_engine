@@ -53,26 +53,6 @@ log = logging.getLogger("interactive")
 
 WINDOW_SIZE = (1280, 720)
 
-# Map pygame keys / mouse buttons to the Windows VK integers that CtrlInput.button
-# expects (see https://github.com/Overworldai/owl-control keycode table). Covers
-# the main ANSI rows, space, shift, and the three mouse buttons — enough for
-# WASD / spacebar / look-around gameplay without being exhaustive.
-# Uses `pygame.K_*` int constants directly so this dict can be built at import
-# time (before `pygame.init()`).
-PYGAME_TO_VK: dict[int, int] = (
-    {getattr(pygame, f"K_{ch}"): ord(ch) for ch in "1234567890"}
-    | {pygame.K_MINUS: 0xBD, pygame.K_EQUALS: 0xBB}
-    | {getattr(pygame, f"K_{ch}"): ord(ch.upper()) for ch in "qwertyuiop"}
-    | {pygame.K_LEFTBRACKET: 0xDB, pygame.K_RIGHTBRACKET: 0xDD, pygame.K_BACKSLASH: 0xDC}
-    | {getattr(pygame, f"K_{ch}"): ord(ch.upper()) for ch in "asdfghjkl"}
-    | {pygame.K_SEMICOLON: 0xBA, pygame.K_QUOTE: 0xDE}
-    | {getattr(pygame, f"K_{ch}"): ord(ch.upper()) for ch in "zxcvbnm"}
-    | {pygame.K_COMMA: 0xBC, pygame.K_PERIOD: 0xBE, pygame.K_SLASH: 0xBF}
-    | {pygame.K_SPACE: 0x20, pygame.K_LSHIFT: 0x10, pygame.K_RSHIFT: 0x10}
-)
-# pygame mouse button ids: 1=left, 2=middle, 3=right. VK: 0x01 LBUTTON, 0x04 MBUTTON, 0x02 RBUTTON.
-MOUSE_TO_VK: dict[int, int] = {1: 0x01, 2: 0x04, 3: 0x02}
-
 
 
 
@@ -256,8 +236,26 @@ class GameState:
 
     def process_events(self) -> bool:
         """Drain pygame events and update state. Returns False to quit."""
-        self.scroll = 0
+        # Map pygame keys / mouse buttons to the Windows VK integers that
+        # CtrlInput.button expects (see https://github.com/Overworldai/owl-control
+        # keycode table). Covers the main ANSI rows, space, shift, and three
+        # mouse buttons — enough for WASD / spacebar / look-around gameplay.
+        key_to_vk: dict[int, int] = (
+            {getattr(pygame, f"K_{ch}"): ord(ch) for ch in "1234567890"}
+            | {pygame.K_MINUS: 0xBD, pygame.K_EQUALS: 0xBB}
+            | {getattr(pygame, f"K_{ch}"): ord(ch.upper()) for ch in "qwertyuiop"}
+            | {pygame.K_LEFTBRACKET: 0xDB, pygame.K_RIGHTBRACKET: 0xDD, pygame.K_BACKSLASH: 0xDC}
+            | {getattr(pygame, f"K_{ch}"): ord(ch.upper()) for ch in "asdfghjkl"}
+            | {pygame.K_SEMICOLON: 0xBA, pygame.K_QUOTE: 0xDE}
+            | {getattr(pygame, f"K_{ch}"): ord(ch.upper()) for ch in "zxcvbnm"}
+            | {pygame.K_COMMA: 0xBC, pygame.K_PERIOD: 0xBE, pygame.K_SLASH: 0xBF}
+            | {pygame.K_SPACE: 0x20, pygame.K_LSHIFT: 0x10, pygame.K_RSHIFT: 0x10}
+        )
+        # pygame mouse button ids: 1=left, 2=middle, 3=right.
+        # VK: 0x01 LBUTTON, 0x04 MBUTTON, 0x02 RBUTTON.
+        mouse_to_vk: dict[int, int] = {1: 0x01, 2: 0x04, 3: 0x02}
 
+        self.scroll = 0
         for e in pygame.event.get():
             if e.type == pygame.QUIT:
                 return False
@@ -273,12 +271,12 @@ class GameState:
                 elif e.key == pygame.K_u and not self.paused:
                     self.engine.reset()
                 else:
-                    vk = PYGAME_TO_VK.get(e.key)
+                    vk = key_to_vk.get(e.key)
                     if vk is not None:
                         self.held_vks.add(vk)
 
             elif e.type == pygame.KEYUP:
-                vk = PYGAME_TO_VK.get(e.key)
+                vk = key_to_vk.get(e.key)
                 if vk is not None:
                     self.held_vks.discard(vk)
 
@@ -286,7 +284,7 @@ class GameState:
                 if self.paused and e.button == 1:
                     self.exit_pause()
                 else:
-                    vk = MOUSE_TO_VK.get(e.button)
+                    vk = mouse_to_vk.get(e.button)
                     if vk is not None:
                         self.held_vks.add(vk)
                     if e.button == 4:
@@ -295,7 +293,7 @@ class GameState:
                         self.scroll -= 1
 
             elif e.type == pygame.MOUSEBUTTONUP:
-                vk = MOUSE_TO_VK.get(e.button)
+                vk = mouse_to_vk.get(e.button)
                 if vk is not None:
                     self.held_vks.discard(vk)
 
