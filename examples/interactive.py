@@ -139,8 +139,8 @@ class Renderer:
 class Engine:
     """Wraps WorldEngine with seed management and the generation pipeline.
 
-    Frames are produced by `next_frame()` and should be `.cpu()`'d into
-    `self.pending` by the caller before the next `next_frame()` call.
+    Frames are produced by `next_frame()` and should be `.cpu()`'d by the
+    caller before the next `next_frame()` call (GPU buffers may be reused).
     """
 
     def __init__(self, model_uri: str, quant: str | None, device: str) -> None:
@@ -148,7 +148,6 @@ class Engine:
         self.inner = WorldEngine(model_uri, quant=quant, device=device)
         self.model_uri = model_uri
         self.seed: np.ndarray | None = None
-        self.pending: torch.Tensor | None = None
         log.info(
             "model loaded: type=%s, temporal_compression=%d",
             self.inner.model_cfg.model_type, self.inner.model_cfg.temporal_compression,
@@ -173,7 +172,6 @@ class Engine:
     def prime(self) -> None:
         """Reset state and encode the seed frame into the KV cache."""
         assert self.seed is not None, "call set_seed() first"
-        self.pending = None
         self.inner.reset()
         t = torch.from_numpy(self.seed).to(self.inner.device)  # uint8 (H, W, 3)
         tc = self.inner.model_cfg.temporal_compression
@@ -184,12 +182,13 @@ class Engine:
         log.info("priming engine with seed shape=%s", tuple(t.shape))
         self.inner.append_frame(t)
 
-    def warmup(self) -> None:
-        """Run one gen_frame to trigger torch.compile. Result stored in `self.pending`."""
+    def warmup(self) -> torch.Tensor:
+        """Run one gen_frame to trigger torch.compile. Returns the first frame (CPU)."""
         log.info("warming up torch.compile")
         w0 = time.perf_counter()
-        self.pending = self.next_frame(ctrl=CtrlInput()).cpu()
+        first = self.next_frame(ctrl=CtrlInput()).cpu()
         log.info("warmup complete in %.1fs", time.perf_counter() - w0)
+        return first
 
     def next_frame(self, ctrl: CtrlInput) -> torch.Tensor:
         """Generate the next frame. Returns a GPU tensor; caller must .cpu() before the next call."""
@@ -218,13 +217,16 @@ class GameState:
     paused: bool = True
     held_vks: set[int] = field(default_factory=set)
     scroll: int = 0
+    # Pipeline state: the not-yet-rendered CPU frame from the previous
+    # gen_frame call. Rendered while the GPU computes the next one.
+    pending: torch.Tensor | None = None
     batch_dt: float = 0.0
 
     def _enter_pause(self) -> None:
         """Flush any in-flight batch and enter paused state."""
-        if self.engine.pending is not None:
-            self.renderer.render_frame(self.engine.pending, self.batch_dt)
-            self.engine.pending = None
+        if self.pending is not None:
+            self.renderer.render_frame(self.pending, self.batch_dt)
+            self.pending = None
         self.paused = True
         pygame.event.set_grab(False)
         pygame.mouse.set_visible(True)
@@ -271,6 +273,7 @@ class GameState:
                 if e.key == pygame.K_ESCAPE and not self.paused:
                     self._enter_pause()
                 elif e.key == pygame.K_u and not self.paused:
+                    self.pending = None
                     self.engine.reset()
                 else:
                     vk = key_to_vk.get(e.key)
@@ -309,8 +312,8 @@ class GameState:
         pacing sleeps) while the GPU works; then .cpu() syncs and transfers
         the result.
         """
-        self.renderer.render_frame(self.engine.pending, 0.0)
-        self.engine.pending = None
+        self.renderer.render_frame(self.pending, 0.0)
+        self.pending = None
         log.info("ready")
 
         while True:
@@ -334,9 +337,9 @@ class GameState:
             # .cpu() syncs and transfers the just-computed batch to CPU.
             t0 = time.perf_counter()
             next_frames = self.engine.next_frame(ctrl=ctrl)
-            if self.engine.pending is not None:
-                self.renderer.render_frame(self.engine.pending, self.batch_dt)
-            self.engine.pending = next_frames.cpu()
+            if self.pending is not None:
+                self.renderer.render_frame(self.pending, self.batch_dt)
+            self.pending = next_frames.cpu()
             self.batch_dt = time.perf_counter() - t0
 
 
@@ -379,8 +382,8 @@ def main() -> None:
         renderer.draw_status("Priming engine…")
         engine.prime()
         renderer.draw_status("Warming up (torch.compile)…")
-        engine.warmup()
-        GameState(renderer, engine, clock, args.mouse_sensitivity).run()
+        first = engine.warmup()
+        GameState(renderer, engine, clock, args.mouse_sensitivity, pending=first).run()
     except KeyboardInterrupt:
         pass
     finally:
