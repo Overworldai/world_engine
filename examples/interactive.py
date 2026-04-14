@@ -22,11 +22,6 @@
 #   Left-click (on pause)  : resume
 #   Close window / Ctrl+C  : quit
 #
-# The engine is pinned to a single dedicated thread for its entire lifetime.
-# torch.compile + triton.cudagraphs capture stream state tied to the capturing
-# thread, so calling gen_frame() from a *different* thread segfaults. The main
-# (pygame/UI) thread communicates with the engine thread via two queues.
-#
 # Supports both Waypoint-1 / 1.1 (single-frame output) and Waypoint-1.5
 # (4-frame temporally-compressed output). The only model-dependent branches
 # live in `prime_seed` and `render`, keyed off `engine.model_cfg.model_type`.
@@ -35,9 +30,7 @@ import argparse
 import io
 import json
 import logging
-import queue
 import random
-import threading
 import time
 import urllib.request
 
@@ -51,7 +44,7 @@ from world_engine import CtrlInput, WorldEngine
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(threadName)s] %(message)s",
+    format="%(asctime)s %(message)s",
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("interactive")
@@ -219,103 +212,7 @@ def draw_status(screen: pygame.Surface, font: pygame.font.Font, text: str) -> No
     pygame.display.flip()
 
 
-# --- engine thread -----------------------------------------------------------
-
-
-class Engine:
-    """Owns a WorldEngine on a dedicated thread. Main thread communicates via queues.
-
-    All CUDA work (construction, torch.compile warmup, gen_frame) happens on the
-    engine thread. Cross-thread invocation of compiled+cudagraphs'd code segfaults.
-    """
-
-    def __init__(self) -> None:
-        self._stop = object()
-        self._reset = object()
-        self.ctrl_q: queue.Queue = queue.Queue(maxsize=1)
-        self.frame_q: queue.Queue = queue.Queue(maxsize=1)
-        self.status: str = "Starting…"
-        self.ready = threading.Event()
-        self.error: BaseException | None = None
-
-    def start(self, model_uri: str, quant: str | None, device: str, seed_path: str | None) -> None:
-        threading.Thread(
-            target=self._run, args=(model_uri, quant, device, seed_path),
-            daemon=True, name="engine",
-        ).start()
-
-    def stop(self) -> None:
-        try:
-            self.ctrl_q.put_nowait(self._stop)
-        except queue.Full:
-            pass
-
-    def reset(self) -> None:
-        """Request engine reset (re-prime seed, produce fresh first frame)."""
-        self.ctrl_q.put(self._reset)
-
-    def _run_gen(self, eng: WorldEngine, ctrl: CtrlInput) -> torch.Tensor:
-        """gen_frame -> synchronize -> .cpu(). The sync + immediate CPU copy
-        mirrors Biome's server: the returned GPU tensor may share storage that
-        gen_frame reuses on the next call, so it must be materialized before
-        the next invocation.
-        """
-        frame = eng.gen_frame(ctrl=ctrl)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        return frame.cpu()
-
-    def _run(self, model_uri: str, quant: str | None, device: str, seed_path: str | None) -> None:
-        try:
-            t0 = time.perf_counter()
-            self.status = "Loading model…"
-            log.info("loading model %s (quant=%s, device=%s)", model_uri, quant, device)
-            eng = WorldEngine(model_uri, quant=quant, device=device)
-            log.info(
-                "model loaded: type=%s, temporal_compression=%d",
-                eng.model_cfg.model_type, eng.model_cfg.temporal_compression,
-            )
-
-            self.status = "Loading seed…"
-            seed = load_seed_from_path(seed_path) if seed_path else load_seed_from_github()
-
-            self.status = "Priming engine…"
-            eng.reset()
-            prime_seed(eng, seed)
-
-            self.status = "Warming up (torch.compile)…"
-            log.info("warming up torch.compile")
-            w0 = time.perf_counter()
-            first = self._run_gen(eng, CtrlInput())
-            log.info("warmup complete in %.1fs", time.perf_counter() - w0)
-            self.frame_q.put(first)
-
-            self.status = "Ready — click to start."
-            log.info("init finished in %.1fs", time.perf_counter() - t0)
-            self.ready.set()
-
-            # Command loop: pull a CtrlInput (or sentinel), dispatch.
-            while True:
-                cmd = self.ctrl_q.get()
-                if cmd is self._stop:
-                    return
-                if cmd is self._reset:
-                    # reset() clears the KV cache and all state, so the model
-                    # must be re-seeded with append_frame before it can produce
-                    # coherent output again.
-                    log.info("resetting engine")
-                    eng.reset()
-                    prime_seed(eng, seed)
-                    self.frame_q.put(self._run_gen(eng, CtrlInput()))
-                    continue
-                self.frame_q.put(self._run_gen(eng, cmd))
-        except BaseException as exc:
-            log.exception("engine thread failed")
-            self.error = exc
-            self.ready.set()
-
-
-# --- main loop phases -------------------------------------------------------
+# --- mouse helpers -----------------------------------------------------------
 
 def grab_mouse(screen: pygame.Surface) -> None:
     """Confine + hide the cursor for FPS-style gameplay."""
@@ -329,33 +226,75 @@ def release_mouse() -> None:
     pygame.mouse.set_visible(True)
 
 
-def loading_screen(screen: pygame.Surface, font: pygame.font.Font, clock: pygame.time.Clock, engine: Engine) -> bool:
-    """Phase 1: show status while engine initializes. Returns True when ready, False on user quit."""
-    while not engine.ready.is_set():
-        for e in pygame.event.get():
-            if e.type == pygame.QUIT or (e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE):
-                return False
-        draw_status(screen, font, engine.status)
-        clock.tick(30)
-    return True
+# --- engine init -------------------------------------------------------------
 
+def init_engine(
+    screen: pygame.Surface,
+    font: pygame.font.Font,
+    model_uri: str,
+    quant: str | None,
+    device: str,
+    seed_path: str | None,
+) -> tuple[WorldEngine, np.ndarray, torch.Tensor]:
+    """Load the model, seed, and produce the first frame (torch.compile warmup).
+
+    Draws status to the screen before each blocking step. The window won't pump
+    events during the heavy steps (model load, compile), but the status text
+    gives the user a progress indication.
+
+    Returns (engine, seed, first_frame_cpu).
+    """
+    draw_status(screen, font, "Loading model…")
+    log.info("loading model %s (quant=%s, device=%s)", model_uri, quant, device)
+    engine = WorldEngine(model_uri, quant=quant, device=device)
+    log.info(
+        "model loaded: type=%s, temporal_compression=%d",
+        engine.model_cfg.model_type, engine.model_cfg.temporal_compression,
+    )
+
+    draw_status(screen, font, "Loading seed…")
+    seed = load_seed_from_path(seed_path) if seed_path else load_seed_from_github()
+
+    draw_status(screen, font, "Priming engine…")
+    engine.reset()
+    prime_seed(engine, seed)
+
+    # The first gen_frame triggers torch.compile — the most expensive step.
+    draw_status(screen, font, "Warming up (torch.compile)…")
+    log.info("warming up torch.compile")
+    w0 = time.perf_counter()
+    first = engine.gen_frame(ctrl=CtrlInput()).cpu()
+    log.info("warmup complete in %.1fs", time.perf_counter() - w0)
+
+    return engine, seed, first
+
+
+# --- gameplay ----------------------------------------------------------------
 
 def gameplay(
     screen: pygame.Surface,
     font: pygame.font.Font,
     hud_font: pygame.font.Font,
     clock: pygame.time.Clock,
-    engine: Engine,
+    engine: WorldEngine,
+    seed: np.ndarray,
+    first_frame: torch.Tensor,
     model_uri: str,
     mouse_sensitivity: float,
 ) -> None:
-    """Phase 2: interactive generation loop. Starts auto-paused on the first frame."""
-    first = engine.frame_q.get()
-    last_surface: pygame.Surface = render(screen, first, 0.0)
+    """Interactive generation loop. Starts auto-paused on the first frame.
+
+    Uses the pipelining pattern from the README: gen_frame() queues GPU kernels
+    and returns immediately; we render the *previous* batch (with pacing sleeps)
+    while the GPU works; then .cpu() syncs and transfers the result.
+    """
+    last_surface: pygame.Surface = render(screen, first_frame, 0.0)
     paused = True
     log.info("ready")
 
     held_vks: set[int] = set()
+    # Pipeline state: `pending` holds the not-yet-rendered CPU frame from the
+    # previous gen_frame call. We render it while the GPU computes the next one.
     pending: torch.Tensor | None = None
     batch_dt = 0.0
 
@@ -370,7 +309,7 @@ def gameplay(
             # WMs where `set_grab` is advisory and the cursor can escape.
             elif e.type == pygame.WINDOWLEAVE and not paused:
                 if pending is not None:
-                    last_surface = render(screen, pending, batch_dt)
+                    last_surface = render(screen, pending, batch_dt, hud_font, model_uri)
                     pending = None
                 paused = True
                 release_mouse()
@@ -379,17 +318,18 @@ def gameplay(
             elif e.type == pygame.KEYDOWN:
                 if e.key == pygame.K_ESCAPE and not paused:
                     if pending is not None:
-                        last_surface = render(screen, pending, batch_dt)
+                        last_surface = render(screen, pending, batch_dt, hud_font, model_uri)
                         pending = None
                     paused = True
                     release_mouse()
                     continue
                 if e.key == pygame.K_u and not paused:
-                    # Reset: re-prime the seed. The engine thread handles
-                    # reset + re-seed + gen_frame and puts the fresh frame on
-                    # frame_q like any normal frame. Gameplay continues.
+                    # reset() clears the KV cache and all state, so the model
+                    # must be re-seeded with append_frame before it can produce
+                    # coherent output again.
                     pending = None
                     engine.reset()
+                    prime_seed(engine, seed)
                     continue
                 vk = PYGAME_TO_VK.get(e.key)
                 if vk is not None:
@@ -430,14 +370,14 @@ def gameplay(
             scroll_wheel=scroll,
         )
 
-        # Hand the ctrl off to the engine thread; it starts computing
-        # immediately. We then render the *previous* batch (with pacing)
-        # while it works. Finally we block on the queue for the new batch.
+        # Pipeline: kick off generation (GPU kernels queued, returns fast),
+        # then render the *previous* batch while the GPU works. Finally .cpu()
+        # syncs and transfers the just-computed batch to CPU.
         t0 = time.perf_counter()
-        engine.ctrl_q.put(ctrl)
+        next_frames = engine.gen_frame(ctrl=ctrl)
         if pending is not None:
             last_surface = render(screen, pending, batch_dt, hud_font, model_uri)
-        pending = engine.frame_q.get()
+        pending = next_frames.cpu()
         batch_dt = time.perf_counter() - t0
 
 
@@ -460,19 +400,18 @@ def main() -> None:
     status_font = pygame.font.SysFont(None, 24)
     clock = pygame.time.Clock()
 
-    engine = Engine()
-    engine.start(args.model_uri, args.quant, args.device, args.seed)
-
     try:
-        if not loading_screen(screen, status_font, clock, engine):
-            return
-        if engine.error:
-            raise engine.error
-        gameplay(screen, font, hud_font, clock, engine, args.model_uri, args.mouse_sensitivity)
+        engine, seed, first = init_engine(
+            screen, status_font, args.model_uri, args.quant, args.device, args.seed,
+        )
+        gameplay(
+            screen, font, hud_font, clock,
+            engine, seed, first,
+            args.model_uri, args.mouse_sensitivity,
+        )
     except KeyboardInterrupt:
         pass
     finally:
-        engine.stop()
         pygame.quit()
 
 
