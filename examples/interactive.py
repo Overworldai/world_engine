@@ -73,7 +73,7 @@ class Renderer:
         self.status_font = pygame.font.SysFont(None, 24)
         self._last_surface: pygame.Surface | None = None
 
-    def _present(self, frame: np.ndarray, batch_dt: float) -> None:
+    def _present(self, frame: np.ndarray, batch_dt: float, temporal_compression: int) -> None:
         """Blit a single (H, W, 3) frame, draw HUD, flip, and cache for pause."""
         # pygame.surfarray expects (W, H, 3), so swap the first two axes.
         surf = pygame.surfarray.make_surface(frame.swapaxes(0, 1))
@@ -83,7 +83,12 @@ class Renderer:
 
         lines: list[tuple[str, tuple[int, int, int]]] = []
         if batch_dt > 0:
-            lines.append((f"{1.0 / batch_dt:.1f} fps / {batch_dt * 1000:.1f} ms", (255, 255, 255)))
+            lfps = 1.0 / batch_dt
+            if temporal_compression > 1:
+                lines.append((f"{lfps * temporal_compression:.1f} FPS", (255, 255, 255)))
+                lines.append((f"{lfps:.1f} LFPS / {batch_dt * 1000:.1f} ms", (255, 255, 255)))
+            else:
+                lines.append((f"{lfps:.1f} FPS / {batch_dt * 1000:.1f} ms", (255, 255, 255)))
         lines.append((self.model_uri, (160, 160, 160)))
         for i, (text, color) in enumerate(lines):
             label = self.hud_font.render(text, True, color)
@@ -93,7 +98,7 @@ class Renderer:
 
         pygame.display.flip()
 
-    def render_frame(self, frame_cpu: torch.Tensor, batch_dt: float) -> None:
+    def render_frame(self, frame_cpu: torch.Tensor, batch_dt: float, temporal_compression: int) -> None:
         """Display an already-on-CPU frame and cache it for the pause overlay.
 
         For multi-frame models the tensor is (T, H, W, 3) — we spread the T
@@ -103,7 +108,7 @@ class Renderer:
         """
         arr = frame_cpu.numpy()
         if arr.ndim == 3:  # single-frame model: (H, W, 3)
-            self._present(arr, batch_dt)
+            self._present(arr, batch_dt, temporal_compression)
             return
 
         # Multi-frame model: (T, H, W, 3)
@@ -111,7 +116,7 @@ class Renderer:
         for i, sub in enumerate(arr):
             if i > 0 and step_ms:
                 pygame.time.wait(step_ms)
-            self._present(sub, batch_dt)
+            self._present(sub, batch_dt, temporal_compression)
 
     def draw_pause(self) -> None:
         """Redraw the cached last frame with a dimmed overlay and centered pause text."""
@@ -152,6 +157,10 @@ class Engine:
             "model loaded: type=%s, temporal_compression=%d",
             self.inner.model_cfg.model_type, self.inner.model_cfg.temporal_compression,
         )
+
+    @property
+    def temporal_compression(self) -> int:
+        return getattr(self.inner.model_cfg, "temporal_compression", 1)
 
     def set_seed(self, img: Image.Image) -> None:
         """Center-crop the image to the expected aspect ratio and store as seed."""
@@ -222,10 +231,14 @@ class GameState:
     pending: torch.Tensor | None = None
     batch_dt: float = 0.0
 
+    @property
+    def temporal_compression(self) -> int:
+        return self.engine.temporal_compression
+
     def _enter_pause(self) -> None:
         """Flush any in-flight batch and enter paused state."""
         if self.pending is not None:
-            self.renderer.render_frame(self.pending, self.batch_dt)
+            self.renderer.render_frame(self.pending, self.batch_dt, self.temporal_compression)
             self.pending = None
         self.paused = True
         pygame.event.set_grab(False)
@@ -312,7 +325,7 @@ class GameState:
         pacing sleeps) while the GPU works; then .cpu() syncs and transfers
         the result.
         """
-        self.renderer.render_frame(self.pending, 0.0)
+        self.renderer.render_frame(self.pending, 0.0, self.temporal_compression)
         self.pending = None
         log.info("ready")
 
@@ -338,7 +351,7 @@ class GameState:
             t0 = time.perf_counter()
             next_frames = self.engine.next_frame(ctrl=ctrl)
             if self.pending is not None:
-                self.renderer.render_frame(self.pending, self.batch_dt)
+                self.renderer.render_frame(self.pending, self.batch_dt, self.temporal_compression)
             self.pending = next_frames.cpu()
             self.batch_dt = time.perf_counter() - t0
 
