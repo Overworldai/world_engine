@@ -66,7 +66,6 @@ from PIL import Image
 
 from world_engine import CtrlInput, WorldEngine
 
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(message)s",
@@ -84,10 +83,6 @@ WINDOW_SIZE = (1280, 720)
 SLEEP_RATIO = 0.8
 
 
-
-
-
-
 # --- rendering --------------------------------------------------------------
 
 
@@ -101,7 +96,7 @@ class Renderer:
     hud_font: pygame.font.Font = field(init=False)
     status_font: pygame.font.Font = field(init=False)
     _last_surface: pygame.Surface | None = field(init=False, default=None, repr=False)
-    """Cached surface of the most recently rendered frame, used for the pause overlay."""
+    """Cached surface of the most recently rendered frame, used for pause."""
 
     def __post_init__(self) -> None:
         self.screen = pygame.display.set_mode(WINDOW_SIZE, pygame.RESIZABLE)
@@ -110,7 +105,12 @@ class Renderer:
         self.hud_font = pygame.font.SysFont(None, 22)
         self.status_font = pygame.font.SysFont(None, 24)
 
-    def _present(self, frame: np.ndarray, batch_dt: float, temporal_compression: int) -> None:
+    def _present(
+        self,
+        frame: np.ndarray,
+        batch_dt: float,
+        temporal_compression: int,
+    ) -> None:
         """Blit a single (H, W, 3) frame, draw HUD, flip, and cache for pause."""
         # pygame.surfarray expects (W, H, 3), so swap the first two axes.
         surf = pygame.surfarray.make_surface(frame.swapaxes(0, 1))
@@ -122,10 +122,16 @@ class Renderer:
         if batch_dt > 0:
             lfps = 1.0 / batch_dt
             if temporal_compression > 1:
-                lines.append((f"{lfps * temporal_compression:.1f} FPS", (255, 255, 255)))
-                lines.append((f"{lfps:.1f} LFPS / {batch_dt * 1000:.1f} ms", (255, 255, 255)))
+                lines.append(
+                    (f"{lfps * temporal_compression:.1f} FPS", (255, 255, 255)),
+                )
+                lines.append(
+                    (f"{lfps:.1f} LFPS / {batch_dt * 1000:.1f} ms", (255, 255, 255)),
+                )
             else:
-                lines.append((f"{lfps:.1f} FPS / {batch_dt * 1000:.1f} ms", (255, 255, 255)))
+                lines.append(
+                    (f"{lfps:.1f} FPS / {batch_dt * 1000:.1f} ms", (255, 255, 255)),
+                )
         lines.append((self.model_uri, (160, 160, 160)))
         for i, (text, color) in enumerate(lines):
             label = self.hud_font.render(text, True, color)
@@ -164,7 +170,7 @@ class Renderer:
                 pass
 
     def draw_pause(self) -> None:
-        """Redraw the cached last frame with a dimmed overlay and centered pause text."""
+        """Redraw cached last frame with a dimmed overlay and pause text."""
         assert self._last_surface is not None
         self.screen.blit(self._last_surface, (0, 0))
         dim = pygame.Surface(self.screen.get_size(), pygame.SRCALPHA)
@@ -179,7 +185,10 @@ class Renderer:
         """Clear to black and draw a status line in the bottom-left corner."""
         self.screen.fill((0, 0, 0))
         label = self.status_font.render(text, True, (220, 220, 220))
-        self.screen.blit(label, (16, self.screen.get_height() - label.get_height() - 16))
+        self.screen.blit(
+            label,
+            (16, self.screen.get_height() - label.get_height() - 16),
+        )
         pygame.display.flip()
 
 
@@ -202,11 +211,17 @@ class Engine:
     """Center-cropped uint8 (H, W, 3) numpy array, set via `set_seed()`."""
 
     def __post_init__(self, quant: str | None, device: str) -> None:
-        log.info("loading model %s (quant=%s, device=%s)", self.model_uri, quant, device)
+        log.info(
+            "loading model %s (quant=%s, device=%s)",
+            self.model_uri,
+            quant,
+            device,
+        )
         self.inner = WorldEngine(self.model_uri, quant=quant, device=device)
         log.info(
             "model loaded: type=%s, temporal_compression=%d",
-            self.inner.model_cfg.model_type, self.inner.model_cfg.temporal_compression,
+            self.inner.model_cfg.model_type,
+            self.inner.model_cfg.temporal_compression,
         )
 
     @property
@@ -256,7 +271,10 @@ class Engine:
         return first
 
     def next_frame(self, ctrl: CtrlInput) -> torch.Tensor:
-        """Generate the next frame. Returns a GPU tensor; caller must .cpu() before the next call."""
+        """Generate the next frame. Returns a GPU tensor.
+
+        Caller must .cpu() before the next call (GPU buffers may be reused).
+        """
         return self.inner.gen_frame(ctrl=ctrl)
 
     def reset(self) -> None:
@@ -318,7 +336,12 @@ class GameState:
     def _enter_pause(self) -> None:
         """Flush any in-flight batch and enter paused state."""
         if self.pending is not None:
-            self.renderer.render_frame(self.pending, self.batch_dt, self.temporal_compression, self._compute_pace())
+            self.renderer.render_frame(
+                self.pending,
+                self.batch_dt,
+                self.temporal_compression,
+                self._compute_pace(),
+            )
             self.pending = None
         self.paused = True
         pygame.event.set_grab(False)
@@ -339,7 +362,11 @@ class GameState:
         {getattr(pygame, f"K_{ch}"): ord(ch) for ch in "1234567890"}
         | {pygame.K_MINUS: 0xBD, pygame.K_EQUALS: 0xBB}
         | {getattr(pygame, f"K_{ch}"): ord(ch.upper()) for ch in "qwertyuiop"}
-        | {pygame.K_LEFTBRACKET: 0xDB, pygame.K_RIGHTBRACKET: 0xDD, pygame.K_BACKSLASH: 0xDC}
+        | {
+            pygame.K_LEFTBRACKET: 0xDB,
+            pygame.K_RIGHTBRACKET: 0xDD,
+            pygame.K_BACKSLASH: 0xDC,
+        }
         | {getattr(pygame, f"K_{ch}"): ord(ch.upper()) for ch in "asdfghjkl"}
         | {pygame.K_SEMICOLON: 0xBA, pygame.K_QUOTE: 0xDE}
         | {getattr(pygame, f"K_{ch}"): ord(ch.upper()) for ch in "zxcvbnm"}
@@ -431,7 +458,12 @@ class GameState:
             next_frames = self.engine.next_frame(ctrl=ctrl)
             if self.pending is not None:
                 self._pace_s = self._compute_pace()
-                self.renderer.render_frame(self.pending, self.batch_dt, self.temporal_compression, self._pace_s)
+                self.renderer.render_frame(
+                    self.pending,
+                    self.batch_dt,
+                    self.temporal_compression,
+                    self._pace_s,
+                )
             self.pending = next_frames.cpu()
             self.batch_dt = time.perf_counter() - t0
             self._overhead = self.batch_dt - self._pace_s
@@ -439,13 +471,16 @@ class GameState:
 
 # --- entry point -------------------------------------------------------------
 
+
 def get_seed(path: str | None) -> Image.Image:
     """Load a seed image from a local path, or download a random one from Biome."""
     if path is not None:
         log.info("loading seed from local file: %s", path)
         return Image.open(path)
     # GitHub contents API for the Biome `seeds/` directory, pinned to a known ref.
-    biome_api = "https://api.github.com/repos/Overworldai/Biome/contents/seeds?ref=14343a6"
+    biome_api = (
+        "https://api.github.com/repos/Overworldai/Biome/contents/seeds?ref=14343a6"
+    )
     log.info("fetching Biome seeds index")
     with urllib.request.urlopen(biome_api) as res:
         entries = [e for e in json.load(res) if e["type"] == "file"]
@@ -458,8 +493,17 @@ def get_seed(path: str | None) -> Image.Image:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("model_uri", help="HF model id, e.g. Overworld/Waypoint-1.5-1B")
-    ap.add_argument("-s", "--seed", help="Path to a local seed image (defaults to a random Biome seed)")
-    ap.add_argument("-q", "--quant", choices=["intw8a8", "fp8w8a8", "nvfp4"], default=None)
+    ap.add_argument(
+        "-s",
+        "--seed",
+        help="Path to a local seed image (defaults to a random Biome seed)",
+    )
+    ap.add_argument(
+        "-q",
+        "--quant",
+        choices=["intw8a8", "fp8w8a8", "nvfp4"],
+        default=None,
+    )
     ap.add_argument("-d", "--device", default="cuda")
     ap.add_argument("-m", "--mouse-sensitivity", type=float, default=1.5)
     args = ap.parse_args()
