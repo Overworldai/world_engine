@@ -116,16 +116,6 @@ def load_seed_from_github() -> np.ndarray:
     return center_crop(Image.open(io.BytesIO(img_bytes)))
 
 
-def prime_seed(engine: WorldEngine, seed: np.ndarray) -> None:
-    """Encode the seed frame into the engine's KV cache."""
-    t = torch.from_numpy(seed).to(engine.device)  # uint8 (H, W, 3)
-    tc = engine.model_cfg.temporal_compression
-    if tc > 1:
-        # Multi-frame models (e.g. Waypoint-1.5) consume/produce a stack of
-        # `temporal_compression` frames per step.
-        t = t.unsqueeze(0).expand(tc, -1, -1, -1).contiguous()
-    log.info("priming engine with seed shape=%s", tuple(t.shape))
-    engine.append_frame(t)
 
 
 # --- rendering --------------------------------------------------------------
@@ -213,47 +203,79 @@ def draw_status(screen: pygame.Surface, font: pygame.font.Font, text: str) -> No
     pygame.display.flip()
 
 
-# --- engine init -------------------------------------------------------------
+# --- engine ------------------------------------------------------------------
 
-def init_engine(
-    screen: pygame.Surface,
-    font: pygame.font.Font,
-    model_uri: str,
-    quant: str | None,
-    device: str,
-    seed_path: str | None,
-) -> tuple[WorldEngine, np.ndarray, torch.Tensor]:
-    """Load the model, seed, and produce the first frame (torch.compile warmup).
 
-    Draws status to the screen before each blocking step. The window won't pump
-    events during the heavy steps (model load, compile), but the status text
-    gives the user a progress indication.
+class Engine:
+    """Wraps WorldEngine with seed management and the generation pipeline.
 
-    Returns (engine, seed, first_frame_cpu).
+    After construction, the first generated frame is available as `self.pending`.
+    Subsequent frames are produced by `next_frame()` and should be `.cpu()`'d
+    into `self.pending` by the caller before the next `next_frame()` call.
     """
-    draw_status(screen, font, "Loading model…")
-    log.info("loading model %s (quant=%s, device=%s)", model_uri, quant, device)
-    engine = WorldEngine(model_uri, quant=quant, device=device)
-    log.info(
-        "model loaded: type=%s, temporal_compression=%d",
-        engine.model_cfg.model_type, engine.model_cfg.temporal_compression,
-    )
 
-    draw_status(screen, font, "Loading seed…")
-    seed = load_seed_from_path(seed_path) if seed_path else load_seed_from_github()
+    inner: WorldEngine
+    seed: np.ndarray
+    model_uri: str
+    pending: torch.Tensor | None
 
-    draw_status(screen, font, "Priming engine…")
-    engine.reset()
-    prime_seed(engine, seed)
+    def __init__(
+        self,
+        screen: pygame.Surface,
+        font: pygame.font.Font,
+        model_uri: str,
+        quant: str | None,
+        device: str,
+        seed_path: str | None,
+    ) -> None:
+        """Load model, seed, prime, compile-warmup. Shows status on *screen*."""
+        draw_status(screen, font, "Loading model…")
+        log.info("loading model %s (quant=%s, device=%s)", model_uri, quant, device)
+        self.inner = WorldEngine(model_uri, quant=quant, device=device)
+        log.info(
+            "model loaded: type=%s, temporal_compression=%d",
+            self.inner.model_cfg.model_type, self.inner.model_cfg.temporal_compression,
+        )
 
-    # The first gen_frame triggers torch.compile — the most expensive step.
-    draw_status(screen, font, "Warming up (torch.compile)…")
-    log.info("warming up torch.compile")
-    w0 = time.perf_counter()
-    first = engine.gen_frame(ctrl=CtrlInput()).cpu()
-    log.info("warmup complete in %.1fs", time.perf_counter() - w0)
+        draw_status(screen, font, "Loading seed…")
+        self.seed = load_seed_from_path(seed_path) if seed_path else load_seed_from_github()
+        self.model_uri = model_uri
 
-    return engine, seed, first
+        draw_status(screen, font, "Priming engine…")
+        self.inner.reset()
+        self._prime_seed()
+
+        # The first gen_frame triggers torch.compile — the most expensive step.
+        draw_status(screen, font, "Warming up (torch.compile)…")
+        log.info("warming up torch.compile")
+        w0 = time.perf_counter()
+        self.pending = self.next_frame(ctrl=CtrlInput()).cpu()
+        log.info("warmup complete in %.1fs", time.perf_counter() - w0)
+
+    def _prime_seed(self) -> None:
+        """Encode the seed frame into the KV cache."""
+        t = torch.from_numpy(self.seed).to(self.inner.device)  # uint8 (H, W, 3)
+        tc = self.inner.model_cfg.temporal_compression
+        if tc > 1:
+            # Multi-frame models (e.g. Waypoint-1.5) consume/produce a stack of
+            # `temporal_compression` frames per step.
+            t = t.unsqueeze(0).expand(tc, -1, -1, -1).contiguous()
+        log.info("priming engine with seed shape=%s", tuple(t.shape))
+        self.inner.append_frame(t)
+
+    def next_frame(self, ctrl: CtrlInput) -> torch.Tensor:
+        """Generate the next frame. Returns a GPU tensor; caller must .cpu() before the next call."""
+        return self.inner.gen_frame(ctrl=ctrl)
+
+    def reset(self) -> None:
+        """Reset all state and re-prime the seed.
+
+        reset() clears the KV cache and all state, so the model must be
+        re-seeded with append_frame before it can produce coherent output.
+        """
+        self.pending = None
+        self.inner.reset()
+        self._prime_seed()
 
 
 # --- gameplay ----------------------------------------------------------------
@@ -264,24 +286,21 @@ class GameState:
     """Mutable state shared between event handling and the generation loop."""
 
     screen: pygame.Surface
-    engine: WorldEngine
-    seed: np.ndarray
+    engine: Engine
     hud_font: pygame.font.Font
-    model_uri: str
     paused: bool = True
     held_vks: set[int] = field(default_factory=set)
     scroll: int = 0
-    # Pipeline state: `pending` holds the not-yet-rendered CPU frame from the
-    # previous gen_frame call. We render it while the GPU computes the next one.
-    pending: torch.Tensor | None = None
     batch_dt: float = 0.0
     last_surface: pygame.Surface | None = None
 
     def enter_pause(self) -> None:
         """Flush any in-flight batch and enter paused state."""
-        if self.pending is not None:
-            self.last_surface = render(self.screen, self.pending, self.batch_dt, self.hud_font, self.model_uri)
-            self.pending = None
+        if self.engine.pending is not None:
+            self.last_surface = render(
+                self.screen, self.engine.pending, self.batch_dt, self.hud_font, self.engine.model_uri,
+            )
+            self.engine.pending = None
         self.paused = True
         pygame.event.set_grab(False)
         pygame.mouse.set_visible(True)
@@ -310,12 +329,7 @@ class GameState:
                 if e.key == pygame.K_ESCAPE and not self.paused:
                     self.enter_pause()
                 elif e.key == pygame.K_u and not self.paused:
-                    # reset() clears the KV cache and all state, so the model
-                    # must be re-seeded with append_frame before it can produce
-                    # coherent output again.
-                    self.pending = None
                     self.engine.reset()
-                    prime_seed(self.engine, self.seed)
                 else:
                     vk = PYGAME_TO_VK.get(e.key)
                     if vk is not None:
@@ -351,10 +365,7 @@ def gameplay(
     font: pygame.font.Font,
     hud_font: pygame.font.Font,
     clock: pygame.time.Clock,
-    engine: WorldEngine,
-    seed: np.ndarray,
-    first_frame: torch.Tensor,
-    model_uri: str,
+    engine: Engine,
     mouse_sensitivity: float,
 ) -> None:
     """Interactive generation loop. Starts auto-paused on the first frame.
@@ -364,10 +375,10 @@ def gameplay(
     while the GPU works; then .cpu() syncs and transfers the result.
     """
     state = GameState(
-        screen=screen, engine=engine, seed=seed,
-        hud_font=hud_font, model_uri=model_uri,
-        last_surface=render(screen, first_frame, 0.0),
+        screen=screen, engine=engine, hud_font=hud_font,
+        last_surface=render(screen, engine.pending, 0.0),
     )
+    engine.pending = None
     log.info("ready")
 
     while True:
@@ -391,10 +402,10 @@ def gameplay(
         # then render the *previous* batch while the GPU works. Finally .cpu()
         # syncs and transfers the just-computed batch to CPU.
         t0 = time.perf_counter()
-        next_frames = engine.gen_frame(ctrl=ctrl)
-        if state.pending is not None:
-            state.last_surface = render(screen, state.pending, state.batch_dt, hud_font, model_uri)
-        state.pending = next_frames.cpu()
+        next_frames = engine.next_frame(ctrl=ctrl)
+        if engine.pending is not None:
+            state.last_surface = render(screen, engine.pending, state.batch_dt, hud_font, engine.model_uri)
+        engine.pending = next_frames.cpu()
         state.batch_dt = time.perf_counter() - t0
 
 
@@ -418,14 +429,8 @@ def main() -> None:
     clock = pygame.time.Clock()
 
     try:
-        engine, seed, first = init_engine(
-            screen, status_font, args.model_uri, args.quant, args.device, args.seed,
-        )
-        gameplay(
-            screen, font, hud_font, clock,
-            engine, seed, first,
-            args.model_uri, args.mouse_sensitivity,
-        )
+        engine = Engine(screen, status_font, args.model_uri, args.quant, args.device, args.seed)
+        gameplay(screen, font, hud_font, clock, engine, args.mouse_sensitivity)
     except KeyboardInterrupt:
         pass
     finally:
