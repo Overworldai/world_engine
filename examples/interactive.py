@@ -23,8 +23,31 @@
 #   Close window / Ctrl+C  : quit
 #
 # Supports both Waypoint-1 / 1.1 (single-frame output) and Waypoint-1.5
-# (4-frame temporally-compressed output). The only model-dependent branches
-# live in `prime_seed` and `render`, keyed off `engine.model_cfg.model_type`.
+# (4-frame temporally-compressed output).
+#
+# Frame pacing strategy
+# ---------------------
+# gen_frame() dispatches GPU kernels and returns a not-yet-ready tensor. We
+# render the *previous* batch's sub-frames (with pacing sleeps) while the GPU
+# computes, then call .cpu() to sync + transfer the result.
+#
+# For multi-frame models (temporal_compression > 1), each gen_frame produces T
+# sub-frames that must be spread over a pacing interval. The interval is:
+#
+#   pace_s = max(batch_dt * SLEEP_RATIO, target_s - overhead)
+#
+# where target_s = T / inference_fps (the model's intended visual frame time),
+# batch_dt is the previous cycle's wall-clock time, and overhead is the
+# measured non-render portion of the cycle (dispatch + .cpu() + events).
+#
+# - The `target_s - overhead` term ensures the *total* cycle (render + overhead)
+#   hits the model's target framerate.
+# - The `batch_dt * SLEEP_RATIO` floor prevents the render from filling the
+#   entire cycle, which would create a diverging feedback loop (batch_dt
+#   includes render time, so pacing to 100% of it grows without bound).
+# - Each sub-frame is presented immediately, then we sleep for SLEEP_RATIO of
+#   the remaining time until the next deadline (yielding CPU), then busy-wait
+#   the rest for precise timing. See the SLEEP_RATIO constant for details.
 
 import argparse
 import io
@@ -53,6 +76,12 @@ log = logging.getLogger("interactive")
 
 
 WINDOW_SIZE = (1280, 720)
+# Fraction of a sleep interval that is yielded to the OS via pygame.time.wait;
+# the remainder is covered by a busy-wait spin for precise timing. OS schedulers
+# are free to extend sleeps beyond their stated duration, so we deliberately
+# undershoot and spin the rest. 0.8 was selected ad-hoc and could be raised
+# toward 1.0 on platforms with more accurate sleep granularity.
+SLEEP_RATIO = 0.8
 
 
 
@@ -106,25 +135,33 @@ class Renderer:
 
         pygame.display.flip()
 
-    def render_frame(self, frame_cpu: torch.Tensor, batch_dt: float, temporal_compression: int) -> None:
+    def render_frame(
+        self,
+        frame_cpu: torch.Tensor,
+        batch_dt: float,
+        temporal_compression: int,
+        pace_s: float,
+    ) -> None:
         """Display an already-on-CPU frame and cache it for the pause overlay.
 
-        For multi-frame models the tensor is (T, H, W, 3) — we spread the T
-        sub-frames evenly across `batch_dt` (per README "Waypoint-1.5 Behavior").
-        The sleeps are what let the pipeline overlap: while we pace here, the
-        GPU is already computing the next batch.
+        Sub-frames are spread evenly across `pace_s`. The caller computes
+        `pace_s` to balance GPU overlap headroom with the FPS cap.
         """
         arr = frame_cpu.numpy()
-        if arr.ndim == 3:  # single-frame model: (H, W, 3)
-            self._present(arr, batch_dt, temporal_compression)
-            return
-
-        # Multi-frame model: (T, H, W, 3)
-        step_ms = max(0, int(batch_dt * 1000 / arr.shape[0]))
-        for i, sub in enumerate(arr):
-            if i > 0 and step_ms:
-                pygame.time.wait(step_ms)
+        # Treat single-frame (H, W, 3) as a batch of one.
+        frames = [arr] if arr.ndim == 3 else list(arr)
+        step_s = pace_s / len(frames)
+        start = time.perf_counter()
+        for i, sub in enumerate(frames):
             self._present(sub, batch_dt, temporal_compression)
+            # Hybrid sleep+spin: yield CPU for SLEEP_RATIO of the remaining
+            # time, then busy-wait the rest for precise timing.
+            deadline = start + step_s * (i + 1)
+            remaining_ms = int((deadline - time.perf_counter()) * SLEEP_RATIO * 1000)
+            if remaining_ms > 0:
+                pygame.time.wait(remaining_ms)
+            while time.perf_counter() < deadline:
+                pass
 
     def draw_pause(self) -> None:
         """Redraw the cached last frame with a dimmed overlay and centered pause text."""
@@ -175,6 +212,11 @@ class Engine:
     @property
     def temporal_compression(self) -> int:
         return getattr(self.inner.model_cfg, "temporal_compression", 1)
+
+    @property
+    def inference_fps(self) -> int:
+        """Visual framerate the model targets."""
+        return getattr(self.inner.model_cfg, "inference_fps", 60)
 
     def set_seed(self, img: Image.Image) -> None:
         """Center-crop the image to the expected aspect ratio and store as seed."""
@@ -245,17 +287,38 @@ class GameState:
     """Not-yet-rendered CPU frame from the previous `gen_frame` call.
     Rendered while the GPU computes the next batch (pipeline overlap)."""
     batch_dt: float = 0.0
-    """Wall-clock seconds the last `gen_frame` + `.cpu()` cycle took. Used to
-    pace multi-frame sub-frames evenly across the generation interval."""
+    """Wall-clock seconds the last full cycle (dispatch + render + sync) took."""
+    _overhead: float = 0.0
+    """Non-render portion of the previous cycle (dispatch + .cpu() + events).
+    Subtracted from the FPS-cap target so pacing compensates for it."""
+    _pace_s: float = 0.0
+    """Pacing interval used by the last render_frame call."""
 
     @property
     def temporal_compression(self) -> int:
         return self.engine.temporal_compression
 
+    @property
+    def inference_fps(self) -> int:
+        return self.engine.inference_fps
+
+    def _compute_pace(self) -> float:
+        """Compute pacing interval for render_frame, accounting for overhead."""
+        # Target interval from the model's intended visual framerate.
+        target_s = (
+            self.temporal_compression / self.inference_fps
+            if self.inference_fps > 0
+            else 0.0
+        )
+        # Subtract measured non-render overhead so the *total* cycle hits target_s.
+        # Use SLEEP_RATIO of batch_dt as a floor so the render never fills the entire
+        # overlap window (batch_dt includes render time — pacing to 100% diverges).
+        return max(self.batch_dt * SLEEP_RATIO, target_s - self._overhead)
+
     def _enter_pause(self) -> None:
         """Flush any in-flight batch and enter paused state."""
         if self.pending is not None:
-            self.renderer.render_frame(self.pending, self.batch_dt, self.temporal_compression)
+            self.renderer.render_frame(self.pending, self.batch_dt, self.temporal_compression, self._compute_pace())
             self.pending = None
         self.paused = True
         pygame.event.set_grab(False)
@@ -335,12 +398,11 @@ class GameState:
     def run(self) -> None:
         """Interactive generation loop. Starts auto-paused on the first frame.
 
-        Uses the pipelining pattern from the README: gen_frame() queues GPU
-        kernels and returns immediately; we render the *previous* batch (with
-        pacing sleeps) while the GPU works; then .cpu() syncs and transfers
-        the result.
+        See "Frame pacing strategy" at the top of the file for the full
+        pipeline design. The first iteration after (un)pause has no previous
+        batch to render, so there is no GPU overlap on that frame.
         """
-        self.renderer.render_frame(self.pending, 0.0, self.temporal_compression)
+        self.renderer.render_frame(self.pending, 0.0, self.temporal_compression, 0.0)
         self.pending = None
         log.info("ready")
 
@@ -350,7 +412,7 @@ class GameState:
 
             if self.paused:
                 self.renderer.draw_pause()
-                self.clock.tick(60)
+                self.clock.tick(self.inference_fps)
                 continue
 
             dx, dy = pygame.mouse.get_rel()
@@ -360,15 +422,19 @@ class GameState:
                 scroll_wheel=self.scroll,
             )
 
-            # Pipeline: kick off generation (GPU kernels queued, returns fast),
-            # then render the *previous* batch while the GPU works. Finally
-            # .cpu() syncs and transfers the just-computed batch to CPU.
+            # Pipeline (see "Frame pacing strategy" at top of file):
+            # 1. Dispatch gen_frame — GPU kernels are queued, returns fast.
+            # 2. Render the *previous* batch with pacing sleeps while GPU works.
+            # 3. .cpu() syncs the GPU and transfers the just-computed batch.
+            # 4. Measure overhead (non-render time) to feed back into pacing.
             t0 = time.perf_counter()
             next_frames = self.engine.next_frame(ctrl=ctrl)
             if self.pending is not None:
-                self.renderer.render_frame(self.pending, self.batch_dt, self.temporal_compression)
+                self._pace_s = self._compute_pace()
+                self.renderer.render_frame(self.pending, self.batch_dt, self.temporal_compression, self._pace_s)
             self.pending = next_frames.cpu()
             self.batch_dt = time.perf_counter() - t0
+            self._overhead = self.batch_dt - self._pace_s
 
 
 # --- entry point -------------------------------------------------------------
