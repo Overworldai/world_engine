@@ -33,7 +33,7 @@ import logging
 import random
 import time
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 
 import numpy as np
 import pygame
@@ -61,17 +61,24 @@ WINDOW_SIZE = (1280, 720)
 # --- rendering --------------------------------------------------------------
 
 
+@dataclass
 class Renderer:
     """Owns the screen surface and fonts; handles all drawing."""
 
-    def __init__(self, model_uri: str) -> None:
+    model_uri: str
+    screen: pygame.Surface = field(init=False)
+    font: pygame.font.Font = field(init=False)
+    hud_font: pygame.font.Font = field(init=False)
+    status_font: pygame.font.Font = field(init=False)
+    _last_surface: pygame.Surface | None = field(init=False, default=None, repr=False)
+    """Cached surface of the most recently rendered frame, used for the pause overlay."""
+
+    def __post_init__(self) -> None:
         self.screen = pygame.display.set_mode(WINDOW_SIZE, pygame.RESIZABLE)
-        pygame.display.set_caption(model_uri)
-        self.model_uri = model_uri
+        pygame.display.set_caption(self.model_uri)
         self.font = pygame.font.SysFont(None, 36)
         self.hud_font = pygame.font.SysFont(None, 22)
         self.status_font = pygame.font.SysFont(None, 24)
-        self._last_surface: pygame.Surface | None = None
 
     def _present(self, frame: np.ndarray, batch_dt: float, temporal_compression: int) -> None:
         """Blit a single (H, W, 3) frame, draw HUD, flip, and cache for pause."""
@@ -141,6 +148,7 @@ class Renderer:
 # --- engine ------------------------------------------------------------------
 
 
+@dataclass
 class Engine:
     """Wraps WorldEngine with seed management and the generation pipeline.
 
@@ -148,11 +156,16 @@ class Engine:
     caller before the next `next_frame()` call (GPU buffers may be reused).
     """
 
-    def __init__(self, model_uri: str, quant: str | None, device: str) -> None:
-        log.info("loading model %s (quant=%s, device=%s)", model_uri, quant, device)
-        self.inner = WorldEngine(model_uri, quant=quant, device=device)
-        self.model_uri = model_uri
-        self.seed: np.ndarray | None = None
+    model_uri: str
+    quant: InitVar[str | None]
+    device: InitVar[str]
+    inner: WorldEngine = field(init=False, repr=False)
+    seed: np.ndarray | None = field(init=False, default=None, repr=False)
+    """Center-cropped uint8 (H, W, 3) numpy array, set via `set_seed()`."""
+
+    def __post_init__(self, quant: str | None, device: str) -> None:
+        log.info("loading model %s (quant=%s, device=%s)", self.model_uri, quant, device)
+        self.inner = WorldEngine(self.model_uri, quant=quant, device=device)
         log.info(
             "model loaded: type=%s, temporal_compression=%d",
             self.inner.model_cfg.model_type, self.inner.model_cfg.temporal_compression,
@@ -225,11 +238,14 @@ class GameState:
     mouse_sensitivity: float
     paused: bool = True
     held_vks: set[int] = field(default_factory=set)
+    """Currently pressed Windows VK codes, forwarded as `CtrlInput.button`."""
     scroll: int = 0
-    # Pipeline state: the not-yet-rendered CPU frame from the previous
-    # gen_frame call. Rendered while the GPU computes the next one.
     pending: torch.Tensor | None = None
+    """Not-yet-rendered CPU frame from the previous `gen_frame` call.
+    Rendered while the GPU computes the next batch (pipeline overlap)."""
     batch_dt: float = 0.0
+    """Wall-clock seconds the last `gen_frame` + `.cpu()` cycle took. Used to
+    pace multi-frame sub-frames evenly across the generation interval."""
 
     @property
     def temporal_compression(self) -> int:
