@@ -209,16 +209,18 @@ class Engine:
 
 @dataclass
 class GameState:
-    """Mutable state shared between event handling and the generation loop."""
+    """Interactive generation loop state. Call `run()` to enter the main loop."""
 
     renderer: Renderer
     engine: Engine
+    clock: pygame.time.Clock
+    mouse_sensitivity: float
     paused: bool = True
     held_vks: set[int] = field(default_factory=set)
     scroll: int = 0
     batch_dt: float = 0.0
 
-    def enter_pause(self) -> None:
+    def _enter_pause(self) -> None:
         """Flush any in-flight batch and enter paused state."""
         if self.engine.pending is not None:
             self.renderer.render_frame(self.engine.pending, self.batch_dt)
@@ -227,14 +229,14 @@ class GameState:
         pygame.event.set_grab(False)
         pygame.mouse.set_visible(True)
 
-    def exit_pause(self) -> None:
+    def _exit_pause(self) -> None:
         """Re-grab the cursor and resume gameplay."""
         self.paused = False
         pygame.event.set_grab(True)
         pygame.mouse.set_visible(False)
         pygame.mouse.get_rel()  # discard accumulated delta during pause
 
-    def process_events(self) -> bool:
+    def _process_events(self) -> bool:
         """Drain pygame events and update state. Returns False to quit."""
         # Map pygame keys / mouse buttons to the Windows VK integers that
         # CtrlInput.button expects (see https://github.com/Overworldai/owl-control
@@ -263,11 +265,11 @@ class GameState:
             # Auto-pause when the cursor leaves the window. Safety net for
             # WMs where `set_grab` is advisory and the cursor can escape.
             elif e.type == pygame.WINDOWLEAVE and not self.paused:
-                self.enter_pause()
+                self._enter_pause()
 
             elif e.type == pygame.KEYDOWN:
                 if e.key == pygame.K_ESCAPE and not self.paused:
-                    self.enter_pause()
+                    self._enter_pause()
                 elif e.key == pygame.K_u and not self.paused:
                     self.engine.reset()
                 else:
@@ -282,7 +284,7 @@ class GameState:
 
             elif e.type == pygame.MOUSEBUTTONDOWN:
                 if self.paused and e.button == 1:
-                    self.exit_pause()
+                    self._exit_pause()
                 else:
                     vk = mouse_to_vk.get(e.button)
                     if vk is not None:
@@ -299,49 +301,43 @@ class GameState:
 
         return True
 
+    def run(self) -> None:
+        """Interactive generation loop. Starts auto-paused on the first frame.
 
-def gameplay(
-    renderer: Renderer,
-    clock: pygame.time.Clock,
-    engine: Engine,
-    mouse_sensitivity: float,
-) -> None:
-    """Interactive generation loop. Starts auto-paused on the first frame.
+        Uses the pipelining pattern from the README: gen_frame() queues GPU
+        kernels and returns immediately; we render the *previous* batch (with
+        pacing sleeps) while the GPU works; then .cpu() syncs and transfers
+        the result.
+        """
+        self.renderer.render_frame(self.engine.pending, 0.0)
+        self.engine.pending = None
+        log.info("ready")
 
-    Uses the pipelining pattern from the README: gen_frame() queues GPU kernels
-    and returns immediately; we render the *previous* batch (with pacing sleeps)
-    while the GPU works; then .cpu() syncs and transfers the result.
-    """
-    renderer.render_frame(engine.pending, 0.0)
-    engine.pending = None
-    state = GameState(renderer=renderer, engine=engine)
-    log.info("ready")
+        while True:
+            if not self._process_events():
+                return
 
-    while True:
-        if not state.process_events():
-            return
+            if self.paused:
+                self.renderer.draw_pause()
+                self.clock.tick(60)
+                continue
 
-        if state.paused:
-            renderer.draw_pause()
-            clock.tick(60)
-            continue
+            dx, dy = pygame.mouse.get_rel()
+            ctrl = CtrlInput(
+                button=set(self.held_vks),
+                mouse=(dx * self.mouse_sensitivity, dy * self.mouse_sensitivity),
+                scroll_wheel=self.scroll,
+            )
 
-        dx, dy = pygame.mouse.get_rel()
-        ctrl = CtrlInput(
-            button=set(state.held_vks),
-            mouse=(dx * mouse_sensitivity, dy * mouse_sensitivity),
-            scroll_wheel=state.scroll,
-        )
-
-        # Pipeline: kick off generation (GPU kernels queued, returns fast),
-        # then render the *previous* batch while the GPU works. Finally .cpu()
-        # syncs and transfers the just-computed batch to CPU.
-        t0 = time.perf_counter()
-        next_frames = engine.next_frame(ctrl=ctrl)
-        if engine.pending is not None:
-            renderer.render_frame(engine.pending, state.batch_dt)
-        engine.pending = next_frames.cpu()
-        state.batch_dt = time.perf_counter() - t0
+            # Pipeline: kick off generation (GPU kernels queued, returns fast),
+            # then render the *previous* batch while the GPU works. Finally
+            # .cpu() syncs and transfers the just-computed batch to CPU.
+            t0 = time.perf_counter()
+            next_frames = self.engine.next_frame(ctrl=ctrl)
+            if self.engine.pending is not None:
+                self.renderer.render_frame(self.engine.pending, self.batch_dt)
+            self.engine.pending = next_frames.cpu()
+            self.batch_dt = time.perf_counter() - t0
 
 
 # --- entry point -------------------------------------------------------------
@@ -384,7 +380,7 @@ def main() -> None:
         engine.prime()
         renderer.draw_status("Warming up (torch.compile)…")
         engine.warmup()
-        gameplay(renderer, clock, engine, args.mouse_sensitivity)
+        GameState(renderer, engine, clock, args.mouse_sensitivity).run()
     except KeyboardInterrupt:
         pass
     finally:
