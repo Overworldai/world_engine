@@ -17,6 +17,7 @@
 #include <metal_simdgroup>
 
 #include "mlx/backend/metal/kernels/steel/gemm/nax.h"
+#include "nax_m32.h"  // Custom M=32 NAXFrag for wide-N shapes (QKV, gate_up)
 using namespace metal;
 using namespace mlx::steel;
 
@@ -95,6 +96,12 @@ inline void store_scaled(
 // ===========================================================================
 // V1: Both A and B staged through threadgroup
 // ===========================================================================
+//
+// Device→TG loader: per-thread sequential. Each thread owns a contiguous
+// 32-byte strip of the tile and issues 2 int4 loads back-to-back. A/B
+// benchmarked against cross-lane distribution on the same tile: per-thread
+// seq won by 1-2% on isolated microbench and ~5% on bench_steady with much
+// tighter variance. See APPLE_SILICON_VS_CUDA.md load-pattern section.
 
 template <
     short _BM, short _BN, short _BK,
@@ -145,10 +152,19 @@ void w8a8_gemm_impl(
 
     for (uint k_base = 0; k_base < K; k_base += _BK) {
 
-        // Cooperative coalesced load A [BM, BK] -> threadgroup
-        for (uint t = flat; t < uint(_BM) * uint(_BK) / 16u; t += _TG_SIZE) {
-            short r = t / (_BK / 16);
-            short c = (t % (_BK / 16)) * 16;
+        // Per-thread sequential: each thread owns a _BYTES_PER_T-byte strip
+        // of the tile and issues its int4 loads in sequence. Requires
+        // _BM*_BK and _BN*_BK both divisible by _TG_SIZE*16 (all current
+        // tile configs satisfy this).
+        constexpr uint _BYTES_A     = uint(_BM) * uint(_BK);
+        constexpr uint _BYTES_PER_T = _BYTES_A / _TG_SIZE;
+        constexpr uint _N_INT4_A    = _BYTES_PER_T / 16;
+
+        STEEL_PRAGMA_UNROLL
+        for (uint i = 0; i < _N_INT4_A; i++) {
+            uint byte_off = flat * _BYTES_PER_T + i * 16;
+            short r = byte_off / _BK;
+            short c = byte_off % _BK;
             uint gm = m_base + r;
             uint gk = k_base + c;
             threadgroup int8_t* dst = As + r * _LDA_TG + c;
@@ -156,15 +172,20 @@ void w8a8_gemm_impl(
                 *reinterpret_cast<threadgroup int4*>(dst) =
                     *reinterpret_cast<device const int4*>(x_q + gm * K + gk);
             } else {
-                for (short i = 0; i < 16; i++)
-                    dst[i] = (gm < M && gk + i < K) ? x_q[gm * K + gk + i] : int8_t(0);
+                for (short j = 0; j < 16; j++)
+                    dst[j] = (gm < M && gk + j < K) ? x_q[gm * K + gk + j] : int8_t(0);
             }
         }
 
-        // Cooperative coalesced load B [BN, BK] -> threadgroup
-        for (uint t = flat; t < uint(_BN) * uint(_BK) / 16u; t += _TG_SIZE) {
-            short r = t / (_BK / 16);
-            short c = (t % (_BK / 16)) * 16;
+        constexpr uint _BYTES_B       = uint(_BN) * uint(_BK);
+        constexpr uint _BYTES_PER_T_B = _BYTES_B / _TG_SIZE;
+        constexpr uint _N_INT4_B      = _BYTES_PER_T_B / 16;
+
+        STEEL_PRAGMA_UNROLL
+        for (uint i = 0; i < _N_INT4_B; i++) {
+            uint byte_off = flat * _BYTES_PER_T_B + i * 16;
+            short r = byte_off / _BK;
+            short c = byte_off % _BK;
             uint gn = n_base + r;
             uint gk = k_base + c;
             threadgroup int8_t* dst = Bs + r * _LDB_TG + c;
@@ -172,8 +193,8 @@ void w8a8_gemm_impl(
                 *reinterpret_cast<threadgroup int4*>(dst) =
                     *reinterpret_cast<device const int4*>(w_q + gn * K + gk);
             } else {
-                for (short i = 0; i < 16; i++)
-                    dst[i] = (gn < N && gk + i < K) ? w_q[gn * K + gk + i] : int8_t(0);
+                for (short j = 0; j < 16; j++)
+                    dst[j] = (gn < N && gk + j < K) ? w_q[gn * K + gk + j] : int8_t(0);
             }
         }
 
@@ -364,6 +385,177 @@ W8A8_KERNEL(bm64_bn64_bk128_wm2_wn2,    64,  64, 128, 2, 2)
 W8A8_KERNEL(bm64_bn64_bk192_wm2_wn2,    64,  64, 192, 2, 2)
 W8A8_KERNEL(bm64_bn128_bk128_wm2_wn4,   64, 128, 128, 2, 4)
 W8A8_KERNEL(bm128_bn128_bk64_wm4_wn4,  128, 128,  64, 4, 4)
+
+// ---------------------------------------------------------------------------
+// M=32 MMA variant: matmul2d_descriptor(32,32,16) for 2× work per MMA call.
+// Halves inner-loop MMA instruction count. Auto-dispatched for wide N (>=6000).
+// Quality isolated: +3-8% for QKV/gate_up, -6% for narrow out_proj.
+// End-to-end: net ~0% due to narrow-N regressions cancelling wide-N wins,
+// but kept since we expect wider architectures in future model updates.
+// ---------------------------------------------------------------------------
+
+template <short _BM, short _BN, short _BK, short _WM, short _WN>
+void w8a8_gemm_m32_impl(
+    device const int8_t* x_q,
+    device const int8_t* w_q,
+    device const float*  x_scales,
+    device const float*  w_scales,
+    device const float*  bias,
+    device half*         out,
+    constant W8A8Params& params,
+    threadgroup int8_t*  As,
+    threadgroup int8_t*  Bs,
+    uint3 tgid, uint sgid, uint lane)
+{
+    constexpr short _SM = _BM / _WM;   // 32
+    constexpr short _SN = _BN / _WN;   // 32
+    constexpr short _SK = 32;
+    constexpr short _A_PAD = 16;
+    constexpr short _B_PAD = 16;
+    constexpr short _LDA_TG = _BK + _A_PAD;
+    constexpr short _LDB_TG = _BK + _B_PAD;
+    constexpr short _TG_SIZE = _WM * _WN * 32;
+
+    const uint M = params.M;
+    const uint N = params.N;
+    const uint K = params.K;
+
+    const uint m_base = tgid.y * _BM;
+    const uint n_base = tgid.x * _BN;
+    if (m_base >= M || n_base >= N) return;
+
+    const short sg_m = sgid / _WN;
+    const short sg_n = sgid % _WN;
+    const short tm = sg_m * _SM;
+    const short tn = sg_n * _SN;
+
+    const bool sg_valid = (m_base + tm < M) && (n_base + tn < N);
+    const uint flat = sgid * 32 + lane;
+
+    // Output accumulator: 32×32 = two M32 fragments (Cn0 + Cn1)
+    using Frag = M32NAXFrag;
+    Frag::dtype_frag_t<int> Cn0, Cn1;
+    Frag::clear(Cn0);
+    Frag::clear(Cn1);
+
+    for (uint k_base = 0; k_base < K; k_base += _BK) {
+        // Cooperative load A [BM, BK] → threadgroup
+        for (uint t = flat; t < uint(_BM) * uint(_BK) / 16u; t += _TG_SIZE) {
+            short r = t / (_BK / 16);
+            short c = (t % (_BK / 16)) * 16;
+            uint gm = m_base + r;
+            uint gk = k_base + c;
+            threadgroup int8_t* dst = As + r * _LDA_TG + c;
+            if (gm < M && gk + 16 <= K) {
+                *reinterpret_cast<threadgroup int4*>(dst) =
+                    *reinterpret_cast<device const int4*>(x_q + gm * K + gk);
+            } else {
+                for (short i = 0; i < 16; i++)
+                    dst[i] = (gm < M && gk + i < K) ? x_q[gm * K + gk + i] : int8_t(0);
+            }
+        }
+        // Cooperative load B [BN, BK] → threadgroup
+        for (uint t = flat; t < uint(_BN) * uint(_BK) / 16u; t += _TG_SIZE) {
+            short r = t / (_BK / 16);
+            short c = (t % (_BK / 16)) * 16;
+            uint gn = n_base + r;
+            uint gk = k_base + c;
+            threadgroup int8_t* dst = Bs + r * _LDB_TG + c;
+            if (gn < N && gk + 16 <= K) {
+                *reinterpret_cast<threadgroup int4*>(dst) =
+                    *reinterpret_cast<device const int4*>(w_q + gn * K + gk);
+            } else {
+                for (short i = 0; i < 16; i++)
+                    dst[i] = (gn < N && gk + i < K) ? w_q[gn * K + gk + i] : int8_t(0);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sg_valid) {
+            STEEL_PRAGMA_UNROLL
+            for (short kk = 0; kk < _BK; kk += _SK) {
+                // Load A[32×16] and B[32×16] using M32 fragment layout
+                // A: rows tm..tm+31, cols kk..kk+15
+                Frag::dtype_frag_t<int8_t> Afrag;
+                Frag::load<int8_t, _LDA_TG>(Afrag, As + tm * _LDA_TG + kk);
+
+                // B: two halves for N=32 output
+                // Bn0: rows tn..tn+15, Bn1: rows tn+16..tn+31
+                Frag::dtype_frag_t<int8_t> Bn0, Bn1;
+                Frag::load<int8_t, _LDB_TG>(Bn0, Bs + tn * _LDB_TG + kk);
+                Frag::load<int8_t, _LDB_TG>(Bn1, Bs + (tn + 16) * _LDB_TG + kk);
+
+                // Second K chunk: kk+16
+                Frag::dtype_frag_t<int8_t> Afrag2;
+                Frag::load<int8_t, _LDA_TG>(Afrag2, As + tm * _LDA_TG + kk + 16);
+                Frag::dtype_frag_t<int8_t> Bn0_2, Bn1_2;
+                Frag::load<int8_t, _LDB_TG>(Bn0_2, Bs + tn * _LDB_TG + kk + 16);
+                Frag::load<int8_t, _LDB_TG>(Bn1_2, Bs + (tn + 16) * _LDB_TG + kk + 16);
+
+                // MMA: 2 calls per SK=32 (K=16 per call)
+                Frag::mma<int, int8_t, int8_t, true>(Cn0, Cn1, Afrag, Bn0, Bn1);
+                Frag::mma<int, int8_t, int8_t, true>(Cn0, Cn1, Afrag2, Bn0_2, Bn1_2);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Epilogue: scale int32 → fp16 and store
+    // Cn0: M-rows 0-15 of this SG's tile. Cn1: M-rows 16-31.
+    // Each contains two 8-element BaseNAXFrag sub-tiles (N-cols 0-15 and 16-31).
+    if (sg_valid) {
+        const short2 sc = Frag::get_coord();
+        // Process each of the 4 sub-tiles: (Cn0/Cn1) × (N-block 0/1)
+        STEEL_PRAGMA_UNROLL
+        for (short m_half = 0; m_half < 2; m_half++) {
+            const thread auto& cn = (m_half == 0) ? Cn0 : Cn1;
+            short m_off = m_half * 16;
+            STEEL_PRAGMA_UNROLL
+            for (short n_half = 0; n_half < 2; n_half++) {
+                short n_off = n_half * 16;
+                short src_off = n_half * 8;
+                STEEL_PRAGMA_UNROLL
+                for (short i = 0; i < 2; i++) {
+                    uint gm = m_base + tm + m_off + sc.y + i * 8;
+                    if (gm >= M) continue;
+                    float xs = x_scales[gm];
+                    STEEL_PRAGMA_UNROLL
+                    for (short j = 0; j < 4; j++) {
+                        uint gn = n_base + tn + n_off + sc.x + j;
+                        if (gn >= N) continue;
+                        float ws = w_scales[gn];
+                        float b = bias[gn];
+                        float val = float(cn[src_off + i * 4 + j]) * xs * ws + b;
+                        out[gm * N + gn] = half(val);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#define W8A8_M32_KERNEL(suffix, _BM, _BN, _BK, _WM, _WN)                    \
+[[kernel, max_total_threads_per_threadgroup(_WM * _WN * 32)]]                 \
+void w8a8_gemm_m32_##suffix(                                                  \
+    device const int8_t* x_q   [[buffer(0)]],                                 \
+    device const int8_t* w_q   [[buffer(1)]],                                 \
+    device const float*  x_s   [[buffer(2)]],                                 \
+    device const float*  w_s   [[buffer(3)]],                                 \
+    device const float*  bias  [[buffer(4)]],                                 \
+    device half*         out   [[buffer(5)]],                                 \
+    constant W8A8Params& p     [[buffer(6)]],                                 \
+    uint3 tgid [[threadgroup_position_in_grid]],                              \
+    uint  sgid [[simdgroup_index_in_threadgroup]],                            \
+    uint  lane [[thread_index_in_simdgroup]])                                 \
+{                                                                             \
+    threadgroup int8_t As[_BM * (_BK + 16)];                                  \
+    threadgroup int8_t Bs[_BN * (_BK + 16)];                                  \
+    w8a8_gemm_m32_impl<_BM, _BN, _BK, _WM, _WN>(                            \
+        x_q, w_q, x_s, w_s, bias, out, p, As, Bs, tgid, sgid, lane);        \
+}
+
+W8A8_M32_KERNEL(bm64_bn64_bk64_wm2_wn2, 64, 64, 64, 2, 2)
 
 // V2: B-only staged — budget: BN*(BK+16) <= 32768
 W8A8_V2_KERNEL(bm64_bn64_bk64_wm2_wn2,     64,  64,  64, 2, 2)

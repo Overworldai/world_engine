@@ -34,29 +34,32 @@ void fused_rmsnorm_adaln_quant(
     if (row >= M) return;
 
     const uint K4 = K / 4;
+
     const device half* x_row = x + row * K;
     device int8_t* q_row = x_q + row * K;
+
+    // x_cache stored as half4 for aligned device<->TG transfers.
+    // MAX_K/4 = 512 half4s = 4KB TG memory.
+    threadgroup half4 x_cache4[MAX_K / 4];
+    threadgroup float sg_reduce[TG_SIZE / 32];
+
+    // Vectorized (half4) cross-lane mapping: thread tid at iter i hits
+    // half4 index (tid + i*TG_SIZE). Requires K % 4 == 0 (callers use
+    // d_model ∈ {2048, 8192}). On 256-thread TGs cross-lane beat
+    // per-thread-seq on fused_silu_quant (14.5% faster); this kernel has
+    // the same TG size so we use the same winning layout.
+    const device half4* x_row4 = reinterpret_cast<const device half4*>(x_row);
     device char4* q_row4 = reinterpret_cast<device char4*>(q_row);
     const device half4* s4 = reinterpret_cast<const device half4*>(adaln_s);
     const device half4* b4 = reinterpret_cast<const device half4*>(adaln_b);
 
-    threadgroup half x_cache[MAX_K];
-    threadgroup float sg_reduce[TG_SIZE / 32];
-
-    // Phase 1 kept SCALAR. We tested workarounds E (dual-flag barrier),
-    // F (reg-prefetch adaln), G (TG-prefetch adaln) in the probe harness
-    // — F and G were 0/100 clean there. But in the full production kernel
-    // (with Phase 3 char4 device writes added) F+vectorized-Phase-1 still
-    // races ~40% of pytest runs. The extra ~1ms/frame from vectorizing
-    // Phase 1 isn't worth the correctness risk; the Phase 2/3
-    // vectorization below already delivers 13.8% vs the all-scalar
-    // baseline and is stable. See APPLE_SILICON_VS_CUDA.md for the full
-    // trail of probe results and the Dynamic Caching hypothesis.
+    // Phase 1: read + cache + sum of squares
     float sum_sq = 0.0f;
-    for (uint k = tid; k < K; k += TG_SIZE) {
-        float v = (float)x_row[k];
-        x_cache[k] = (half)v;
-        sum_sq += v * v;
+    for (uint k4 = tid; k4 < K4; k4 += TG_SIZE) {
+        half4 h = x_row4[k4];
+        x_cache4[k4] = h;
+        float4 v = float4(h);
+        sum_sq += dot(v, v);
     }
 
     sum_sq = simd_sum(sum_sq);
@@ -74,18 +77,12 @@ void fused_rmsnorm_adaln_quant(
 
     float rms_inv = sg_reduce[0];
 
-    // Phase 2: vectorized device s4/b4 reads, scalar TG R/W (safe
-    // because Phase 1 is scalar).
+    // Phase 2: normalize + AdaLN + absmax
     float local_max = 0.0f;
     for (uint k4 = tid; k4 < K4; k4 += TG_SIZE) {
-        uint k = k4 * 4;
-        float4 xv = float4(x_cache[k+0], x_cache[k+1], x_cache[k+2], x_cache[k+3]);
-        float4 v = xv * rms_inv;
+        float4 v = float4(x_cache4[k4]) * rms_inv;
         v = v * (1.0f + float4(s4[k4])) + float4(b4[k4]);
-        x_cache[k+0] = (half)v.x;
-        x_cache[k+1] = (half)v.y;
-        x_cache[k+2] = (half)v.z;
-        x_cache[k+3] = (half)v.w;
+        x_cache4[k4] = half4(v);
         float4 a = abs(v);
         local_max = max(local_max, max(max(a.x, a.y), max(a.z, a.w)));
     }
@@ -106,14 +103,14 @@ void fused_rmsnorm_adaln_quant(
 
     float inv_scale = 1.0f / sg_reduce[0];
 
-    // Phase 3: scalar TG read → vectorized char4 device write.
+    // Phase 3: quantize from cache (half4 → char4)
     for (uint k4 = tid; k4 < K4; k4 += TG_SIZE) {
-        uint k = k4 * 4;
+        float4 v = float4(x_cache4[k4]) * inv_scale;
         char4 q;
-        q.x = (int8_t)clamp(rint((float)x_cache[k+0] * inv_scale), -127.0f, 127.0f);
-        q.y = (int8_t)clamp(rint((float)x_cache[k+1] * inv_scale), -127.0f, 127.0f);
-        q.z = (int8_t)clamp(rint((float)x_cache[k+2] * inv_scale), -127.0f, 127.0f);
-        q.w = (int8_t)clamp(rint((float)x_cache[k+3] * inv_scale), -127.0f, 127.0f);
+        q.x = (int8_t)clamp(rint(v.x), -127.0f, 127.0f);
+        q.y = (int8_t)clamp(rint(v.y), -127.0f, 127.0f);
+        q.z = (int8_t)clamp(rint(v.z), -127.0f, 127.0f);
+        q.w = (int8_t)clamp(rint(v.w), -127.0f, 127.0f);
         q_row4[k4] = q;
     }
 }
@@ -142,25 +139,22 @@ void fused_rmsnorm_adaln_smooth_quant(
 
     const device half* x_row = x + row * K;
     device int8_t* q_row = x_q + row * K;
+    const device half4* x_row4 = reinterpret_cast<const device half4*>(x_row);
     device char4* q_row4 = reinterpret_cast<device char4*>(q_row);
     const device half4* s4 = reinterpret_cast<const device half4*>(adaln_s);
     const device half4* b4 = reinterpret_cast<const device half4*>(adaln_b);
     const device half4* ss4 = reinterpret_cast<const device half4*>(smooth_scale);
 
-    threadgroup half x_cache[MAX_K];
+    threadgroup half4 x_cache4[MAX_K / 4];
     threadgroup float sg_reduce[TG_SIZE / 32];
 
-    // Phase 1 kept SCALAR. Workaround F (reg-prefetch) was 0/100 clean in
-    // the isolated probe but still causes ~40% failure rate when combined
-    // with Phase 3 char4 device writes in production. Keeping Phase 1
-    // scalar matches fused_rmsnorm_adaln_quant; Phase 2/3 vectorization
-    // alone delivers 13.8% speedup with stable correctness. See
-    // APPLE_SILICON_VS_CUDA.md.
+    // Phase 1: read + cache + sum of squares (half4 vector loads)
     float sum_sq = 0.0f;
-    for (uint k = tid; k < K; k += TG_SIZE) {
-        float v = (float)x_row[k];
-        x_cache[k] = (half)v;
-        sum_sq += v * v;
+    for (uint k4 = tid; k4 < K4; k4 += TG_SIZE) {
+        half4 h = x_row4[k4];
+        x_cache4[k4] = h;
+        float4 v = float4(h);
+        sum_sq += dot(v, v);
     }
 
     sum_sq = simd_sum(sum_sq);
@@ -178,19 +172,13 @@ void fused_rmsnorm_adaln_smooth_quant(
 
     float rms_inv = sg_reduce[0];
 
-    // Phase 2: vectorized device s4/b4/ss4 reads, scalar TG R/W (safe
-    // because Phase 1 is scalar).
+    // Phase 2: normalize + AdaLN + SmoothQuant + absmax
     float local_max = 0.0f;
     for (uint k4 = tid; k4 < K4; k4 += TG_SIZE) {
-        uint k = k4 * 4;
-        float4 xv = float4(x_cache[k+0], x_cache[k+1], x_cache[k+2], x_cache[k+3]);
-        float4 v = xv * rms_inv;
+        float4 v = float4(x_cache4[k4]) * rms_inv;
         v = v * (1.0f + float4(s4[k4])) + float4(b4[k4]);
         v *= float4(ss4[k4]);
-        x_cache[k+0] = (half)v.x;
-        x_cache[k+1] = (half)v.y;
-        x_cache[k+2] = (half)v.z;
-        x_cache[k+3] = (half)v.w;
+        x_cache4[k4] = half4(v);
         float4 a = abs(v);
         local_max = max(local_max, max(max(a.x, a.y), max(a.z, a.w)));
     }
@@ -211,14 +199,14 @@ void fused_rmsnorm_adaln_smooth_quant(
 
     float inv_scale = 1.0f / sg_reduce[0];
 
-    // Phase 3: quantize from cache → char4 device writes
+    // Phase 3: quantize from cache (half4 → char4)
     for (uint k4 = tid; k4 < K4; k4 += TG_SIZE) {
-        uint k = k4 * 4;
+        float4 v = float4(x_cache4[k4]) * inv_scale;
         char4 q;
-        q.x = (int8_t)clamp(rint((float)x_cache[k+0] * inv_scale), -127.0f, 127.0f);
-        q.y = (int8_t)clamp(rint((float)x_cache[k+1] * inv_scale), -127.0f, 127.0f);
-        q.z = (int8_t)clamp(rint((float)x_cache[k+2] * inv_scale), -127.0f, 127.0f);
-        q.w = (int8_t)clamp(rint((float)x_cache[k+3] * inv_scale), -127.0f, 127.0f);
+        q.x = (int8_t)clamp(rint(v.x), -127.0f, 127.0f);
+        q.y = (int8_t)clamp(rint(v.y), -127.0f, 127.0f);
+        q.z = (int8_t)clamp(rint(v.z), -127.0f, 127.0f);
+        q.w = (int8_t)clamp(rint(v.w), -127.0f, 127.0f);
         q_row4[k4] = q;
     }
 }
@@ -242,20 +230,19 @@ void fused_rmsnorm_quant(
 
     const device half* x_row = x + row * K;
     device int8_t* q_row = x_q + row * K;
+    const device half4* x_row4 = reinterpret_cast<const device half4*>(x_row);
     device char4* q_row4 = reinterpret_cast<device char4*>(q_row);
 
-    threadgroup half x_cache[MAX_K];
+    threadgroup half4 x_cache4[MAX_K / 4];
     threadgroup float sg_reduce[TG_SIZE / 32];
 
-    // Phase 1 kept scalar — vector Phase 1 combined with Phase 3 char4
-    // device writes triggers the same race as variant D (see
-    // APPLE_SILICON_VS_CUDA.md). Probe C was clean on its own, but
-    // probe D's trigger returns when Phase 3 adds device writes.
+    // Phase 1: read + cache + sum of squares
     float sum_sq = 0.0f;
-    for (uint k = tid; k < K; k += TG_SIZE) {
-        float v = (float)x_row[k];
-        x_cache[k] = (half)v;
-        sum_sq += v * v;
+    for (uint k4 = tid; k4 < K4; k4 += TG_SIZE) {
+        half4 h = x_row4[k4];
+        x_cache4[k4] = h;
+        float4 v = float4(h);
+        sum_sq += dot(v, v);
     }
 
     sum_sq = simd_sum(sum_sq);
@@ -273,14 +260,11 @@ void fused_rmsnorm_quant(
 
     float rms_inv = sg_reduce[0];
 
-    // Phase 2: normalize + absmax (vectorized arith, scalar TG R/W).
+    // Phase 2: normalize + absmax
     float local_max = 0.0f;
     for (uint k4 = tid; k4 < K4; k4 += TG_SIZE) {
-        uint k = k4 * 4;
-        float4 xv = float4(x_cache[k+0], x_cache[k+1], x_cache[k+2], x_cache[k+3]);
-        float4 v = xv * rms_inv;
-        x_cache[k+0] = (half)v.x; x_cache[k+1] = (half)v.y;
-        x_cache[k+2] = (half)v.z; x_cache[k+3] = (half)v.w;
+        float4 v = float4(x_cache4[k4]) * rms_inv;
+        x_cache4[k4] = half4(v);
         float4 a = abs(v);
         local_max = max(local_max, max(max(a.x, a.y), max(a.z, a.w)));
     }
@@ -301,14 +285,14 @@ void fused_rmsnorm_quant(
 
     float inv_scale = 1.0f / sg_reduce[0];
 
-    // Phase 3: quantize → char4 device writes.
+    // Phase 3: quantize from cache
     for (uint k4 = tid; k4 < K4; k4 += TG_SIZE) {
-        uint k = k4 * 4;
+        float4 v = float4(x_cache4[k4]) * inv_scale;
         char4 q;
-        q.x = (int8_t)clamp(rint((float)x_cache[k+0] * inv_scale), -127.0f, 127.0f);
-        q.y = (int8_t)clamp(rint((float)x_cache[k+1] * inv_scale), -127.0f, 127.0f);
-        q.z = (int8_t)clamp(rint((float)x_cache[k+2] * inv_scale), -127.0f, 127.0f);
-        q.w = (int8_t)clamp(rint((float)x_cache[k+3] * inv_scale), -127.0f, 127.0f);
+        q.x = (int8_t)clamp(rint(v.x), -127.0f, 127.0f);
+        q.y = (int8_t)clamp(rint(v.y), -127.0f, 127.0f);
+        q.z = (int8_t)clamp(rint(v.z), -127.0f, 127.0f);
+        q.w = (int8_t)clamp(rint(v.w), -127.0f, 127.0f);
         q_row4[k4] = q;
     }
 }
@@ -328,18 +312,23 @@ void fused_quant(
 {
     const uint M = params.M;
     const uint K = params.K;
+    const uint K4 = K / 4;
     const uint row = tgid.x;
     if (row >= M) return;
 
     const device half* x_row = x + row * K;
     device int8_t* q_row = x_q + row * K;
+    const device half4* x_row4 = reinterpret_cast<const device half4*>(x_row);
+    device char4* q_row4 = reinterpret_cast<device char4*>(q_row);
 
     threadgroup float sg_reduce[TG_SIZE / 32];
 
-    // Pass 1: absmax
+    // Pass 1: absmax (half4 loads, cross-lane mapping)
     float local_max = 0.0f;
-    for (uint k = tid; k < K; k += TG_SIZE) {
-        local_max = max(local_max, abs((float)x_row[k]));
+    for (uint k4 = tid; k4 < K4; k4 += TG_SIZE) {
+        float4 v = float4(x_row4[k4]);
+        float4 a = abs(v);
+        local_max = max(local_max, max(max(a.x, a.y), max(a.z, a.w)));
     }
 
     local_max = simd_max(local_max);
@@ -360,10 +349,15 @@ void fused_quant(
 
     float inv_scale = 1.0f / sg_reduce[0];
 
-    // Pass 2: re-read from device + quantize
-    for (uint k = tid; k < K; k += TG_SIZE) {
-        float v = (float)x_row[k] * inv_scale;
-        q_row[k] = (int8_t)clamp(rint(v), -127.0f, 127.0f);
+    // Pass 2: re-read from device + quantize (half4 → char4)
+    for (uint k4 = tid; k4 < K4; k4 += TG_SIZE) {
+        float4 v = float4(x_row4[k4]) * inv_scale;
+        char4 q;
+        q.x = (int8_t)clamp(rint(v.x), -127.0f, 127.0f);
+        q.y = (int8_t)clamp(rint(v.y), -127.0f, 127.0f);
+        q.z = (int8_t)clamp(rint(v.z), -127.0f, 127.0f);
+        q.w = (int8_t)clamp(rint(v.w), -127.0f, 127.0f);
+        q_row4[k4] = q;
     }
 }
 
@@ -454,21 +448,20 @@ void fused_rmsnorm_smooth_quant(
 
     const device half* x_row = x + row * K;
     device int8_t* q_row = x_q + row * K;
+    const device half4* x_row4 = reinterpret_cast<const device half4*>(x_row);
     device char4* q_row4 = reinterpret_cast<device char4*>(q_row);
     const device half4* ss4 = reinterpret_cast<const device half4*>(smooth_scale);
 
-    threadgroup half x_cache[MAX_K];
+    threadgroup half4 x_cache4[MAX_K / 4];
     threadgroup float sg_reduce[TG_SIZE / 32];
 
-    // Phase 1 kept SCALAR (see APPLE_SILICON_VS_CUDA.md). Vectorized
-    // Phase 1 combined with Phase 3 char4 device writes triggers the
-    // same race as probe D; workaround F clean in isolation but not in
-    // production.
+    // Phase 1: read + cache + sum of squares
     float sum_sq = 0.0f;
-    for (uint k = tid; k < K; k += TG_SIZE) {
-        float v = (float)x_row[k];
-        x_cache[k] = (half)v;
-        sum_sq += v * v;
+    for (uint k4 = tid; k4 < K4; k4 += TG_SIZE) {
+        half4 h = x_row4[k4];
+        x_cache4[k4] = h;
+        float4 v = float4(h);
+        sum_sq += dot(v, v);
     }
 
     sum_sq = simd_sum(sum_sq);
@@ -486,17 +479,11 @@ void fused_rmsnorm_smooth_quant(
 
     float rms_inv = sg_reduce[0];
 
-    // Phase 2: vectorized device ss4 read, scalar TG R/W (safe because
-    // Phase 1 is scalar).
+    // Phase 2: normalize + SmoothQuant + absmax
     float local_max = 0.0f;
     for (uint k4 = tid; k4 < K4; k4 += TG_SIZE) {
-        uint k = k4 * 4;
-        float4 xv = float4(x_cache[k+0], x_cache[k+1], x_cache[k+2], x_cache[k+3]);
-        float4 v = xv * rms_inv * float4(ss4[k4]);
-        x_cache[k+0] = (half)v.x;
-        x_cache[k+1] = (half)v.y;
-        x_cache[k+2] = (half)v.z;
-        x_cache[k+3] = (half)v.w;
+        float4 v = float4(x_cache4[k4]) * rms_inv * float4(ss4[k4]);
+        x_cache4[k4] = half4(v);
         float4 a = abs(v);
         local_max = max(local_max, max(max(a.x, a.y), max(a.z, a.w)));
     }
@@ -517,14 +504,14 @@ void fused_rmsnorm_smooth_quant(
 
     float inv_scale = 1.0f / sg_reduce[0];
 
-    // Phase 3: quantize → char4 device writes.
+    // Phase 3: quantize from cache
     for (uint k4 = tid; k4 < K4; k4 += TG_SIZE) {
-        uint k = k4 * 4;
+        float4 v = float4(x_cache4[k4]) * inv_scale;
         char4 q;
-        q.x = (int8_t)clamp(rint((float)x_cache[k+0] * inv_scale), -127.0f, 127.0f);
-        q.y = (int8_t)clamp(rint((float)x_cache[k+1] * inv_scale), -127.0f, 127.0f);
-        q.z = (int8_t)clamp(rint((float)x_cache[k+2] * inv_scale), -127.0f, 127.0f);
-        q.w = (int8_t)clamp(rint((float)x_cache[k+3] * inv_scale), -127.0f, 127.0f);
+        q.x = (int8_t)clamp(rint(v.x), -127.0f, 127.0f);
+        q.y = (int8_t)clamp(rint(v.y), -127.0f, 127.0f);
+        q.z = (int8_t)clamp(rint(v.z), -127.0f, 127.0f);
+        q.w = (int8_t)clamp(rint(v.w), -127.0f, 127.0f);
         q_row4[k4] = q;
     }
 }

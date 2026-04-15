@@ -5,7 +5,8 @@ Encodes a seed image via TAEHV, runs the model forward pass per frame,
 and decodes latents to RGB. Measures end-to-end wall time.
 
 Usage:
-  python -m src.mlx_metal.benchmarks.bench_render
+  python -m src.mlx_metal.benchmarks.bench_render                         # ANE decode (default)
+  python -m src.mlx_metal.benchmarks.bench_render --no-ane                # CPU decode
   python -m src.mlx_metal.benchmarks.bench_render --frames 30 --save-frames
   python -m src.mlx_metal.benchmarks.bench_render --profile fp16 --no-decode
   python -m src.mlx_metal.benchmarks.bench_render --stability --frames 60
@@ -364,9 +365,10 @@ def main():
     parser.add_argument("--smoothquant", action="store_true", help="Use SmoothQuant model")
     parser.add_argument("--stability", action="store_true",
                         help="Run stability analysis: measure latent/pixel drift over a zero-control rollout")
-    parser.add_argument("--ane", action="store_true",
-                        help="Run TAEHV on Apple Neural Engine (frees GPU for world model)")
+    parser.add_argument("--no-ane", action="store_true",
+                        help="Disable ANE, run TAEHV on CPU instead (ANE is default — it frees GPU for the world model)")
     args = parser.parse_args()
+    args.ane = not args.no_ane
 
     if args.smoothquant and args.model_uri == MODEL_URI:
         args.model_uri = SMOOTHQUANT_URI

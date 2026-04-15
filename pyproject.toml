@@ -26,6 +26,7 @@ dependencies = [
   # MLX / Metal (macOS only)
   "mlx; sys_platform == 'darwin'",
   "coremltools; sys_platform == 'darwin'",
+  "nanobind==2.10.2; sys_platform == 'darwin'",
   "matplotlib>=3.10.8",
 ]
 

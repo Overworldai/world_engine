@@ -32,12 +32,20 @@ void fused_silu_quant(
 
     threadgroup float sg_max[TG_SIZE / 32];
 
-    // Pass 1: SiLU + absmax (no cache — re-read + recompute on pass 2)
+    // Cross-lane with half4 vector loads: thread tid at iter i hits
+    // half4 index (tid + i*TG_SIZE). Adjacent threads hit adjacent half4s.
+    const uint per_thread_4 = K / (TG_SIZE * 4);
+    const device half4* x_row4 = reinterpret_cast<const device half4*>(x_row);
+    device char4* q_row4 = reinterpret_cast<device char4*>(q_row);
+
+    // Pass 1: SiLU + absmax
     float local_max = 0.0f;
-    for (uint k = tid; k < K; k += TG_SIZE) {
-        float v = (float)x_row[k];
-        float s = v / (1.0f + fast::exp(-v));
-        local_max = max(local_max, abs(s));
+    for (uint i = 0; i < per_thread_4; i++) {
+        half4 h = x_row4[tid + i * TG_SIZE];
+        float4 v = float4(h);
+        float4 s = v / (1.0f + fast::exp(-v));
+        float4 a = abs(s);
+        local_max = max(local_max, max(max(a.x, a.y), max(a.z, a.w)));
     }
 
     local_max = simd_max(local_max);
@@ -58,10 +66,18 @@ void fused_silu_quant(
 
     float inv_scale = 1.0f / sg_max[0];
 
-    // Pass 2: re-read + SiLU + quantize
-    for (uint k = tid; k < K; k += TG_SIZE) {
-        float v = (float)x_row[k];
-        float s = v / (1.0f + fast::exp(-v));
-        q_row[k] = (int8_t)clamp(rint(s * inv_scale), -127.0f, 127.0f);
+    // Pass 2: re-read + SiLU + quantize (half4 in, char4 out).
+    for (uint i = 0; i < per_thread_4; i++) {
+        uint idx = tid + i * TG_SIZE;
+        half4 h = x_row4[idx];
+        float4 v = float4(h);
+        float4 s = v / (1.0f + fast::exp(-v));
+        float4 scaled = s * inv_scale;
+        char4 q;
+        q.x = (int8_t)clamp(rint(scaled.x), -127.0f, 127.0f);
+        q.y = (int8_t)clamp(rint(scaled.y), -127.0f, 127.0f);
+        q.z = (int8_t)clamp(rint(scaled.z), -127.0f, 127.0f);
+        q.w = (int8_t)clamp(rint(scaled.w), -127.0f, 127.0f);
+        q_row4[idx] = q;
     }
 }

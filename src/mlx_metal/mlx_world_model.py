@@ -15,7 +15,16 @@ import numpy as np
 
 from we_kernels import w8a8_gemm_nax
 from we_kernels import fused_silu_quant, fused_rmsnorm_adaln_quant, w8a8_gemm_prequantized, w8a8_silu_gemm_nax
-from we_kernels import seq_sdpa, fused_qkv_norm_rope, kv_cache_upsert
+import os
+
+from we_kernels import (
+    seq_sdpa, fused_qkv_norm_rope, kv_cache_upsert,
+    seq_sdpa_int8block, fused_quant_upsert,
+)
+
+# Int8 KV cache: SageAttention-style per-block quantization.
+# Enables 50% KV memory savings at about same speed.
+_INT8_KV = os.environ.get("WE_INT8_KV", "0") == "1"
 
 DTYPE = mx.float16
 
@@ -368,15 +377,29 @@ def compute_rope_angles(frame_idx: int, ts_mult: float, rope_xy: mx.array, rope_
     return cos, sin
 
 
+SDPA_BK = 32  # matches kernel's BK (block size for SageAttention-style per-block quant)
+
+
 class RingKVCache:
-    def __init__(self, L: int, dilation: int, num_buckets: int):
+    def __init__(self, L: int, dilation: int, num_buckets: int,
+                 int8_mode: bool = False):
         # No separate tail — the stale slot doubles as scratch space.
         self.capacity = L
         self.L = L
         self.dilation = dilation
         self.num_buckets = num_buckets
-        self.keys = mx.zeros((1, N_KV_HEADS, L, D_HEAD), dtype=DTYPE)
-        self.values = mx.zeros((1, N_KV_HEADS, L, D_HEAD), dtype=DTYPE)
+        self.int8_mode = int8_mode
+        if int8_mode:
+            scale_len = L // SDPA_BK
+            self.keys_q = mx.zeros((1, N_KV_HEADS, L, D_HEAD), dtype=mx.int8)
+            self.keys_scale = mx.zeros((1, N_KV_HEADS, scale_len), dtype=mx.float16)
+            self.values_q = mx.zeros((1, N_KV_HEADS, L, D_HEAD), dtype=mx.int8)
+            self.values_scale = mx.zeros((1, N_KV_HEADS, scale_len), dtype=mx.float16)
+            self.keys = None
+            self.values = None
+        else:
+            self.keys = mx.zeros((1, N_KV_HEADS, L, D_HEAD), dtype=DTYPE)
+            self.values = mx.zeros((1, N_KV_HEADS, L, D_HEAD), dtype=DTYPE)
         self.written_slots: set[int] = set()
 
     def set_frozen(self, frozen: bool):
@@ -405,10 +428,10 @@ class RingKVCache:
         return (frame_idx % self.dilation) == 0
 
     def upsert(self, k_new: mx.array, v_new: mx.array, frame_idx: int) -> None:
-        """Write current frame's KV to the scratch slot.
+        """Write current frame's KV to the scratch slot (fp16 path).
 
-        Always writes to scratch (used as working space during denoise).
-        Only marks the slot as persisted on write frames (respects dilation).
+        Int8 mode bypasses this method and calls fused_quant_upsert directly
+        from TransformerBlock to fuse quantization into the cache write.
         """
         scratch = self._scratch_slot(frame_idx)
         rs = scratch * T
@@ -528,28 +551,69 @@ class TransformerBlock(nn.Module):
             )
 
         # Fused QKV split + RMSNorm + OrthoRoPE (single kernel for Q/K norm+rope)
-        q, k_new, v_new = fused_qkv_norm_rope(
-            qkv_flat, rope_cos, rope_sin, N_HEADS, N_KV_HEADS, N_KV_HEADS,
-        )
-        # q: [N_Q, T, D], k_new: [N_KV, T, D], v_new: [N_KV, T, D]
-        # Add batch dim for KV cache: [1, N_H, T, D]
-        k_new = mx.expand_dims(k_new, 0)
-        v_new = mx.expand_dims(v_new, 0)
-        if v1_in is not None and self.attn.value_residual:
-            v1_r = mx.reshape(v1_in, (1, N_KV_HEADS, T, D_HEAD))
-            v_new = v_new + self.attn.v_lamb * (v1_r - v_new)
-            v1_out = v1_in
-        else:
-            v1_out = v_new
+        if kv_cache.int8_mode:
+            # Always run fp16 fused_qkv first so value_residual can be applied
+            # cleanly in fp16. Then quantize K/V per-token via fused_quant.
+            q, k_new, v_new = fused_qkv_norm_rope(
+                qkv_flat, rope_cos, rope_sin, N_HEADS, N_KV_HEADS, N_KV_HEADS,
+            )
+            k_new = mx.expand_dims(k_new, 0)
+            v_new = mx.expand_dims(v_new, 0)
+            if v1_in is not None and self.attn.value_residual:
+                v1_r = mx.reshape(v1_in, (1, N_KV_HEADS, T, D_HEAD))
+                v_new = v_new + self.attn.v_lamb * (v1_r - v_new)
+                v1_out = v1_in
+            else:
+                v1_out = v_new
 
-        # KV cache upsert + SDPA
-        kv_cache.upsert(k_new, v_new, frame_idx)
-        n_kv = kv_cache.keys.shape[1]
-        k_3d = mx.reshape(kv_cache.keys, (n_kv, kv_cache.capacity, D_HEAD))
-        v_3d = mx.reshape(kv_cache.values, (n_kv, kv_cache.capacity, D_HEAD))
-        # Slots fill sequentially from 0, so active range is always [0, num_kv_tokens).
-        num_kv_tokens = (len(kv_cache.written_slots | {kv_cache._scratch_slot(frame_idx)})) * T
-        y_nhd = seq_sdpa(q, k_3d, v_3d, num_kv_tokens, float(D_HEAD ** -0.5))
+            # Fused quantize + cache write: fp16 K/V → per-block int8 → cache (one dispatch)
+            scratch = kv_cache._scratch_slot(frame_idx)
+            rs = scratch * T
+            rs_BLK = scratch * (T // SDPA_BK)
+            (kv_cache.keys_q, kv_cache.keys_scale,
+             kv_cache.values_q, kv_cache.values_scale) = fused_quant_upsert(
+                k_new, v_new,
+                kv_cache.keys_q, kv_cache.keys_scale,
+                kv_cache.values_q, kv_cache.values_scale,
+                rs, rs_BLK, SDPA_BK)
+            if not getattr(kv_cache, "frozen", False) and kv_cache._is_write_frame(frame_idx):
+                kv_cache.written_slots.add(scratch)
+
+            n_kv = kv_cache.keys_q.shape[1]
+            L = kv_cache.capacity
+            k_q_3d = mx.reshape(kv_cache.keys_q,   (n_kv, L, D_HEAD))
+            v_q_3d = mx.reshape(kv_cache.values_q, (n_kv, L, D_HEAD))
+            scale_len = L // SDPA_BK
+            k_s_2d = mx.reshape(kv_cache.keys_scale,   (n_kv, scale_len))
+            v_s_2d = mx.reshape(kv_cache.values_scale, (n_kv, scale_len))
+            num_kv_tokens = (len(kv_cache.written_slots | {kv_cache._scratch_slot(frame_idx)})) * T
+            # bk=32: production int8 kernel. BK=64 exists in separate compilation unit
+            # (scatter_sdpa_bk64.metal) but register allocation is compiler-context fragile.
+            y_nhd = seq_sdpa_int8block(q, k_q_3d, k_s_2d, v_q_3d, v_s_2d,
+                                       num_kv_tokens, float(D_HEAD ** -0.5), 32)
+        else:
+            q, k_new, v_new = fused_qkv_norm_rope(
+                qkv_flat, rope_cos, rope_sin, N_HEADS, N_KV_HEADS, N_KV_HEADS,
+            )
+            # q: [N_Q, T, D], k_new: [N_KV, T, D], v_new: [N_KV, T, D]
+            # Add batch dim for KV cache: [1, N_H, T, D]
+            k_new = mx.expand_dims(k_new, 0)
+            v_new = mx.expand_dims(v_new, 0)
+            if v1_in is not None and self.attn.value_residual:
+                v1_r = mx.reshape(v1_in, (1, N_KV_HEADS, T, D_HEAD))
+                v_new = v_new + self.attn.v_lamb * (v1_r - v_new)
+                v1_out = v1_in
+            else:
+                v1_out = v_new
+
+            # KV cache upsert + SDPA
+            kv_cache.upsert(k_new, v_new, frame_idx)
+            n_kv = kv_cache.keys.shape[1]
+            k_3d = mx.reshape(kv_cache.keys, (n_kv, kv_cache.capacity, D_HEAD))
+            v_3d = mx.reshape(kv_cache.values, (n_kv, kv_cache.capacity, D_HEAD))
+            # Slots fill sequentially from 0, so active range is always [0, num_kv_tokens).
+            num_kv_tokens = (len(kv_cache.written_slots | {kv_cache._scratch_slot(frame_idx)})) * T
+            y_nhd = seq_sdpa(q, k_3d, v_3d, num_kv_tokens, float(D_HEAD ** -0.5))
         y = mx.reshape(y_nhd.transpose(1, 0, 2), (1, T, N_HEADS * D_HEAD))
         y = self.attn.out_proj(y)
         x4_y = mx.reshape(y, (1, 1, T, D_MODEL))
@@ -633,7 +697,8 @@ class MLXWorldModel(nn.Module):
             # Allocate only num_buckets * T tokens, not window * T.
             # With dilation>1 (global layers), this compacts the cache from
             # 65536 to 8192 tokens — eliminating 7MB dead stride between heads.
-            self.kv_caches.append(RingKVCache(num_buckets * T, dilation, num_buckets))
+            self.kv_caches.append(RingKVCache(
+                num_buckets * T, dilation, num_buckets, int8_mode=_INT8_KV))
 
     def noise_cond(self, sigma: float) -> mx.array:
         s = mx.array([sigma], dtype=mx.float32) * 1000.0
@@ -694,7 +759,13 @@ class MLXWorldModel(nn.Module):
         cond = self.noise_cond(0.0)
         self.forward_single(x, cond, rope_cos, rope_sin, mouse, button, scroll, frame_idx)
         # Eval to materialize KV cache writes before next frame
-        mx.eval(*[arr for kv in self.kv_caches for arr in [kv.keys, kv.values]])
+        arrs = []
+        for kv in self.kv_caches:
+            if kv.int8_mode:
+                arrs += [kv.keys_q, kv.keys_scale, kv.values_q, kv.values_scale]
+            else:
+                arrs += [kv.keys, kv.values]
+        mx.eval(*arrs)
 
 
 def _extract_smooth_scales(pt_model) -> dict:

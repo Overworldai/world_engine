@@ -191,6 +191,25 @@ def seq_sdpa(
     )
 
 
+def seq_sdpa_int8block(
+    Q: mx.array, K_q: mx.array, K_scales: mx.array,
+    V_q: mx.array, V_scales: mx.array,
+    num_kv_tokens: int, scale: float,
+    bk: int = 32,
+) -> mx.array:
+    """SageAttention-style per-block int8 SDPA.
+
+    K_scales and V_scales shape: [N_KV, capacity / BK] — one fp16 per block.
+    Uses int8 Q@K^T MMA with scalar per-block scales, fp16 P@V MMA.
+    bk: block size (32 or 64). Must match scale granularity.
+    """
+    return _ext.seq_sdpa_int8block(
+        Q.astype(mx.float16), K_q.astype(mx.int8), K_scales.astype(mx.float16),
+        V_q.astype(mx.int8), V_scales.astype(mx.float16),
+        int(num_kv_tokens), float(scale), int(bk),
+    )
+
+
 def kv_cache_upsert(
     cache_k: mx.array,
     cache_v: mx.array,
@@ -208,6 +227,89 @@ def kv_cache_upsert(
     """
     result = _ext.kv_cache_upsert(cache_k, cache_v, k_new, v_new, int(rs))
     return result[0], result[1]
+
+
+def fused_quant_upsert(
+    k_new: mx.array, v_new: mx.array,
+    cache_k_q: mx.array, cache_k_s: mx.array,
+    cache_v_q: mx.array, cache_v_s: mx.array,
+    rs: int, rs_block: int, bk: int = 32,
+) -> tuple[mx.array, mx.array, mx.array, mx.array]:
+    """Fused fp16→int8 per-block quant + cache write in one dispatch.
+
+    Takes fp16 K/V new data, quantizes per-block, writes directly to int8 cache.
+    Returns (cache_k_q, cache_k_s, cache_v_q, cache_v_s) updated in place.
+    """
+    r = _ext.fused_quant_upsert(
+        k_new.astype(mx.float16), v_new.astype(mx.float16),
+        cache_k_q, cache_k_s, cache_v_q, cache_v_s,
+        int(rs), int(rs_block), int(bk))
+    return r[0], r[1], r[2], r[3]
+
+
+def repro_half4_tg(x: mx.array) -> mx.array:
+    """Diagnostic A: pure x→TG→y copy via vector half4 TG writes."""
+    return _ext.repro_half4_tg(x)
+
+
+def repro_half4_tg_reduce(x: mx.array) -> tuple[mx.array, mx.array]:
+    """Diagnostic B: + sum_sq reduction (RMSNorm Phase 1)."""
+    r = _ext.repro_half4_tg_reduce(x)
+    return r[0], r[1]
+
+
+def repro_half4_tg_rmw(x: mx.array) -> tuple[mx.array, mx.array]:
+    """Diagnostic C: + Phase 2 RMW + Phase 3 copy-out.
+    Returns (y = x * rms_inv, rms_inv)."""
+    r = _ext.repro_half4_tg_rmw(x)
+    return r[0], r[1]
+
+
+def repro_half4_tg_adaln(
+    x: mx.array, adaln_s: mx.array, adaln_b: mx.array,
+) -> tuple[mx.array, mx.array]:
+    """Diagnostic D: full RMSNorm Phase 1+2+3 (with AdaLN device reads)."""
+    r = _ext.repro_half4_tg_adaln(x, adaln_s, adaln_b)
+    return r[0], r[1]
+
+
+def repro_half4_tg_dualflag(x, adaln_s, adaln_b):
+    """Workaround E: D + mem_threadgroup|mem_device barrier."""
+    r = _ext.repro_half4_tg_dualflag(x, adaln_s, adaln_b); return r[0], r[1]
+
+
+def repro_half4_tg_regprefetch(x, adaln_s, adaln_b):
+    """Workaround F: D + pre-load adaln to per-thread registers."""
+    r = _ext.repro_half4_tg_regprefetch(x, adaln_s, adaln_b); return r[0], r[1]
+
+
+def repro_half4_tg_tgprefetch(x, adaln_s, adaln_b):
+    """Workaround G: D + pre-load adaln to a TG scratch buffer."""
+    r = _ext.repro_half4_tg_tgprefetch(x, adaln_s, adaln_b); return r[0], r[1]
+
+
+def repro_half4_tg_volatile(x, adaln_s, adaln_b):
+    """Workaround H: D + volatile threadgroup x_cache."""
+    r = _ext.repro_half4_tg_volatile(x, adaln_s, adaln_b); return r[0], r[1]
+
+
+def kv_cache_upsert_int8_block(
+    cache_k_q: mx.array, cache_k_scale: mx.array,
+    cache_v_q: mx.array, cache_v_scale: mx.array,
+    k_new_q: mx.array, k_new_scale: mx.array,
+    v_new_q: mx.array, v_new_scale: mx.array,
+    rs: int, rs_block: int,
+) -> tuple[mx.array, mx.array, mx.array, mx.array]:
+    """In-place int8 KV cache upsert with per-block scales (SageAttention-style).
+
+    rs is the token offset (for int8 data buffer).
+    rs_block is the block offset (for per-block scale buffer), typically rs // BK.
+    """
+    r = _ext.kv_cache_upsert_int8_block(
+        cache_k_q, cache_k_scale, cache_v_q, cache_v_scale,
+        k_new_q, k_new_scale, v_new_q, v_new_scale,
+        int(rs), int(rs_block))
+    return r[0], r[1], r[2], r[3]
 
 
 def fused_qkv_norm_rope(

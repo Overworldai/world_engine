@@ -116,7 +116,7 @@ def main():
         t1 = time.perf_counter()
 
         model.cache_write(out, rope_cos, rope_sin, mouse, button, scroll, fi)
-        mx.eval(*[arr for kv in model.kv_caches for arr in [kv.keys, kv.values]])
+        # cache_write already evals appropriate buffers internally (supports int8)
         t2 = time.perf_counter()
 
         d_ms = (t1 - t0) * 1000

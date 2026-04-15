@@ -20,6 +20,8 @@ from we_kernels import (
     fused_rmsnorm_adaln_quant,
     fused_qkv_norm_rope,
     scatter_sdpa,
+    seq_sdpa,
+    seq_sdpa_int8block,
 )
 
 
@@ -485,6 +487,123 @@ class TestScatterSDPA:
         r2 = scatter_sdpa(Q, K, V, block_offsets, scale)
         mx.eval(r1, r2)
         np.testing.assert_array_equal(np.array(r1), np.array(r2))
+
+    # --- Int8 block SDPA tests ---
+
+    def test_int8block_vs_fp16(self):
+        """Int8 block SDPA should match fp16 SDPA within quantization tolerance."""
+        mx.random.seed(42)
+        N_Q, N_KV, T_Q, D = 32, 32, 8, 64
+        cap = 256
+        BK = 32
+        scale = 1.0 / np.sqrt(D)
+
+        Q = mx.random.normal((N_Q, T_Q, D)).astype(mx.float16)
+        K_fp = mx.random.normal((N_KV, cap, D)).astype(mx.float16) * 0.5
+        V_fp = mx.random.normal((N_KV, cap, D)).astype(mx.float16) * 0.5
+        mx.eval(Q, K_fp, V_fp)
+
+        # Quantize K, V per-block
+        from we_kernels import fused_quant
+        K_flat = mx.reshape(K_fp, (N_KV * (cap // BK), BK * D))
+        K_q, K_s = fused_quant(K_flat)
+        K_q = mx.reshape(K_q, (N_KV, cap, D))
+        K_s = mx.reshape(K_s.astype(mx.float16), (N_KV, cap // BK))
+        V_flat = mx.reshape(V_fp, (N_KV * (cap // BK), BK * D))
+        V_q, V_s = fused_quant(V_flat)
+        V_q = mx.reshape(V_q, (N_KV, cap, D))
+        V_s = mx.reshape(V_s.astype(mx.float16), (N_KV, cap // BK))
+
+        num_kv = 128
+        O_fp = seq_sdpa(Q, K_fp, V_fp, num_kv, scale)
+        O_i8 = seq_sdpa_int8block(Q, K_q, K_s, V_q, V_s, num_kv, scale)
+        mx.eval(O_fp, O_i8)
+
+        res = np.array(O_i8).astype(np.float32)
+        ref = np.array(O_fp).astype(np.float32)
+        mae = np.abs(res - ref).mean()
+        ref_max = np.abs(ref).max()
+        assert mae / ref_max < 0.005, f"Int8 block MAE {mae:.6f} / ref_max {ref_max:.4f} = {mae/ref_max*100:.2f}% (>0.5%)"
+        assert np.all(np.isfinite(res))
+
+    def test_int8block_large_kv(self):
+        """Int8 block SDPA at production shape (8192 KV tokens)."""
+        mx.random.seed(42)
+        N_Q, N_KV, T_Q, D = 32, 32, 512, 64
+        cap = 8192
+        BK = 32
+        scale = 1.0 / np.sqrt(D)
+
+        Q = mx.random.normal((N_Q, T_Q, D)).astype(mx.float16)
+        K_fp = mx.random.normal((N_KV, cap, D)).astype(mx.float16) * 0.5
+        V_fp = mx.random.normal((N_KV, cap, D)).astype(mx.float16) * 0.5
+        mx.eval(Q, K_fp, V_fp)
+
+        from we_kernels import fused_quant
+        K_flat = mx.reshape(K_fp, (N_KV * (cap // BK), BK * D))
+        K_q, K_s = fused_quant(K_flat)
+        K_q = mx.reshape(K_q, (N_KV, cap, D))
+        K_s = mx.reshape(K_s.astype(mx.float16), (N_KV, cap // BK))
+        V_flat = mx.reshape(V_fp, (N_KV * (cap // BK), BK * D))
+        V_q, V_s = fused_quant(V_flat)
+        V_q = mx.reshape(V_q, (N_KV, cap, D))
+        V_s = mx.reshape(V_s.astype(mx.float16), (N_KV, cap // BK))
+
+        O = seq_sdpa_int8block(Q, K_q, K_s, V_q, V_s, cap, scale)
+        mx.eval(O)
+        res = np.array(O).astype(np.float32)
+        assert res.shape == (N_Q, T_Q, D)
+        assert np.all(np.isfinite(res)), "Large-KV int8 block output has NaN/Inf"
+
+    def test_int8block_deterministic(self):
+        """Same input produces identical int8 block output."""
+        mx.random.seed(42)
+        N_Q, N_KV, T_Q, D = 4, 4, 8, 64
+        cap = 128
+        BK = 32
+        scale = 1.0 / np.sqrt(D)
+
+        Q = mx.random.normal((N_Q, T_Q, D)).astype(mx.float16)
+        K_q = mx.random.randint(-127, 127, (N_KV, cap, D)).astype(mx.int8)
+        K_s = mx.random.uniform(shape=(N_KV, cap // BK)).astype(mx.float16) * 0.02
+        V_q = mx.random.randint(-127, 127, (N_KV, cap, D)).astype(mx.int8)
+        V_s = mx.random.uniform(shape=(N_KV, cap // BK)).astype(mx.float16) * 0.02
+        mx.eval(Q, K_q, K_s, V_q, V_s)
+
+        r1 = seq_sdpa_int8block(Q, K_q, K_s, V_q, V_s, 64, scale)
+        r2 = seq_sdpa_int8block(Q, K_q, K_s, V_q, V_s, 64, scale)
+        mx.eval(r1, r2)
+        np.testing.assert_array_equal(np.array(r1), np.array(r2))
+
+    def test_kv_cache_upsert_int8_block(self):
+        """Int8 block KV cache upsert roundtrip."""
+        N_KV, L, T_Q, D = 4, 256, 16, 64
+        BK = 32
+        rs = 32
+
+        cache_k_q = mx.zeros((1, N_KV, L, D), dtype=mx.int8)
+        cache_k_s = mx.zeros((1, N_KV, L // BK), dtype=mx.float16)
+        cache_v_q = mx.zeros((1, N_KV, L, D), dtype=mx.int8)
+        cache_v_s = mx.zeros((1, N_KV, L // BK), dtype=mx.float16)
+
+        k_new_q = mx.random.randint(-127, 127, (1, N_KV, T_Q, D)).astype(mx.int8)
+        k_new_s = mx.random.uniform(shape=(1, N_KV, T_Q // BK)).astype(mx.float16) * 0.05
+        v_new_q = mx.random.randint(-127, 127, (1, N_KV, T_Q, D)).astype(mx.int8)
+        v_new_s = mx.random.uniform(shape=(1, N_KV, T_Q // BK)).astype(mx.float16) * 0.05
+        mx.eval(cache_k_q, cache_k_s, cache_v_q, cache_v_s, k_new_q, k_new_s, v_new_q, v_new_s)
+
+        from we_kernels import kv_cache_upsert_int8_block
+        rs_blk = rs // BK
+        ck, cs, cv, vs = kv_cache_upsert_int8_block(
+            cache_k_q, cache_k_s, cache_v_q, cache_v_s,
+            k_new_q, k_new_s, v_new_q, v_new_s, rs, rs_blk)
+        mx.eval(ck, cs, cv, vs)
+
+        # Verify data was written at the correct offset
+        assert bool(mx.all(ck[:, :, rs:rs+T_Q] == k_new_q))
+        assert bool(mx.all(cs[:, :, rs_blk:rs_blk+T_Q//BK] == k_new_s))
+        assert bool(mx.all(cv[:, :, rs:rs+T_Q] == v_new_q))
+        assert bool(mx.all(vs[:, :, rs_blk:rs_blk+T_Q//BK] == v_new_s))
 
     def test_finite_single_block(self):
         """Single block should produce finite results."""
