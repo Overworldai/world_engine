@@ -2,6 +2,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import os
 
 
 QUANTS = [None]  # TODO: enable specific quant based on model config, which should specify compatible quants [None, "w8a8", "fp8"]
@@ -12,6 +13,19 @@ try:
     QUANTS.append("nvfp4")
 except ImportError:
     pass
+try:
+    config_path = "gemlite_config.json"
+    from gemlite.helper import A8W8_INT8_dynamic
+    import gemlite
+
+    if os.path.exists(config_path):
+        gemlite.load_config(config_path)
+    else: 
+        gemlite.set_autotune("max")
+        gemlite.helper.warmup(shapes=[(128,2048), (2048,2048), (2048,8192), (4096,2048), (8192,2048)], batch_sizes=[1], processor=A8W8_INT8_dynamic())
+        gemlite.cache_config(config_path)
+except ImportError:
+    A8W8_INT8_dynamic = None
 
 
 @torch.library.custom_op("world_engine::fp4_linear", mutates_args=())
@@ -151,7 +165,7 @@ class FP8Linear(nn.Module):
             if lin.bias is not None
             else None
         )
-        w_amax = lin.weight.data.clone().amax().float().squeeze()
+        w_amax = lin.weight.data.abs().amax()
         w = lin.weight.data.clone().div(w_amax).to(torch.float8_e4m3fn)
         self.register_buffer("w_amax", w_amax)
         self.register_buffer("weightT", w.t())
@@ -183,28 +197,104 @@ class FP8Linear(nn.Module):
 
         return result.reshape(x.shape[:-1] + (-1,))
 
+def _per_token_quant_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Local per-token symmetric int8 quantization matching SGLang's W8A8 flow:
+      scale = absmax / 127
+      x_q   = round(x / scale)
+    Returns:
+      x_q:    [..., K] int8
+      scales: [..., 1] float32
+    """
+    x_fp = x.float().nan_to_num()
+    scales = (x_fp.abs().amax(dim=-1, keepdim=True).clamp_min(1e-10) / 127.0).float()
+    x_q = torch.round(x_fp / scales).clamp(-127, 127).to(torch.int8)
+    return x_q, scales
 
-def quantize_model(model: nn.Module, quant: str):
+
+@torch.library.custom_op("world_engine::w8a8_int8_linear", mutates_args=())
+def w8a8_int8_linear(
+    a: torch.Tensor,
+    b_int8_T: torch.Tensor,
+    b_scale: torch.Tensor,
+    bias: torch.Tensor,
+) -> torch.Tensor:
+    if sgl_int8_scaled_mm is None:
+        raise ImportError("sgl-kernel is required for quant='w8a8'")
+
+    assert a.ndim == 2, "expected [M, K] input"
+    x_q, x_scale = _per_token_quant_int8(a.contiguous())
+
+    bias_arg = None if bias.numel() == 0 else bias
+    return sgl_int8_scaled_mm(
+        x_q,                 # [M, K] row-major int8
+        b_int8_T,            # [K, N] column-major int8 view
+        x_scale,             # [M, 1] float32
+        b_scale,             # [N, 1] float32
+        out_dtype=a.dtype,
+        bias=bias_arg,
+    )
+
+
+@w8a8_int8_linear.register_fake
+def _w8a8_int8_linear_fake(
+    a: torch.Tensor,
+    b_int8_T: torch.Tensor,
+    b_scale: torch.Tensor,
+    bias: torch.Tensor,
+) -> torch.Tensor:
+    return torch.empty(
+        (a.shape[0], b_int8_T.shape[1]),
+        device=a.device,
+        dtype=a.dtype,
+    )
+
+class INT8W8A8GemLite(nn.Module):
+    __constants__ = ("in_features", "out_features")
+
+    def __init__(self, lin: nn.Linear):
+        super().__init__()
+        if A8W8_INT8_dynamic is None:
+            raise ImportError("Install gemlite for quant='w8a8_gemlite'")
+        
+        self.in_features = lin.in_features
+        self.out_features = lin.out_features
+
+        # Minimal wrapper: assumes the layer is already on the target CUDA device.
+        self.impl = A8W8_INT8_dynamic(
+            device=str(lin.weight.device),
+            dtype=lin.weight.dtype,
+        ).from_linear(lin)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.impl(x).type_as(x)
+
+
+def quantize_model(model: nn.Module, quant: str, _prefix: str = ""):
     if quant is None:
         return model
-
-    def eligible(m: nn.Module) -> bool:
+    
+    def eligible(m: nn.Module, fqn: str) -> bool:
         w = getattr(m, "weight", None)
         if not isinstance(m, nn.Linear):
             return False
         if getattr(w, "dtype", None) != torch.bfloat16:
             return False
+        EXCLUDED_LAYERS = [".ctrl_emb", ".out_norm", ".unpatchify"]
+        if any(s in fqn for s in EXCLUDED_LAYERS):
+            return False
         o, k = w.shape
         return (o % 32 == 0) and (k % 32 == 0)
 
     new_linear = {
-        "w8a8": FP8W8A8Linear,
+        "intw8a8": INT8W8A8GemLite,
+        "fp8w8a8": FP8W8A8Linear,
         "nvfp4": FP4Linear,
-        "fp8": FP8Linear,
     }[quant]
 
     for name, child in model.named_children():
-        setattr(model, name, new_linear(child)) if eligible(child) else quantize_model(
-            child, quant
+        fqn = f"{_prefix}.{name}"
+        setattr(model, name, new_linear(child)) if eligible(child, fqn) else quantize_model(
+            child, quant, fqn
         )
     return model

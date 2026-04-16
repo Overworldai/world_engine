@@ -9,7 +9,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from .attn import Attn, CrossAttention
+from .attn import Attn, CrossAttention, OrthoRoPEAngles
 from .nn import AdaLN, ada_gate, ada_rmsnorm, NoiseConditioner
 from .base_model import BaseModel
 
@@ -149,10 +149,10 @@ class WorldDiTBlock(nn.Module):
 
         do_prompt_cond = config.prompt_conditioning is not None and layer_idx % config.prompt_conditioning_period == 0
         self.prompt_cross_attn = CrossAttention(config, config.prompt_embedding_dim) if do_prompt_cond else None
-        do_ctrl_cond = layer_idx % config.ctrl_conditioning_period == 0
+        do_ctrl_cond = config.ctrl_conditioning_period is not None and layer_idx % config.ctrl_conditioning_period == 0
         self.ctrl_mlpfusion = MLPFusion(config) if do_ctrl_cond else None
 
-    def forward(self, x, pos_ids, cond, ctx, v, kv_cache=None):
+    def forward(self, x, pos_ids, rope_angles, cond, ctx, v, kv_cache=None):
         """
         0) Causal Frame Attention
         1) Frame->CTX Cross Attention
@@ -163,7 +163,7 @@ class WorldDiTBlock(nn.Module):
         # Self / Causal Attention
         residual = x
         x = ada_rmsnorm(x, s0, b0)
-        x, v = self.attn(x, pos_ids, v, kv_cache=kv_cache)
+        x, v = self.attn(x, pos_ids, rope_angles, v, kv_cache=kv_cache)
         x = ada_gate(x, g0) + residual
 
         # Cross Attention Prompt Conditioning
@@ -189,6 +189,7 @@ class WorldDiT(nn.Module):
         super().__init__()
         self.config = config
         self.blocks = nn.ModuleList([WorldDiTBlock(config, idx) for idx in range(config.n_layers)])
+        self.rope_angles = OrthoRoPEAngles(config)
 
         if self.config.noise_conditioning in ("dit_air", "wan"):
             ref_proj = self.blocks[0].cond_head.cond_proj
@@ -196,15 +197,11 @@ class WorldDiT(nn.Module):
                 for blk_mod, ref_mod in zip(blk.cond_head.cond_proj, ref_proj):
                     blk_mod.weight = ref_mod.weight
 
-        # Shared RoPE buffers
-        ref_rope = self.blocks[0].attn.rope
-        for blk in self.blocks[1:]:
-            blk.attn.rope = ref_rope
-
     def forward(self, x, pos_ids, cond, ctx, kv_cache=None):
+        rope_angles = self.rope_angles(pos_ids)
         v = None
         for i, block in enumerate(self.blocks):
-            x, v = block(x, pos_ids, cond, ctx, v, kv_cache=kv_cache)
+            x, v = block(x, pos_ids, rope_angles, cond, ctx, v, kv_cache=kv_cache)
         return x
 
 
@@ -234,7 +231,7 @@ class WorldModel(BaseModel):
 
         self.transformer = WorldDiT(config)
 
-        self.patch = tuple(getattr(config, "patch", (1, 1)))
+        self.patch = tuple(config.patch)
 
         C, D = config.channels, config.d_model
         self.patchify = nn.Conv2d(C, D, kernel_size=self.patch, stride=self.patch, bias=False)
@@ -253,6 +250,7 @@ class WorldModel(BaseModel):
         x: Tensor,
         sigma: Tensor,
         frame_timestamp: Tensor,
+        frame_idx: Optional[Tensor] = None,
         prompt_emb: Optional[Tensor] = None,
         prompt_pad_mask: Optional[Tensor] = None,
         mouse: Optional[Tensor] = None,
@@ -279,7 +277,12 @@ class WorldModel(BaseModel):
         torch._assert(B == 1 and N == 1, "WorldModel.forward currently supports B==1, N==1")
         self._t_pos_1f.copy_(frame_timestamp[0, 0].expand_as(self._t_pos_1f))
         pos_ids = TensorDict(
-            {"t_pos": self._t_pos_1f[None], "y_pos": self._y_pos_1f[None], "x_pos": self._x_pos_1f[None]},
+            {
+                "f_pos": (frame_timestamp if frame_idx is None else frame_idx)[0, 0].expand_as(self._t_pos_1f)[None],
+                "t_pos": self._t_pos_1f[None],
+                "y_pos": self._y_pos_1f[None],
+                "x_pos": self._x_pos_1f[None],
+            },
             batch_size=[1, self._t_pos_1f.numel()],
         )
 
@@ -304,3 +307,56 @@ class WorldModel(BaseModel):
         )
 
         return x
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        if self.config.model_type != "waypoint-1.5":
+            return super().load_state_dict(state_dict, strict=strict, assign=assign)
+
+        state_dict = dict(state_dict)
+
+        if "unpatchify.weight" in state_dict and state_dict["unpatchify.weight"].ndim == 4:
+            w = state_dict["unpatchify.weight"]  # [D, C, ph, pw]
+            state_dict["unpatchify.weight"] = w.permute(1, 2, 3, 0).reshape(-1, w.shape[0])
+        if "unpatchify.bias" in state_dict and state_dict["unpatchify.bias"].numel() != self.unpatchify.bias.numel():
+            ph, pw = self.patch
+            state_dict["unpatchify.bias"] = state_dict["unpatchify.bias"][:, None, None].expand(-1, ph, pw).reshape(-1)
+
+        for i in range(self.config.n_layers):
+            p = f"transformer.blocks.{i}."
+
+            for name in ("fc1.weight", "fc2.weight"):
+                old = p + "dit_mlp." + name
+                if old in state_dict:
+                    state_dict.setdefault(p + "mlp." + name, state_dict.pop(old))
+
+            attn_bias = state_dict.pop(p + "attn_cond_head.bias_in", None)
+            mlp_bias = state_dict.pop(p + "mlp_cond_head.bias_in", None)
+            if attn_bias is not None or mlp_bias is not None:
+                state_dict.setdefault(p + "cond_head.bias_in", mlp_bias if mlp_bias is not None else attn_bias)
+
+            for j in range(3):
+                attn = state_dict.pop(p + f"attn_cond_head.cond_proj.{j}.weight", None)
+                mlp = state_dict.pop(p + f"mlp_cond_head.cond_proj.{j}.weight", None)
+                if attn is not None:
+                    state_dict.setdefault(p + f"cond_head.cond_proj.{j}.weight", attn)
+                if mlp is not None:
+                    state_dict.setdefault(p + f"cond_head.cond_proj.{j + 3}.weight", mlp)
+
+            x = state_dict.pop(p + "ctrl_mlpfusion.fc1_x.weight", None)
+            c = state_dict.pop(p + "ctrl_mlpfusion.fc1_c.weight", None)
+            if x is not None and c is not None:
+                state_dict.setdefault(p + "ctrl_mlpfusion.mlp.fc1.weight", torch.cat((x, c), dim=1))
+            old = state_dict.pop(p + "ctrl_mlpfusion.fc2.weight", None)
+            if old is not None:
+                state_dict.setdefault(p + "ctrl_mlpfusion.mlp.fc2.weight", old)
+
+        ref = "transformer.blocks.0.cond_head.cond_proj."
+        for i in range(1, self.config.n_layers):
+            p = f"transformer.blocks.{i}.cond_head.cond_proj."
+            for j in range(6):
+                k, rk = p + f"{j}.weight", ref + f"{j}.weight"
+                if k not in state_dict and rk in state_dict:
+                    state_dict[k] = state_dict[rk]
+        state_dict = {k: v for k, v in state_dict.items() if ".cond_heads." not in k}
+
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)

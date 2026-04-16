@@ -4,7 +4,7 @@ from torch import Tensor
 from dataclasses import dataclass, field
 
 from .model import WorldModel, StaticKVCache, PromptEncoder
-from .ae import InferenceAE
+from .ae import get_ae
 from .patch_model import apply_inference_patches
 from .quantize import quantize_model
 
@@ -16,12 +16,21 @@ torch.set_float32_matmul_precision("medium")  # low: bf16, medium: tf32, high: f
 # fix graph break:
 torch._dynamo.config.capture_scalar_outputs = True
 
+COMPILE_OPTIONS = {
+    "max_autotune": True,
+    "coordinate_descent_tuning": True,
+    "triton.cudagraphs": True,
+    # Negligible improvement in throughput:
+    # "epilogue_fusion": True,
+    # "shape_padding": True,
+}
+
 
 @dataclass
 class CtrlInput:
     button: Set[int] = field(default_factory=set)  # pressed button IDs
-    mouse: Tuple[float, float] = (0.0, 0.0)  # (x, y) velocity
-    scroll_wheel: int = 0  # bwd, stationary, or fwd -> (-1, 0, 1)
+    mouse: Tuple[float, float] = (0.0, 0.0)  # (dx, dy) velocity
+    scroll_wheel: int = 0  # down, stationary, or up -> (-1, 0, 1)
 
 
 class WorldEngine:
@@ -36,54 +45,66 @@ class WorldEngine:
     ):
         """
         model_uri: HF URI or local folder containing model.safetensors and config.yaml
-        quant: None | w8a8 | nvfp4
+        quant: None | intw8a8 | fp8w8a8 | nvfp4
         model_config_overrides: Dict to override model config values
+        - auto_aspect_ratio: set to False to work in ae raw space, otherwise in/out are 720p or 360p
         """
-        self.device, self.dtype = device, dtype
+        self.device = torch.get_default_device() if device is None else device
+        self.dtype = torch.get_default_dtype() if dtype is None else dtype
 
         self.model_cfg = WorldModel.load_config(model_uri)
 
         if model_config_overrides:
             self.model_cfg.merge_with(model_config_overrides)
 
-        # Model
-        self.vae = InferenceAE.from_pretrained(self.model_cfg.ae_uri, device=device, dtype=dtype)
+        with torch.device(self.device):
+            pH, pW = self.model_cfg.patch
+            # Load Model / Modules
+            self.vae = get_ae(
+                self.model_cfg.ae_uri,
+                is_taehv_ae=self.model_cfg.taehv_ae,
+                auto_aspect_ratio=self.model_cfg.auto_aspect_ratio,
+                dtype=dtype,
+                device=device,
+                **(
+                    {"height": self.model_cfg.height * pH, "width": self.model_cfg.width * pW}
+                    if self.model_cfg.taehv_ae else {}
+                ),
+            )
 
-        self.prompt_encoder = None
-        if self.model_cfg.prompt_conditioning is not None:
-            pe_uri = getattr(self.model_cfg, "prompt_encoder_uri", "google/umt5-xl")
-            self.prompt_encoder = PromptEncoder(pe_uri, dtype=dtype).to(device).eval()
+            self.prompt_encoder = None
+            if self.model_cfg.prompt_conditioning is not None:
+                self.prompt_encoder = PromptEncoder(self.model_cfg.prompt_encoder_uri, dtype=dtype).eval()
 
-        if load_weights:
-            self.model = WorldModel.from_pretrained(model_uri, cfg=self.model_cfg)
-        else:
-            self.model = WorldModel(self.model_cfg)
-        self.model = self.model.to(device=device, dtype=dtype).eval()
+            self.model = WorldModel.from_pretrained(
+                model_uri, cfg=self.model_cfg, device=self.device, dtype=dtype, load_weights=load_weights
+            ).eval()
+            apply_inference_patches(self.model)
+            if quant is not None:
+                quantize_model(self.model, quant)
 
-        apply_inference_patches(self.model)
+            self.kv_cache = StaticKVCache(self.model_cfg, batch_size=1, dtype=dtype).to(device=device)
 
-        if quant is not None:
-            quantize_model(self.model, quant)
+            # Inference Scheduler
+            self.scheduler_sigmas = torch.tensor(self.model_cfg.scheduler_sigmas, dtype=dtype, device=device)
 
-        # Inference Scheduler
-        self.scheduler_sigmas = torch.tensor(self.model_cfg.scheduler_sigmas, device=device, dtype=dtype)
+            self.frm_shape = 1, 1, self.model_cfg.channels, self.model_cfg.height * pH, self.model_cfg.width * pW
 
-        pH, pW = getattr(self.model_cfg, "patch", [1, 1])
-        self.frm_shape = 1, 1, self.model_cfg.channels, self.model_cfg.height * pH, self.model_cfg.width * pW
+            # State
+            latent_fps = self.model_cfg.inference_fps / self.model_cfg.temporal_compression
+            self.ts_mult = int(self.model_cfg.base_fps) // latent_fps
+            self.frame_ts = torch.tensor([[0]], dtype=torch.long)
 
-        # State
-        self.kv_cache = StaticKVCache(self.model_cfg, batch_size=1, dtype=dtype).to(device)
-        self.frame_ts = torch.tensor([[0]], dtype=torch.long, device=device)
+            # Static input context tensors
+            self._ctx = {
+                "button": torch.zeros((1, 1, self.model_cfg.n_buttons), dtype=dtype),
+                "mouse": torch.zeros((1, 1, 2), dtype=dtype),
+                "scroll": torch.zeros((1, 1, 1), dtype=dtype),
+                "frame_timestamp": torch.empty((1, 1), dtype=torch.long),
+                "frame_idx": torch.empty((1, 1), dtype=torch.long),
+            }
 
-        # Static input context tensors
-        self._ctx = {
-            "button": torch.zeros((1, 1, self.model_cfg.n_buttons), device=device, dtype=dtype),
-            "mouse": torch.zeros((1, 1, 2), device=device, dtype=dtype),
-            "scroll": torch.zeros((1, 1, 1), device=device, dtype=dtype),
-            "frame_timestamp": torch.empty((1, 1), device=device, dtype=torch.long),
-        }
-
-        self._prompt_ctx = {"prompt_emb": None, "prompt_pad_mask": None}
+            self._prompt_ctx = {"prompt_emb": None, "prompt_pad_mask": None}
 
     @torch.inference_mode()
     def reset(self):
@@ -92,6 +113,18 @@ class WorldEngine:
         self.frame_ts.zero_()
         for v in self._ctx.values():
             v.zero_()
+        self.vae.reset()
+
+    @torch.inference_mode()
+    def get_state(self):
+        """Captures a world state to continue via load_state. Doesn't save model"""
+        return {"kv_cache": self.kv_cache.get_state(), "frame_ts": self.frame_ts.detach().clone()}
+
+    @torch.inference_mode()
+    def load_state(self, state):
+        """Loads a world state object saved via save_state. Doesn't load or change model"""
+        self.kv_cache.load_state(state["kv_cache"])
+        self.frame_ts.copy_(state["frame_ts"])
 
     def set_prompt(self, prompt: str):
         """Apply text conditioning for T2V"""
@@ -117,22 +150,25 @@ class WorldEngine:
 
     @torch.compile
     def _prep_inputs(self, x, ctrl=None):
+        self._ctx["button"].zero_()
+        self._ctx["button"][..., ctrl.button] = 1.0
+
         self._ctx["mouse"][0, 0, 0] = ctrl.mouse[0]
         self._ctx["mouse"][0, 0, 1] = ctrl.mouse[1]
+
         self._ctx["scroll"][0, 0, 0] = ctrl.scroll_wheel
 
-        self._ctx["frame_timestamp"].copy_(self.frame_ts)
+        self._ctx["frame_idx"].copy_(self.frame_ts)
+        self._ctx["frame_timestamp"].copy_(self.frame_ts).mul_(self.ts_mult)
         self.frame_ts.add_(1)
 
         return self._ctx
 
     def prep_inputs(self, x, ctrl=None):
         ctrl = ctrl if ctrl is not None else CtrlInput()
-        self._ctx["button"].zero_()
-        if ctrl.button:
-            self._ctx["button"][..., list(ctrl.button)] = 1.0
-        ctrl.mouse = torch.tensor(ctrl.mouse, device=x.device, dtype=self._ctx["mouse"].dtype)
-        ctrl.scroll_wheel = torch.sign(torch.tensor(ctrl.scroll_wheel, device=x.device, dtype=self._ctx["scroll"].dtype))
+        ctrl.button = torch.as_tensor(list(ctrl.button), dtype=torch.int64).to(x.device, non_blocking=True)
+        ctrl.mouse = torch.as_tensor(ctrl.mouse).to(x.device, non_blocking=True)
+        ctrl.scroll_wheel = torch.as_tensor(ctrl.scroll_wheel).to(x.device, non_blocking=True)
         ctx = self._prep_inputs(x, ctrl)
 
         # prepare prompt conditioning
@@ -142,16 +178,17 @@ class WorldEngine:
             self.set_prompt("An explorable world")
         return {**ctx, **self._prompt_ctx}
 
-    @torch.compile(fullgraph=True, mode="max-autotune", dynamic=False)
+    @torch.compile(fullgraph=True, dynamic=False, options=COMPILE_OPTIONS)
     def _denoise_pass(self, x, ctx: Dict[str, Tensor], kv_cache):
+        """Run Deterministic Euler ODE Solver"""
         kv_cache.set_frozen(True)
         sigma = x.new_empty((x.size(0), x.size(1)))
         for step_sig, step_dsig in zip(self.scheduler_sigmas, self.scheduler_sigmas.diff()):
             v = self.model(x, sigma.fill_(step_sig), **ctx, kv_cache=kv_cache)
-            x = x + step_dsig * v
+            x = (x.float() + step_dsig.float() * v.float()).type_as(x)
         return x
 
-    @torch.compile(fullgraph=True, mode="max-autotune", dynamic=False)
+    @torch.compile(fullgraph=True, dynamic=False, options=COMPILE_OPTIONS)
     def _cache_pass(self, x, ctx: Dict[str, Tensor], kv_cache):
         """Side effect: updates kv cache"""
         kv_cache.set_frozen(False)

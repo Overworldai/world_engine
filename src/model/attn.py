@@ -4,67 +4,65 @@ from torch import nn
 
 from torch.nn.attention.flex_attention import flex_attention
 
-from rotary_embedding_torch import RotaryEmbedding
-
 from .nn import rms_norm, NoCastModule
 
 
-class RoPE(NoCastModule):
+class OrthoRoPEAngles(NoCastModule):
+    """Functions as a on the fly RoPE angle computer called every fwd pass. Should be setup
+    as a module under WordDiT, then each forward pass it computes a shared tuple of (rope_cos, rope_sin)
+    tensors that get passed to every block for their underlying RoPE computations."""
     def __init__(self, config):
         super().__init__()
         self.config = config
-        assert not getattr(self.config, "has_audio", False)
 
-        freqs = self.get_freqs(config)
-        self.cos = nn.Buffer(freqs.cos().contiguous(), persistent=False)
-        self.sin = nn.Buffer(freqs.sin().contiguous(), persistent=False)
+        d_head = config.d_model // config.n_heads
+        torch._assert(d_head % 8 == 0, "d_head must be divisible by 8")
+        d_xy, d_t = d_head // 8, d_head // 4
 
-    def get_angles(self, pos_ids):
-        t, y, x = pos_ids["t_pos"], pos_ids["y_pos"], pos_ids["x_pos"]  # [B,T]
-        H, W = self.config.height, self.config.width
-        if not torch.compiler.is_compiling():
-            torch._assert((y.max() < H) & (x.max() < W), f"pos_ids out of bounds, {y.max()}, {x.max()}")
-        flat = t * (H * W) + y * W + x                         # [B,T]
-        idx = flat.reshape(-1).to(torch.long)
-        cos = self.cos.index_select(0, idx).view(*flat.shape, -1)
-        sin = self.sin.index_select(0, idx).view(*flat.shape, -1)
-        return cos[:, None], sin[:, None]  # add head dim for broadcast
+        nyq = float(config.rope_nyquist_frac)
+        max_freq = min(self.config.height, self.config.width) * nyq
+        n = (d_xy + 1) // 2
+        xy = (torch.linspace(1.0, max_freq / 2, n, dtype=torch.float32) * torch.pi).repeat_interleave(2)[:d_xy]
+
+        theta = float(config.rope_theta)
+        inv_t = 1.0 / (theta ** (torch.arange(0, d_t, 2, dtype=torch.float32) / d_t))
+        inv_t = inv_t.repeat_interleave(2)  # [d_t]
+
+        self.register_buffer("xy", xy, persistent=False)        # [d_xy]
+        self.register_buffer("inv_t", inv_t, persistent=False)  # [d_t]
 
     @torch.autocast("cuda", enabled=False)
-    def forward(self, x, pos_ids):
-        assert self.cos.dtype == self.sin.dtype == torch.float32
-        cos, sin = self.get_angles(pos_ids)
+    def forward(self, pos_ids):
+        if not torch.compiler.is_compiling():
+            torch._assert(
+                (pos_ids["y_pos"].max() < self.config.height) & (pos_ids["x_pos"].max() < self.config.width),
+                f"pos_ids out of bounds, {self.config.height}, {self.config.width}"
+            )
+
+        x = (2.0 * pos_ids["x_pos"].float() + 1.0) / self.config.width - 1.0
+        y = (2.0 * pos_ids["y_pos"].float() + 1.0) / self.config.height - 1.0
+        t = pos_ids["t_pos"].float()
+
+        freqs = torch.cat(
+            (x.unsqueeze(-1) * self.xy, y.unsqueeze(-1) * self.xy, t.unsqueeze(-1) * self.inv_t),
+            dim=-1,  # [B,T,d_head//2]
+        )
+        # Returns rope_cos, rope_sin angles of shape [B, 1, T, D/2]
+        return freqs.cos()[:, None], freqs.sin()[:, None]
+
+
+class OrthoRoPE(NoCastModule):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+    @torch.autocast("cuda", enabled=False)
+    def forward(self, x, rope_angles):
+        cos, sin = rope_angles
         x0, x1 = x.float().unfold(-1, 2, 2).unbind(-1)
         y0 = x0 * cos - x1 * sin
         y1 = x1 * cos + x0 * sin
         return torch.cat((y0, y1), dim=-1).type_as(x)
-
-    def get_freqs(self, config):
-        raise NotImplementedError
-
-
-class OrthoRoPE(RoPE):
-    """
-    RoPE for rotation across orthogonal axes: time, height, and width
-    Time: Geometric Spectrum -- rotates 1/2 of head dim
-    Height / Width: Linear Spectrum -- rotates 1/4th of head dim each (1/2 combined)
-    """
-    def get_freqs(self, config):
-        H, W, T = config.height, config.width, config.n_frames
-        head_dim = config.d_model // config.n_heads
-
-        max_freq = min(H, W) * 0.8  # stay below nyquist
-        rope_xy = RotaryEmbedding(dim=head_dim // 8, freqs_for='pixel', max_freq=max_freq)
-        freqs_x = rope_xy(torch.linspace(-1 + 1 / W, 1 - 1 / W, W))[None, :, :]   # [1,W,D]
-        freqs_y = rope_xy(torch.linspace(-1 + 1 / H, 1 - 1 / H, H))[:, None, :]   # [H,1,D]
-
-        freq_t = RotaryEmbedding(dim=head_dim // 4, freqs_for='lang').forward(torch.arange(T))
-
-        return torch.cat([
-            eo.repeat(freqs_x.expand(H, W, -1), 'h w d -> (t h w) d', t=T),   # X
-            eo.repeat(freqs_y.expand(H, W, -1), 'h w d -> (t h w) d', t=T),   # Y
-            eo.repeat(freq_t, 't d -> (t h w) d', h=H, w=W)     # T
-        ], dim=-1)
 
 
 class Attn(nn.Module):
@@ -72,13 +70,13 @@ class Attn(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
+        self.value_residual = config.value_residual
 
-        self.value_residual = getattr(config, "value_residual", False)
         if self.value_residual:
             self.v_lamb = nn.Parameter(torch.tensor(0.5))
 
         self.n_heads = config.n_heads
-        self.n_kv_heads = getattr(config, "n_kv_heads", config.n_heads)
+        self.n_kv_heads = config.n_kv_heads
         self.d_head = config.d_model // self.n_heads
         assert config.d_model % self.n_heads == 0
 
@@ -91,12 +89,12 @@ class Attn(nn.Module):
 
         self.rope = OrthoRoPE(config)
 
-        self.gated_attn = getattr(config, "gated_attn", False)
+        self.gated_attn = config.gated_attn
         if self.gated_attn:
             self.gate_proj = nn.Linear(self.n_heads, self.n_heads, bias=False)  # sparse attn gate
             nn.init.zeros_(self.gate_proj.weight)
 
-    def forward(self, x, pos_ids, v1, kv_cache):
+    def forward(self, x, pos_ids, rope_angles, v1, kv_cache):
         # Q, K, V proj -> QK-norm -> RoPE
         q = eo.rearrange(self.q_proj(x), "b t (h d) -> b h t d", h=self.n_heads, d=self.d_head)
         k = eo.rearrange(self.k_proj(x), "b t (h d) -> b h t d", h=self.n_kv_heads, d=self.d_head)
@@ -107,7 +105,7 @@ class Attn(nn.Module):
             v = torch.lerp(v, v1.view_as(v), self.v_lamb)
 
         q, k = rms_norm(q), rms_norm(k)
-        q, k = self.rope(q, pos_ids), self.rope(k, pos_ids)
+        q, k = self.rope(q, rope_angles), self.rope(k, rope_angles)
 
         # Update KV-cache in-place
         k, v, bm = kv_cache.upsert(k, v, pos_ids, self.layer_idx)

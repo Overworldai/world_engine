@@ -113,7 +113,7 @@ class MergedQKVAttn(Attn):
 
         del self.q_proj, self.k_proj, self.v_proj
 
-    def forward(self, x, pos_ids, v1, kv_cache):
+    def forward(self, x, pos_ids, rope_angles, v1, kv_cache):
         q, k, v = self.qkv_proj(x).split((self.q_out, self.kv_out, self.kv_out), dim=-1)
 
         B, T = x.shape[:2]
@@ -126,7 +126,7 @@ class MergedQKVAttn(Attn):
             v = torch.lerp(v, v1.view_as(v), self.v_lamb)
 
         q, k = rms_norm(q), rms_norm(k)
-        q, k = self.rope(q, pos_ids), self.rope(k, pos_ids)
+        q, k = self.rope(q, rope_angles), self.rope(k, rope_angles)
 
         k, v, bm = kv_cache.upsert(k, v, pos_ids, self.layer_idx)
 

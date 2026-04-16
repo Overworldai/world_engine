@@ -13,52 +13,46 @@ def make_block_mask(T: int, L: int, written: torch.Tensor) -> BlockMask:
     """
     T: Q length for this frame
     L: KV capacity == written.numel()
-    written: [L] bool, True where there is valid KV data
+    written: [L] bool, True where there is valid KV data.
+    T and L must be exact multiples of the sparse block size; `written` must be
+    block-aligned, i.e. each block is either all True or all False.
     """
     BS = _DEFAULT_SPARSE_BLOCK_SIZE
-    KV_blocks = (L + BS - 1) // BS
-    Q_blocks = (T + BS - 1) // BS
+
+    if not torch.compiler.is_compiling():
+        torch._check(T % BS == 0, f"T ({T}) must be a multiple of block size ({BS})")
+        torch._check(L % BS == 0, f"L ({L}) must be a multiple of block size ({BS})")
+
+    Q_blocks = T // BS
+    KV_blocks = L // BS
 
     # [KV_blocks, BS]
-    written_blocks = torch.nn.functional.pad(written, (0, KV_blocks * BS - L)).view(KV_blocks, BS)
+    written_blocks = written.view(KV_blocks, BS)
 
-    # Block-level occupancy
-    block_any = written_blocks.any(-1)    # block has at least one written token
-    block_all = written_blocks.all(-1)    # block is fully written
+    # For a valid block-aligned mask, each block is either all written or all empty.
+    block_any = written_blocks.any(-1)
+    if not torch.compiler.is_compiling():
+        assert torch.equal(block_any, written_blocks.all(-1)), "written must be block-aligned"
 
-    # Every Q-block sees the same KV-block pattern
-    nonzero_bm = block_any[None, :].expand(Q_blocks, KV_blocks)       # [Q_blocks, KV_blocks]
-    full_bm = block_all[None, :].expand_as(nonzero_bm)                # [Q_blocks, KV_blocks]
-    partial_bm = nonzero_bm & ~full_bm                                # [Q_blocks, KV_blocks]
+    # Every KV block is a full block
+    full_bm = block_any[None, :].expand(Q_blocks, KV_blocks)
+    full_kv_num_blocks = full_bm.sum(dim=-1, dtype=torch.int32)[None, None].contiguous()
+    full_kv_indices = full_bm.argsort(dim=-1, descending=True, stable=True).to(torch.int32)[None, None].contiguous()
 
-    def dense_to_ordered(dense_mask: torch.Tensor):
-        # dense_mask: [Q_blocks, KV_blocks] bool
-        # returns: [1,1,Q_blocks], [1,1,Q_blocks,KV_blocks]
-        num_blocks = dense_mask.sum(dim=-1, dtype=torch.int32)        # [Q_blocks]
-        indices = dense_mask.argsort(dim=-1, descending=True, stable=True).to(torch.int32)
-        return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
+    # No partial blocks at all.
+    kv_num_blocks = torch.zeros((1, 1, Q_blocks), dtype=torch.int32, device=written.device)
+    kv_indices = torch.zeros((1, 1, Q_blocks, KV_blocks), dtype=torch.int32, device=written.device)
 
-    # Partial blocks (need mask_mod)
-    kv_num_blocks, kv_indices = dense_to_ordered(partial_bm)
-
-    # Full blocks (mask_mod can be skipped entirely)
-    full_kv_num_blocks, full_kv_indices = dense_to_ordered(full_bm)
-
-    def mask_mod(b, h, q, kv):
-        return written[kv]
-
-    bm = BlockMask.from_kv_blocks(
+    return BlockMask.from_kv_blocks(
         kv_num_blocks,
         kv_indices,
         full_kv_num_blocks,
         full_kv_indices,
         BLOCK_SIZE=BS,
-        mask_mod=mask_mod,
+        mask_mod=None,
         seq_lengths=(T, L),
-        compute_q_blocks=False,  # no backward, avoids the transpose/_ordered_to_dense path
+        compute_q_blocks=False,
     )
-
-    return bm
 
 
 class LayerKVCache(nn.Module):
@@ -107,26 +101,21 @@ class LayerKVCache(nn.Module):
         t_pos: [B, T], all equal per frame (ignoring -1)
         """
         T = self.tpf
-        t_pos = pos_ids["t_pos"]
+        f_pos = pos_ids["f_pos"]
 
         if not torch.compiler.is_compiling():
             torch._check(kv.size(3) == self.tpf, "KV cache expects exactly one frame per upsert")
-            torch._check(t_pos.shape == (kv.size(1), T), "t_pos must be [B, T]")
+            torch._check(f_pos.shape == (kv.size(1), T), "t_pos must be [B, T]")
             torch._check(self.tpf <= self.L, "frame longer than KV ring capacity")
-            torch._check(self.L % self.tpf == 0,
-                         f"L ({self.L}) must be a multiple of tokens_per_frame ({self.tpf})")
-            torch._check(self.kv.size(3) == self.capacity,
-                         "KV buffer has unexpected length (expected L + tokens_per_frame)")
-            torch._check(
-                (t_pos >= 0).all().item(),
-                "t_pos must be non-negative during inference",
-            )
-            torch._check(((t_pos == t_pos[:, :1]).all()).item(), "t_pos must be constant within frame")
+            torch._check(self.L % self.tpf == 0, f"L ({self.L}) must be a multiple of tokens_per_frame ({self.tpf})")
+            torch._check(self.kv.size(3) == self.capacity, "KV buffer too long (expected L + tokens_per_frame)")
+            torch._check((f_pos >= 0).all().item(), "t_pos must be non-negative during inference")
+            torch._check(((f_pos == f_pos[:, :1]).all()).item(), "t_pos must be constant within frame")
 
-        frame_t = t_pos[0, 0]
+        frame_idx = f_pos[0, 0]
 
         # map frame_t to a bucket, each bucket owns T contiguous slots
-        bucket = (frame_t + (self.pinned_dilation - 1)) // self.pinned_dilation
+        bucket = (frame_idx + (self.pinned_dilation - 1)) // self.pinned_dilation
         slot = bucket % self.num_buckets
         base = slot * T
 
@@ -137,7 +126,7 @@ class LayerKVCache(nn.Module):
         # this is the "self-attention component" for the current frame.
         self.kv.index_copy_(3, self.current_idx, kv)
 
-        write_step = (frame_t.remainder(self.pinned_dilation) == 0)
+        write_step = (frame_idx.remainder(self.pinned_dilation) == 0)
         mask_written = self._mask_written
         mask_written.copy_(self.written)
         mask_written[ring_idx] = mask_written[ring_idx] & ~write_step
@@ -158,17 +147,17 @@ class StaticKVCache(nn.Module):
     def __init__(self, config, batch_size, dtype):
         super().__init__()
 
-        self.tpf = config.tokens_per_frame
+        self.tpf = config.height * config.width
 
         local_L = config.local_window * self.tpf
         global_L = config.global_window * self.tpf
 
         period = config.global_attn_period
-        off = getattr(config, "global_attn_offset", 0) % period
+        off = config.global_attn_offset % period
         self.layers = nn.ModuleList([
             LayerKVCache(
                 batch_size,
-                getattr(config, "n_kv_heads", config.n_heads),
+                config.n_kv_heads,
                 global_L if ((layer_idx - off) % period == 0) else local_L,
                 config.d_model // config.n_heads,
                 dtype,
@@ -184,6 +173,18 @@ class StaticKVCache(nn.Module):
         for layer in self.layers:
             layer.reset()
         self._is_frozen = True
+
+    @torch.inference_mode()
+    def get_state(self):
+        layers = [(layer.kv.detach().clone(), layer.written.detach().clone()) for layer in self.layers]
+        return {"_is_frozen": self._is_frozen, "layers": layers}
+
+    @torch.inference_mode()
+    def load_state(self, state):
+        self._is_frozen = bool(state.get("_is_frozen", True))
+        for layer, (kv, written) in zip(self.layers, state["layers"]):
+            layer.kv.copy_(kv)
+            layer.written.copy_(written)
 
     def set_frozen(self, is_frozen: bool):
         self._is_frozen = is_frozen

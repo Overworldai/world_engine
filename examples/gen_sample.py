@@ -1,22 +1,52 @@
+# uv run --dev examples/gen_sample.py Overworld/Waypoint-1.5-1B
+
 import cv2
-from world_engine import WorldEngine
+import imageio.v3 as iio
+import random
+import sys
+import urllib.request
+import json
+import numpy as np
+import torch
+
+from world_engine import WorldEngine, CtrlInput
 
 
-def gen_vid():
-    engine = WorldEngine("Overworld/Waypoint-1-Small", device="cuda")
-    writer = None
-    for _ in range(8):
-        frame = engine.gen_frame().cpu().numpy()[:, :, ::-1]  # RGB -> BGR for OpenCV
-        writer = writer or cv2.VideoWriter(
-            "out.mp4",
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            60,
-            (frame.shape[1], frame.shape[0])
-        )
-        writer.write(frame)
-
-    writer.release()
+# Create inference engine
+engine = WorldEngine(sys.argv[1], quant=None, device="cuda")
 
 
-if __name__ == "__main__":
-    gen_vid()
+# Define sequence of controller inputs applied
+controller_sequence = [
+    # move mouse, jump, do nothing, trigger, do nothing, trigger+jump, do nothing
+    CtrlInput(mouse=[0.2, 0.2]), CtrlInput(button={32}), CtrlInput(), CtrlInput(), CtrlInput(),
+    CtrlInput(button={1}), CtrlInput(), CtrlInput(), CtrlInput(button={1, 32}),
+    CtrlInput(), CtrlInput(), CtrlInput(), CtrlInput(), CtrlInput(), CtrlInput(),
+] * 4
+controller_sequence += [CtrlInput()] * 8
+controller_sequence += (
+    [CtrlInput(button={32})] * 10 +  # forward
+    [CtrlInput(button={65})] * 10 +  # left
+    [CtrlInput(button={68})] * 10 +  # right
+    [CtrlInput(button={83})] * 10   # backwards
+)
+controller_sequence += [CtrlInput()] * 10
+
+
+# Set seed frame
+with urllib.request.urlopen("https://api.github.com/repos/Overworldai/Biome/contents/seeds?ref=14343a6") as res:
+    urls = [item["download_url"] for item in json.load(res) if item["type"] == "file"]
+url = random.choice(urls)
+
+seed_frame = cv2.imdecode(np.frombuffer(urllib.request.urlopen(url).read(), np.uint8), cv2.IMREAD_COLOR)
+seed_frame = cv2.resize(seed_frame, (1280, 720))
+seed_frame_x4 = torch.from_numpy(np.repeat(seed_frame[None], 4, axis=0))
+
+
+# Generate frames conditioned on controller inputs
+with iio.imopen("out.mp4", "w", plugin="pyav") as out:
+    engine.append_frame(seed_frame_x4)
+    out.write(seed_frame_x4, fps=60, codec="libx264")
+    for ctrl in controller_sequence:
+        four_frames = engine.gen_frame(ctrl=ctrl).cpu().numpy()
+        out.write(four_frames)
