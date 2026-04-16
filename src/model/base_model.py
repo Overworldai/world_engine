@@ -33,7 +33,10 @@ class BaseModel(nn.Module):
         dtype = torch.get_default_dtype() if dtype is None else dtype
 
         try:
-            path = huggingface_hub.snapshot_download(path)
+            path = huggingface_hub.snapshot_download(
+                    path,
+                    allow_patterns=["config.yaml", "model.safetensors"],
+                )
         except Exception:
             pass
 
