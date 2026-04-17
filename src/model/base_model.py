@@ -34,9 +34,12 @@ class BaseModel(nn.Module):
 
         try:
             path = huggingface_hub.snapshot_download(
-                    path,
-                    allow_patterns=["config.yaml", "model.safetensors"],
-                )
+                path,
+                allow_patterns=[
+                    "config.yaml",
+                    "model.safetensors",
+                ],
+            )
         except Exception:
             pass
 
