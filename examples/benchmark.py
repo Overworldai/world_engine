@@ -1,12 +1,14 @@
+# MODEL_URI="Overworld/Waypoint-1.5-1B" uv run --dev pytest examples/benchmark.py
+
+import os
 import pytest
 import torch
+import random
 
-from world_engine import WorldEngine
+from world_engine import WorldEngine, CtrlInput
 
 
-# TODO
-# - benchmark encode img
-# - benchmark encode prompt
+MODEL_URI = os.environ.get("MODEL_URI", "Overworld/Waypoint-1-Small")
 
 
 def version_with_commit(pkg):
@@ -49,11 +51,12 @@ def print_env_info():
 
 
 def get_warm_engine(model_uri, model_overrides=None):
-    model_config_overrides = {"ae_uri": "OpenWorldLabs/owl_vae_f16_c16_distill_v0_nogan"}
+    model_config_overrides = {}
     model_config_overrides.update(model_overrides or {})
     engine = WorldEngine(
         model_uri,
         model_config_overrides=model_config_overrides,
+        quant="intw8a8",
         device="cuda",
         load_weights=False
     )
@@ -65,8 +68,8 @@ def get_warm_engine(model_uri, model_overrides=None):
 
 
 @pytest.fixture(scope="session")
-def engine(model_uri="Overworld/Waypoint-1-Small"):
-    return get_warm_engine(model_uri)
+def engine():
+    return get_warm_engine(MODEL_URI)
 
 
 @pytest.fixture(scope="session")
@@ -86,14 +89,22 @@ def test_img_decoder_only(benchmark, engine, last_latent):
 MODEL_OVERRIDES = [None]
 
 
+@pytest.mark.parametrize("blocking", [True, False])
 @pytest.mark.parametrize("dit_only", [True])
 @pytest.mark.parametrize("n_frames", [256])
 @pytest.mark.parametrize(
     "model_overrides", MODEL_OVERRIDES,
     ids=lambda d: (",".join(f"{k}={v}" for k, v in d.items()) or "") if d else ""
 )
-def test_ar_rollout(benchmark, dit_only, n_frames, model_overrides):
-    engine = get_warm_engine("Overworld/Waypoint-1-Small", model_overrides=model_overrides)
+def test_ar_rollout(benchmark, dit_only, n_frames, model_overrides, blocking):
+    engine = get_warm_engine(MODEL_URI, model_overrides=model_overrides)
+
+    try:
+        total_params = sum(p.numel() for p in engine.model.parameters())
+        active_params = int(engine.model.get_active_parameters())
+        benchmark.name = f"{benchmark.name} | params={total_params:,} | active={active_params:,}"
+    except Exception:
+        pass
 
     def setup():
         engine.reset()
@@ -101,8 +112,17 @@ def test_ar_rollout(benchmark, dit_only, n_frames, model_overrides):
         torch.cuda.synchronize()
 
     def target():
-        for _ in range(n_frames):
+        ctrls = [
+            CtrlInput(
+                button=set(random.sample(range(1, 65), random.randint(0, 10))),
+                mouse=(random.random(), random.random()),
+                scroll_wheel=random.choice((-1, 0, 1))
+            )
+            for _ in range(n_frames)
+        ]
+        for ctrl in ctrls:
             engine.gen_frame(return_img=not dit_only)
-        torch.cuda.synchronize()
+        if blocking:
+            torch.cuda.synchronize()
 
     benchmark.pedantic(target, setup=setup, rounds=20)

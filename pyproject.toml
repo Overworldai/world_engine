@@ -7,26 +7,20 @@ name = "world_engine"
 version = "1.5.0"
 requires-python = ">=3.10"
 dependencies = [
-  "taehv @ git+https://github.com/madebyollin/taehv.git@7dc60ec6601af2e668e31bc70acc4cb3665e4c22",
+  "taehv @ https://github.com/madebyollin/taehv/archive/7dc60ec6601af2e668e31bc70acc4cb3665e4c22.zip",
   "torch==2.10.0",
-  "torchvision==0.25.0",
-  "torchaudio==2.10.0",
-  "fbgemm-gpu-genai==1.5.0; sys_platform == 'linux'",
   "einops",
-  "rotary-embedding-torch>=0.8.8",
   "tensordict==0.10.0",
-  "transformers==4.57.3",
+  "transformers>=5.3.0",
   "ftfy",
   "diffusers",
-  "huggingface-hub==0.36.0",
+  "huggingface-hub>=1.7.0",
   "omegaconf",
   "accelerate==1.12.0",
-
   # Triton (platform-specific)
   "triton==3.6.0; sys_platform == 'linux'",
-  # TODO: move back to mainline triton-windows once long-path fix is merged
-  # (see https://github.com/triton-lang/triton-windows/pull/11#issuecomment-4014081904)
-  "triton-windows @ https://github.com/Overworldai/triton-windows/releases/download/v3.6.0-windows-longpath/triton_windows-3.6.0+git7df5604d-cp313-cp313-win_amd64.whl ; sys_platform == 'win32'",
+  "triton-windows==3.6.0.post26; sys_platform == 'win32'",
+  "gemlite @ https://github.com/dropbox/gemlite/archive/ebfcc197d694acd4ca8dfaadf5fceb3570401df3.zip",
 ]
 
 [tool.setuptools]
@@ -37,3 +31,12 @@ packages = [
 
 [tool.setuptools.package-dir]
 world_engine = "src"
+
+[dependency-groups]
+dev = [
+  "pytest",
+  "pytest-benchmark",
+  "opencv-python",
+  "imageio[pyav]",
+  "numpy",
+]

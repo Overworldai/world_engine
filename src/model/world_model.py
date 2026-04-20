@@ -10,15 +10,6 @@ from torch import nn
 import torch.nn.functional as F
 
 
-#try:
-#    from fbgemm_gpu.experimental.gen_ai.moe import index_shuffling
-#    import fbgemm_gpu.experimental.gen_ai.moe.gather_scatter  # noqa
-#    HAS_FBGEMM = True
-#except ImportError:
-#    HAS_FBGEMM = False
-#from sgl_kernel import topk_softmax
-
-
 from .attn import Attn, CrossAttention, OrthoRoPEAngles
 from .nn import AdaLN, ada_gate, ada_rmsnorm, NoiseConditioner
 from .base_model import BaseModel
@@ -543,7 +534,7 @@ class WorldModel(BaseModel):
         return total
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
-        if getattr(self.config, "model_type", "waypoint-1") != "waypoint-1.5":
+        if self.config.model_type != "waypoint-1.5":
             return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
         state_dict = dict(state_dict)
@@ -594,23 +585,3 @@ class WorldModel(BaseModel):
         state_dict = {k: v for k, v in state_dict.items() if ".cond_heads." not in k}
 
         return super().load_state_dict(state_dict, strict=strict, assign=assign)
-
-
-"""
-TODO: use the below for quantization
-import torch.nn as nn
-
-
-class BufferLinear(nn.Linear):
-    capture = True
-
-    def _load_from_state_dict(self, sd, prefix, *args):
-        if self.capture:
-            keep = {prefix + "weight", prefix + "bias"}
-            for k in list(sd):
-                if k.startswith(prefix) and k not in keep and "." not in k[len(prefix):]:
-                    n = k[len(prefix):]
-                    self.register_buffer(n, sd.pop(k).to(self.weight.device),
-                                         persistent=False)
-        super()._load_from_state_dict(sd, prefix, *args)
-"""
