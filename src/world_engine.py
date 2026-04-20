@@ -141,7 +141,7 @@ class WorldEngine:
         x0 = self.vae.encode(img).unsqueeze(1)
         inputs = self.prep_inputs(x=x0, ctrl=ctrl)
         self._cache_pass(x0, inputs, self.kv_cache)
-        return img
+        return self.vae.decode(x0.squeeze(1))
 
     @torch.inference_mode()
     def gen_frame(self, ctrl: CtrlInput = None, return_img: bool = True):
