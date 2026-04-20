@@ -9,6 +9,12 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+try:
+    from flashinfer.fused_moe import cutlass_fused_moe, ActivationType
+    FLASHINFER_AVAILABLE = True
+except ImportError:
+    FLASHINFER_AVAILABLE = False
+
 
 from .attn import Attn, CrossAttention, OrthoRoPEAngles
 from .nn import AdaLN, ada_gate, ada_rmsnorm, NoiseConditioner
@@ -80,7 +86,7 @@ class CFG(nn.Module):
         return x if is_conditioned else null
 
 
-class MoEWithoutFBGEMM(nn.Module):
+class PureTorchMoE(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -127,104 +133,6 @@ class MoEWithoutFBGEMM(nn.Module):
         return (y * weights.unsqueeze(-1)).sum(dim=1).reshape(orig_shape)
 
 
-class MoEFB(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.top_k = config.moe_top_k
-        dense_hidden = config.d_model * config.mlp_ratio
-        assert dense_hidden == int(dense_hidden) and dense_hidden % self.top_k == 0
-        d_int = int(dense_hidden) // self.top_k
-
-        self.router = nn.Linear(config.d_model, config.moe_n_experts, bias=False)
-        self.expert_in_proj = nn.Parameter(
-            torch.empty(config.moe_n_experts, d_int, config.d_model)
-        )  # (E, N, K) for grouped_mm
-        self.expert_out_proj = nn.Parameter(torch.empty(config.moe_n_experts, config.d_model, d_int))  # (E, N, K)
-
-    def forward(self, x: torch.Tensor, gate: torch.Tensor | None = None) -> torch.Tensor:
-        if self.training or torch.is_grad_enabled():
-            raise NotImplementedError("inference only")
-
-        orig = x.shape
-        x = x.reshape(-1, orig[-1])
-        logits = self.router(x) if gate is None else gate.reshape(-1, gate.size(-1))
-
-        logits32 = logits.float()
-        topk_logits = logits32.topk(self.top_k, dim=-1).values
-        token_counts, expert_sorted, src = index_shuffling(logits32, top_k=self.top_k)
-
-        E = self.expert_in_proj.size(0)
-        offs = token_counts[:E].cumsum(0).to(torch.int32)
-
-        src = src.to(torch.long)
-        expert_sorted = expert_sorted.to(torch.long)
-        topk_logZ = topk_logits.logsumexp(-1)
-        w = (logits32[src, expert_sorted] - topk_logZ[src]).exp().to(x.dtype)  # [T*K]
-
-        xg = x.index_select(0, torch.cat((src, src[:1]), 0))  # pad by 1 for grouped_mm offs constraint
-        h = F.grouped_mm(xg, self.expert_in_proj.transpose(-2, -1), offs=offs)
-
-        h = F.silu(h)
-
-        yg = F.grouped_mm(h, self.expert_out_proj.transpose(-2, -1), offs=offs)[:-1]
-        contrib = (yg * w.unsqueeze(-1)).contiguous()
-        out = torch.index_add(torch.zeros_like(x), 0, src, contrib)
-        return out.reshape(orig)
-
-
-class MoEBaseline(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.top_k = config.moe_top_k
-        dense_hidden = config.d_model * config.mlp_ratio
-        assert dense_hidden == int(dense_hidden) and dense_hidden % self.top_k == 0
-        d_int = int(dense_hidden) // self.top_k
-
-        self.router = nn.Linear(config.d_model, config.moe_n_experts, bias=False)
-        self.expert_in_proj = nn.Parameter(
-            torch.empty(config.moe_n_experts, d_int, config.d_model)
-        )  # (E, N, K) for grouped_mm
-        self.expert_out_proj = nn.Parameter(torch.empty(config.moe_n_experts, config.d_model, d_int))  # (E, N, K)
-
-    def forward(self, x: torch.Tensor, gate: torch.Tensor | None = None) -> torch.Tensor:
-        if self.training or torch.is_grad_enabled():
-            raise NotImplementedError("inference only")
-
-        orig = x.shape
-        x = x.reshape(-1, orig[-1])
-
-        logits32 = self.router(x).float()
-
-        E = self.expert_in_proj.size(0)
-
-        topk_weights = torch.empty(x.size(0), self.top_k, dtype=torch.float32, device=x.device)
-        topk_ids = torch.empty(x.size(0), self.top_k, dtype=torch.int32, device=x.device)
-        topk_softmax(topk_weights, topk_ids, logits32, True)
-
-        flat_ids = topk_ids.reshape(-1).to(torch.long)
-        perm = flat_ids.argsort()
-        offs = torch.bincount(flat_ids, minlength=E).cumsum(0).to(torch.int32)
-        src = torch.div(perm, self.top_k, rounding_mode="floor")
-        w = topk_weights.reshape(-1).index_select(0, perm).to(x.dtype)
-
-        xg = x.index_select(0, torch.cat((src, src[:1]), 0))  # pad by 1 for grouped_mm offs constraint
-        h = F.grouped_mm(xg, self.expert_in_proj.transpose(-2, -1), offs=offs)
-        h = F.silu(h)
-
-        yg = F.grouped_mm(h, self.expert_out_proj.transpose(-2, -1), offs=offs)[:-1]
-        contrib = (yg * w.unsqueeze(-1)).contiguous()
-        out = torch.index_add(torch.zeros_like(x), 0, src, contrib)
-        return out.reshape(orig)
-
-
-# FLASHINFER MoE
-import torch
-import torch.nn as nn
-from flashinfer.fused_moe import cutlass_fused_moe, ActivationType
-
-
 @torch.library.custom_op("world_engine::flashinfer_moe_silu", mutates_args={"out"})
 def flashinfer_moe_silu(
     x: torch.Tensor,
@@ -249,7 +157,7 @@ def flashinfer_moe_silu(
     )
 
 
-class MoE(nn.Module):
+class FlashInferMoE(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -270,9 +178,6 @@ class MoE(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, gate: torch.Tensor | None = None) -> torch.Tensor:
-        if self.training or torch.is_grad_enabled():
-            raise NotImplementedError("inference only")
-
         orig_shape = x.shape
         x = x.reshape(-1, orig_shape[-1]).contiguous()
 
@@ -291,6 +196,10 @@ class MoE(nn.Module):
             self.tokens_per_frame
         )
         return out.view(orig_shape)
+
+
+def MoE(config):
+    return FlashInferMoE(config) if FLASHINFER_AVAILABLE else PureTorchMoE(config)
 
 
 class MLP(nn.Module):
@@ -359,7 +268,7 @@ class WorldDiTBlock(nn.Module):
         self.config = config
         self.attn = Attn(config, layer_idx)
         if getattr(config, "moe", False):
-            self.mlp = MoE(config)  #if HAS_FBGEMM else MoEWithoutFBGEMM(config)
+            self.mlp = MoE(config)
         else:
             self.mlp = MLP(config.d_model, config.d_model * config.mlp_ratio, config.d_model)
         self.cond_head = CondHead(config)
