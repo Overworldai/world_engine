@@ -56,7 +56,7 @@ def get_warm_engine(model_uri, model_overrides=None):
     engine = WorldEngine(
         model_uri,
         model_config_overrides=model_config_overrides,
-        quant="intw8a8",
+        quant=None,
         device="cuda",
         load_weights=False
     )
