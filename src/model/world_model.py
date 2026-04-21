@@ -9,13 +9,6 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-try:
-    from flashinfer.fused_moe import cutlass_fused_moe, ActivationType
-    FLASHINFER_AVAILABLE = True
-except ImportError:
-    FLASHINFER_AVAILABLE = False
-
-
 from .attn import Attn, CrossAttention, OrthoRoPEAngles
 from .nn import AdaLN, ada_gate, ada_rmsnorm, NoiseConditioner
 from .base_model import BaseModel
@@ -86,7 +79,7 @@ class CFG(nn.Module):
         return x if is_conditioned else null
 
 
-class PureTorchMoE(nn.Module):
+class MoE(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -131,75 +124,6 @@ class PureTorchMoE(nn.Module):
         y_grouped = F.grouped_mm(h, self.expert_out_proj.transpose(-2, -1), offs=offsets)[:-1]
         y = torch.empty_like(y_grouped).index_copy_(0, sort_idx, y_grouped).view(x.size(0), self.top_k, -1)
         return (y * weights.unsqueeze(-1)).sum(dim=1).reshape(orig_shape)
-
-
-@torch.library.custom_op("world_engine::flashinfer_moe_silu", mutates_args={"out"})
-def flashinfer_moe_silu(
-    x: torch.Tensor,
-    expert: torch.Tensor,
-    weights: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    out: torch.Tensor,
-    tune_max_num_tokens: int,
-) -> None:
-    cutlass_fused_moe(
-        input=x,
-        token_selected_experts=expert,
-        token_final_scales=weights,
-        fc1_expert_weights=w1,
-        fc2_expert_weights=w2,
-        output=out,
-        output_dtype=x.dtype,
-        quant_scales=[],
-        tune_max_num_tokens=tune_max_num_tokens,
-        activation_type=ActivationType.Silu,
-    )
-
-
-class FlashInferMoE(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.tokens_per_frame = int(config.tokens_per_frame)
-        self.top_k = config.moe_top_k
-
-        moe_mlp_ratio = getattr(config, "moe_mlp_ratio", None) or (
-            config.mlp_ratio / config.moe_top_k
-        )
-        d_intermediate = int(config.d_model * moe_mlp_ratio)
-
-        self.router = nn.Linear(config.d_model, config.moe_n_experts, bias=False)
-        self.expert_in_proj = nn.Parameter(
-            torch.empty(config.moe_n_experts, d_intermediate, config.d_model)
-        )
-        self.expert_out_proj = nn.Parameter(
-            torch.empty(config.moe_n_experts, config.d_model, d_intermediate)
-        )
-
-    def forward(self, x: torch.Tensor, gate: torch.Tensor | None = None) -> torch.Tensor:
-        orig_shape = x.shape
-        x = x.reshape(-1, orig_shape[-1]).contiguous()
-
-        logits = self.router(x)
-        scores, expert = logits.topk(self.top_k, dim=-1, sorted=False)
-        weights = scores.softmax(dim=-1, dtype=torch.float32)
-
-        out = x.new_empty((x.shape[0], x.shape[1]))
-        flashinfer_moe_silu(
-            x,
-            expert.to(torch.int32).contiguous(),
-            weights.contiguous(),
-            self.expert_in_proj.contiguous(),
-            self.expert_out_proj.contiguous(),
-            out,
-            self.tokens_per_frame
-        )
-        return out.view(orig_shape)
-
-
-def MoE(config):
-    return FlashInferMoE(config) if FLASHINFER_AVAILABLE else PureTorchMoE(config)
 
 
 class MLP(nn.Module):

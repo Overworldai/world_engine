@@ -20,7 +20,6 @@ dependencies = [
   "gemlite @ https://github.com/dropbox/gemlite/archive/ebfcc197d694acd4ca8dfaadf5fceb3570401df3.zip",
 
   # Platform Specific:
-  "flashinfer-python==0.6.8.post1; sys_platform == 'linux'",
   "triton==3.6.0; sys_platform == 'linux'",
   "triton-windows==3.6.0.post26; sys_platform == 'win32'",
 ]
