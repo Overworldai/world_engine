@@ -84,46 +84,43 @@ class MoE(nn.Module):
         super().__init__()
         self.config = config
         self.top_k = config.moe_top_k
-        moe_mlp_ratio = getattr(config, "moe_mlp_ratio", None) or config.mlp_ratio / config.moe_top_k
-        d_intermediate = int(config.d_model * moe_mlp_ratio)
-        self.router = nn.Linear(config.d_model, config.moe_n_experts, bias=False)
-        self.expert_in_proj = nn.Parameter(
-            torch.empty(config.moe_n_experts, d_intermediate, config.d_model)
-        )
-        self.expert_out_proj = nn.Parameter(torch.empty(config.moe_n_experts, config.d_model, d_intermediate))
 
-    def forward(self, x: torch.Tensor, gate: torch.Tensor | None = None) -> torch.Tensor:
-        if self.training or torch.is_grad_enabled():
-            raise NotImplementedError("inference only")
+        d_intermediate = int(config.d_model * config.mlp_ratio / self.top_k)
+        self.router = nn.Linear(config.d_model, config.moe_n_experts, bias=False)
+        self.expert_in = nn.Parameter(torch.empty(config.moe_n_experts, d_intermediate, config.d_model))
+        self.expert_out = nn.Parameter(torch.empty(config.moe_n_experts, config.d_model, d_intermediate))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # grouped_mm requires bf16 inputs and breaks w/ autocast
+        assert x.is_cuda and not torch.is_autocast_enabled(x.device.type)
+        assert x.dtype == self.expert_in.dtype == self.expert_out.dtype == torch.bfloat16
 
         orig_shape = x.shape
         x = x.reshape(-1, orig_shape[-1])
-        logits = self.router(x) if gate is None else gate.reshape(-1, gate.size(-1))
 
-        logits_fp32 = logits.float()
-        scores, expert = logits.topk(self.top_k, dim=-1, sorted=False)
-        weights = (scores.float() - logits_fp32.logsumexp(dim=-1, keepdim=True)).exp().to(x.dtype)
+        # Route tokens to top_k experts and norm weights (must add to 1.0)
+        scores, expert = self.router(x).topk(self.top_k, dim=-1, sorted=False)
+        weights = (scores - scores.logsumexp(-1, True)).exp()
 
-        expert = expert.flatten()
-        expert_sorted, sort_idx = expert.sort()
-        expert_ids = torch.arange(self.expert_in_proj.size(0), device=expert.device, dtype=expert_sorted.dtype)
-        offsets = torch.searchsorted(expert_sorted, expert_ids, right=True).to(torch.int32)
+        # Sort token/expert into expert-major order for grouped_mm
+        expert_sorted, sort_idx = expert.flatten().sort()
+        counts = expert_sorted.new_zeros(self.expert_in.size(0), dtype=torch.int32)
+        counts.scatter_add_(0, expert_sorted, torch.ones_like(expert_sorted, dtype=torch.int32))
+        offsets = torch.cumsum(counts, 0, dtype=torch.int32)
 
-        # (1) Pad the *indices* instead of cat-copying x_grouped
+        # Pack tokens by expert + append one dummy row for grouped_mm.
         src = sort_idx // self.top_k
-        x_grouped = x.index_select(0, torch.cat((src, src[:1]), dim=0))
-        h = F.grouped_mm(
-            x_grouped,
-            self.expert_in_proj.transpose(-2, -1),
-            offs=offsets
-        )
+        x_grouped = F.pad(x.index_select(0, src), (0, 0, 0, 1))
+
+        # Run the expert MLPs as two grouped GEMMs
+        h = F.grouped_mm(x_grouped, self.expert_in.transpose(-2, -1), offs=offsets)
         h[-1].zero_()  # ensure last row initialized
-
         h = F.silu(h)
+        y_grp = F.grouped_mm(h, self.expert_out.transpose(-2, -1), offs=offsets)[:-1]
 
-        y_grouped = F.grouped_mm(h, self.expert_out_proj.transpose(-2, -1), offs=offsets)[:-1]
-        y = torch.empty_like(y_grouped).index_copy_(0, sort_idx, y_grouped).view(x.size(0), self.top_k, -1)
-        return (y * weights.unsqueeze(-1)).sum(dim=1).reshape(orig_shape)
+        # Restore token-major order and combine expert outputs
+        y = torch.empty_like(y_grp).index_copy_(0, sort_idx, y_grp).view(x.size(0), self.top_k, -1)
+        return (y.float() * weights.unsqueeze(-1)).sum(dim=1).type_as(x).reshape(orig_shape)
 
 
 class MLP(nn.Module):
@@ -381,8 +378,7 @@ class WorldModel(BaseModel):
 
         for i in range(self.config.n_layers):
             p = f"transformer.blocks.{i}."
-
-            for name in ("fc1.weight", "fc2.weight"):
+            for name in ("fc1.weight", "fc2.weight", "expert_in", "expert_out", "router.weight"):
                 old = p + "dit_mlp." + name
                 if old in state_dict:
                     state_dict.setdefault(p + "mlp." + name, state_dict.pop(old))
