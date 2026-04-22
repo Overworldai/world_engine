@@ -280,6 +280,7 @@ class QuarkBackend:
             )
         self.model.prepare(fp8=fp8)
         self.gen = GenerateFrame(self.model)
+        self._graph_ready = False
 
         # ── VAE (torch side) ─────────────────────────────────────
         pH, pW = cfg.patch
@@ -305,13 +306,27 @@ class QuarkBackend:
         self.ts_mult = int(self.we_cfg.base_fps // latent_fps)
         self._frame_counter = 0
 
-        # Ctrl staging buffer (host f32 → cast to bf16 on upload).
+        # Stable noise + output buffers for the graph hot path. torch
+        # owns the memory; quark borrows the pointer. Refill noise every
+        # frame via ``torch.randn(out=self._noise_torch)`` so the capture
+        # buffer stays at a fixed address (graph-stable).
+        self._noise_torch = torch.empty(self.frm_shape, device=self.device, dtype=self.dtype)
+        self._noise_qt = _qt_borrow(self._noise_torch)
+        self._latent_out_torch = torch.empty(self.frm_shape, device=self.device, dtype=self.dtype)
+
+        # Stable ctrl device buffer (bf16). Filled in place per frame via
+        # memcpy_htod so the graph captures a fixed pointer.
         if cfg.ctrl_conditioning:
+            from quark.runtime.tensor import QuarkTensor
+
             self._padded_in = self.model.ctrl_emb._padded_in
             self._n_buttons = cfg.n_buttons
             self._ctrl_host = np.zeros((1, self._padded_in), dtype=np.float32)
+            self._ctrl_staged = np.zeros((1, self._padded_in), dtype=np.uint16)
+            self._ctrl_dev = QuarkTensor.zeros(1, self._padded_in, dtype="bf16")
         else:
             self._ctrl_host = None
+            self._ctrl_dev = None
 
     # ── Public API (matches WorldEngine's forwarded methods) ─────
 
@@ -360,19 +375,54 @@ class QuarkBackend:
 
     @torch.inference_mode()
     def gen_frame(self, ctrl=None, return_img: bool = True):
-        """Sample noise on torch (faster RNG), borrow into QuarkTensor,
-        run ``GenerateFrame`` (denoise + commit + ft++), VAE-decode."""
-        x = torch.randn(self.frm_shape, device=self.device, dtype=self.dtype)
-        x_qt = _qt_borrow(x)
+        """Sample noise on torch (faster RNG) into a stable borrowed
+        buffer, run ``GenerateFrame`` (denoise + commit + ft++) via a
+        captured CUDA graph, D2D-copy the latent into a torch buffer
+        for VAE decode.
+
+        First call does the eager warmup + ``gen.graph(...)`` capture
+        dance (see ``scripts/generate.py``): run one frame eagerly so
+        every cached output buffer is allocated, rewind ``frame_t``,
+        capture, rewind again — otherwise cuMemAllocAsync nodes bake
+        into the graph at addresses that desync on replay.
+        """
+        from quark.runtime.cuda import CudaRuntime
+
+        # Refill the stable noise buffer in place. torch.randn on CUDA
+        # is a native kernel (~µs), much faster than QuarkTensor.randn's
+        # scalar-Python-loop RNG — and refilling in place keeps the
+        # borrowed QuarkTensor's pointer graph-stable.
+        torch.randn(self.frm_shape, out=self._noise_torch)
         ctrl_qt = self._encode_ctrl(ctrl)
 
-        # GenerateFrame runs denoise + commit + ft increment. The final
-        # latent is written in place into ``x`` (borrowed), so the torch
-        # side already owns the result.
-        self.gen(x_qt, ctrl_qt)
+        if not self._graph_ready:
+            # Eager warmup — ensures every cached output buffer in the
+            # model tree is already allocated before capture.
+            _ = self.gen(self._noise_qt, ctrl_qt)
+            CudaRuntime.instance().stream_synchronize(0)
+            # Warmup bumped frame_t; rewind to the real value.
+            self.gen.set_frame_t(self._frame_counter)
+            self.gen.graph(self._noise_qt, ctrl_qt)
+            # Capture ran one forward pass → bumped again.
+            self.gen.set_frame_t(self._frame_counter)
+            CudaRuntime.instance().stream_synchronize(0)
+            self._graph_ready = True
+
+        # Replay: D2D-copies inputs into the stable capture buffers,
+        # replays, returns a cloned output QuarkTensor.
+        latent_qt = self.gen(self._noise_qt, ctrl_qt)
         self._frame_counter += 1
 
-        x0 = x.squeeze(1)
+        # QuarkTensor → torch: D2D memcpy into our pre-allocated torch
+        # output buffer. No host round-trip.
+        nbytes = (
+            self._latent_out_torch.numel() * self._latent_out_torch.element_size()
+        )
+        CudaRuntime.instance().memcpy_dtod(
+            self._latent_out_torch.data_ptr(), latent_qt.data_ptr(), nbytes
+        )
+
+        x0 = self._latent_out_torch.squeeze(1)
         return self.vae.decode(x0) if return_img else x0
 
     def get_state(self):
@@ -390,18 +440,19 @@ class QuarkBackend:
     # ── Internals ────────────────────────────────────────────────
 
     def _encode_ctrl(self, ctrl):
-        """Pack a ``CtrlInput`` into the ``[1, padded_in]`` bf16 tensor
-        ``Waypoint15.encode_ctrl`` expects.
+        """Pack a ``CtrlInput`` into the stable ``[1, padded_in]`` bf16
+        device buffer ``Waypoint15.encode_ctrl`` expects.
 
         Layout matches ``ControllerInputEmbedding.forward`` in
         ``world_engine.model.world_model``:
             ``cat((mouse[2], button[n_buttons], scroll[1]), dim=-1)``
-        padded up to ``padded_in``.
+        padded up to ``padded_in``. Writes happen in place on the
+        pre-allocated ``self._ctrl_dev`` so the graph-captured input
+        pointer stays stable across frames.
         """
-        if self._ctrl_host is None:
+        if self._ctrl_dev is None:
             return None
         if ctrl is None:
-            # Import lazily to avoid circular import at module load.
             from ..world_engine import CtrlInput
 
             ctrl = CtrlInput()
@@ -415,8 +466,14 @@ class QuarkBackend:
                 buf[0, 2 + bid] = 1.0
         buf[0, 2 + self._n_buttons] = float(ctrl.scroll_wheel)
 
-        # TODO: allocate ``QuarkTensor`` once and memcpy_htod in place —
-        # ``from_numpy`` allocates a fresh device buffer every frame.
-        from quark.runtime.tensor import QuarkTensor
+        # f32 → bf16: truncate each 32-bit word to its high 16 bits.
+        self._ctrl_staged[:] = (buf.view(np.uint32) >> 16).astype(np.uint16)
 
-        return QuarkTensor.from_numpy(buf, dtype="bf16")
+        from quark.runtime.cuda import CudaRuntime
+
+        CudaRuntime.instance().memcpy_htod(
+            self._ctrl_dev.data_ptr(),
+            self._ctrl_staged.ctypes.data,
+            self._ctrl_staged.nbytes,
+        )
+        return self._ctrl_dev
