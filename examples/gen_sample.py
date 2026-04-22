@@ -1,4 +1,5 @@
 # uv run --dev examples/gen_sample.py Overworld/Waypoint-1.5-1B
+# uv run --dev --with-editable /Users/work/popcorn examples/gen_sample.py Overworld/Waypoint-1.5-1B --quark
 
 import cv2
 import imageio.v3 as iio
@@ -12,8 +13,11 @@ import torch
 from world_engine import WorldEngine, CtrlInput
 
 
+backend = "quark" if "--quark" in sys.argv else "torch"
+argv = [a for a in sys.argv if a != "--quark"]
+
 # Create inference engine
-engine = WorldEngine(sys.argv[1], quant=None, device="cuda")
+engine = WorldEngine(argv[1], quant=None, device="cuda", backend=backend)
 
 
 # Define sequence of controller inputs applied
