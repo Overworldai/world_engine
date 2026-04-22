@@ -41,14 +41,36 @@ class WorldEngine:
         model_config_overrides: Optional[Dict] = None,
         device=None,
         dtype=torch.bfloat16,
-        load_weights: bool = True
+        load_weights: bool = True,
+        backend: str = "torch",
     ):
         """
         model_uri: HF URI or local folder containing model.safetensors and config.yaml
         quant: None | intw8a8 | fp8w8a8 | nvfp4
         model_config_overrides: Dict to override model config values
         - auto_aspect_ratio: set to False to work in ae raw space, otherwise in/out are 720p or 360p
+        backend: "torch" (default) | "quark" — routes DiT inference through the
+            quark stack. The VAE stays on torch either way. backend="quark" does
+            not yet support prompt conditioning — see backends/quark_backend.py.
         """
+        self._delegate = None
+        if backend == "quark":
+            from .backends import QuarkBackend
+
+            self._delegate = QuarkBackend(
+                model_uri,
+                quant=quant,
+                model_config_overrides=model_config_overrides,
+                device=device,
+                dtype=dtype,
+                load_weights=load_weights,
+            )
+            self.device = self._delegate.device
+            self.dtype = self._delegate.dtype
+            return
+        if backend != "torch":
+            raise ValueError(f"backend must be 'torch' or 'quark', got {backend!r}")
+
         self.dtype = torch.get_default_dtype() if dtype is None else dtype
         self.device = torch.device(torch.get_default_device() if device is None else device)
         if self.device.type == "cuda" and self.device.index is None:
@@ -112,6 +134,8 @@ class WorldEngine:
     @torch.inference_mode()
     def reset(self):
         """Reset state for new generation"""
+        if self._delegate is not None:
+            return self._delegate.reset()
         self.kv_cache.reset()
         self.frame_ts.zero_()
         for v in self._ctx.values():
@@ -121,22 +145,30 @@ class WorldEngine:
     @torch.inference_mode()
     def get_state(self):
         """Captures a world state to continue via load_state. Doesn't save model"""
+        if self._delegate is not None:
+            return self._delegate.get_state()
         return {"kv_cache": self.kv_cache.get_state(), "frame_ts": self.frame_ts.detach().clone()}
 
     @torch.inference_mode()
     def load_state(self, state):
         """Loads a world state object saved via save_state. Doesn't load or change model"""
+        if self._delegate is not None:
+            return self._delegate.load_state(state)
         self.kv_cache.load_state(state["kv_cache"])
         self.frame_ts.copy_(state["frame_ts"])
 
     def set_prompt(self, prompt: str):
         """Apply text conditioning for T2V"""
+        if self._delegate is not None:
+            return self._delegate.set_prompt(prompt)
         if self.prompt_encoder is None:
             raise RuntimeError("prompt_conditioning enabled but prompt_encoder is not initialized")
         self._prompt_ctx["prompt_emb"], self._prompt_ctx["prompt_pad_mask"] = self.prompt_encoder([prompt])
 
     @torch.inference_mode()
     def append_frame(self, img: Tensor, ctrl: CtrlInput = None):
+        if self._delegate is not None:
+            return self._delegate.append_frame(img, ctrl=ctrl)
         assert img.dtype == torch.uint8, img.dtype
         x0 = self.vae.encode(img).unsqueeze(1)
         inputs = self.prep_inputs(x=x0, ctrl=ctrl)
@@ -145,6 +177,8 @@ class WorldEngine:
 
     @torch.inference_mode()
     def gen_frame(self, ctrl: CtrlInput = None, return_img: bool = True):
+        if self._delegate is not None:
+            return self._delegate.gen_frame(ctrl=ctrl, return_img=return_img)
         x = torch.randn(self.frm_shape, device=self.device, dtype=self.dtype)
         inputs = self.prep_inputs(x=x, ctrl=ctrl)
         x0 = self._denoise_pass(x, inputs, self.kv_cache).clone()

@@ -23,9 +23,22 @@ dependencies = [
   "gemlite @ https://github.com/dropbox/gemlite/archive/ebfcc197d694acd4ca8dfaadf5fceb3570401df3.zip",
 ]
 
+[project.optional-dependencies]
+# Torch-free DiT inference backend. Opt in via `pip install world_engine[quark]`
+# and instantiate `WorldEngine(..., backend="quark")`. The VAE + prompt encoder
+# still run on torch today (unchanged core deps); this extra only layers in the
+# quark stack for the DiT hot path.
+# TODO: once the VAE is ported to quark, flip core/extra so torch becomes the
+# optional extra.
+quark = [
+  "quark",
+  "numpy",
+]
+
 [tool.setuptools]
 packages = [
   "world_engine",
+  "world_engine.backends",
   "world_engine.model",
 ]
 
