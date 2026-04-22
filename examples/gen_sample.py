@@ -16,8 +16,11 @@ from world_engine import WorldEngine, CtrlInput
 backend = "quark" if "--quark" in sys.argv else "torch"
 argv = [a for a in sys.argv if a != "--quark"]
 
+# Match generate.py's default --bf16 --fp8 config on the quark path.
+quant = "fp8w8a8" if backend == "quark" else None
+
 # Create inference engine
-engine = WorldEngine(argv[1], quant=None, device="cuda", backend=backend)
+engine = WorldEngine(argv[1], quant=quant, device="cuda", backend=backend)
 
 
 # Define sequence of controller inputs applied
