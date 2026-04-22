@@ -58,33 +58,32 @@ def _qt_borrow(t: torch.Tensor):
 
 
 def _map_config(we_cfg):
-    """Map ``world_engine`` OmegaConf config → ``Waypoint15Config``."""
+    """Map ``world_engine`` OmegaConf config → ``Waypoint15Config``.
+
+    Only fields actually present on the yaml are forwarded — the rest
+    fall back to ``Waypoint15Config`` dataclass defaults, which match
+    the implicit defaults baked into the torch world_engine code.
+    """
     from quark.models.waypoint_15 import Waypoint15Config
 
-    return Waypoint15Config(
-        d_model=we_cfg.d_model,
-        n_layers=we_cfg.n_layers,
-        n_heads=we_cfg.n_heads,
-        n_kv_heads=we_cfg.n_kv_heads,
-        mlp_ratio=we_cfg.mlp_ratio,
-        channels=we_cfg.channels,
-        patch=tuple(we_cfg.patch),
-        height=we_cfg.height,
-        width=we_cfg.width,
-        local_window=we_cfg.local_window,
-        global_window=we_cfg.global_window,
-        global_pinned_dilation=we_cfg.global_pinned_dilation,
-        global_attn_period=we_cfg.global_attn_period,
-        global_attn_offset=we_cfg.global_attn_offset,
-        value_residual=we_cfg.value_residual,
-        fourier_dim=we_cfg.fourier_dim,
-        scheduler_sigmas=tuple(we_cfg.scheduler_sigmas),
-        n_buttons=we_cfg.n_buttons,
-        ctrl_conditioning=we_cfg.ctrl_conditioning is not None,
-        ctrl_conditioning_period=we_cfg.ctrl_conditioning_period,
-        # TODO: confirm whether the Waypoint-1.5 ckpt is f16 or bf16.
-        use_f16=False,
+    _SCALAR_FIELDS = (
+        "d_model", "n_layers", "n_heads", "n_kv_heads", "mlp_ratio",
+        "channels", "height", "width",
+        "local_window", "global_window", "global_pinned_dilation",
+        "global_attn_period", "global_attn_offset",
+        "value_residual", "fourier_dim",
+        "n_buttons", "ctrl_conditioning_period",
     )
+    kwargs = {name: we_cfg[name] for name in _SCALAR_FIELDS if name in we_cfg}
+    if "patch" in we_cfg:
+        kwargs["patch"] = tuple(we_cfg.patch)
+    if "scheduler_sigmas" in we_cfg:
+        kwargs["scheduler_sigmas"] = tuple(we_cfg.scheduler_sigmas)
+    if "ctrl_conditioning" in we_cfg:
+        kwargs["ctrl_conditioning"] = we_cfg.ctrl_conditioning is not None
+    # TODO: confirm whether the Waypoint-1.5 ckpt is f16 or bf16.
+    kwargs["use_f16"] = False
+    return Waypoint15Config(**kwargs)
 
 
 def _resolve_safetensors_path(model_uri: str) -> str:
