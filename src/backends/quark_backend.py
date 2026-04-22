@@ -86,6 +86,120 @@ def _map_config(we_cfg):
     return Waypoint15Config(**kwargs)
 
 
+def _remap_state_dict(raw_sd: dict, cfg) -> dict:
+    """Transform a world_engine-saved state dict into the layout quark's
+    ``Waypoint15`` expects (merged ``qkv_proj``, split ``ctrl_fusion``,
+    per-block ``attn_cond``/``mlp_cond`` heads, etc.).
+
+    CUDA-only copy of ``scripts/generate.py::remap_state_dict`` in the
+    quark repo. TODO: factor the canonical version into a shared
+    ``quark.models.convert`` module and import from there.
+    """
+    from quark.runtime.tensor import QuarkTensor
+
+    sd: dict = {}
+    d = cfg.d_model
+    ph, pw = cfg.patch
+    C = cfg.channels
+
+    w = raw_sd["patchify.weight"]
+    sd["patchify.weight"] = w.reshape(d, C * ph * pw) if w.ndim == 4 else w
+
+    w = raw_sd["unpatchify.weight"]
+    if w.ndim == 4:
+        w = w.permute(1, 2, 3, 0).reshape(C * ph * pw, d)
+    sd["unpatchify.weight"] = w
+
+    b = raw_sd["unpatchify.bias"]
+    if int(b.shape[0]) == C:
+        # Tile [C] → [C*ph*pw] by repeating each element ph*pw times.
+        import struct as _struct
+
+        b_f32 = b.astype("f32")
+        b_vals = list(_struct.unpack(f"<{C}f", b_f32.to_bytes()))
+        tiled = []
+        for v in b_vals:
+            tiled.extend([v] * (ph * pw))
+        b = QuarkTensor.from_list(tiled, dtype="f32").astype(raw_sd["unpatchify.bias"].dtype)
+    sd["unpatchify.bias"] = b
+
+    sd["noise_fc1.weight"] = raw_sd["denoise_step_emb.mlp.fc1.weight"]
+    sd["noise_fc2.weight"] = raw_sd["denoise_step_emb.mlp.fc2.weight"]
+    sd["out_norm_proj.weight"] = raw_sd["out_norm.fc.weight"]
+
+    for i in range(cfg.n_layers):
+        p = f"transformer.blocks.{i}."
+
+        if p + "cond_head.bias_in" in raw_sd:
+            sd[f"blocks.{i}.attn_cond_bias_in"] = raw_sd[p + "cond_head.bias_in"]
+            sd[f"blocks.{i}.mlp_cond_bias_in"] = raw_sd[p + "cond_head.bias_in"]
+            for j in range(6):
+                sd[f"blocks.{i}.cond_projs.{j}.weight"] = raw_sd[
+                    p + f"cond_head.cond_proj.{j}.weight"
+                ]
+        else:
+            sd[f"blocks.{i}.attn_cond_bias_in"] = raw_sd[p + "attn_cond_head.bias_in"]
+            sd[f"blocks.{i}.mlp_cond_bias_in"] = raw_sd[p + "mlp_cond_head.bias_in"]
+            for j in range(3):
+                sd[f"blocks.{i}.cond_projs.{j}.weight"] = raw_sd[
+                    p + f"attn_cond_head.cond_proj.{j}.weight"
+                ]
+                sd[f"blocks.{i}.cond_projs.{j+3}.weight"] = raw_sd[
+                    p + f"mlp_cond_head.cond_proj.{j}.weight"
+                ]
+
+        q_w = raw_sd[p + "attn.q_proj.weight"]
+        k_w = raw_sd[p + "attn.k_proj.weight"]
+        v_w = raw_sd[p + "attn.v_proj.weight"]
+        sd[f"blocks.{i}.qkv_proj.weight"] = QuarkTensor.cat([q_w, k_w, v_w], dim=0)
+        sd[f"blocks.{i}.out_proj.weight"] = raw_sd[p + "attn.out_proj.weight"]
+
+        fc1 = p + ("mlp.fc1.weight" if p + "mlp.fc1.weight" in raw_sd else "dit_mlp.fc1.weight")
+        fc2 = p + ("mlp.fc2.weight" if p + "mlp.fc2.weight" in raw_sd else "dit_mlp.fc2.weight")
+        sd[f"blocks.{i}.mlp.fc1.weight"] = raw_sd[fc1]
+        sd[f"blocks.{i}.mlp.fc2.weight"] = raw_sd[fc2]
+
+        if cfg.value_residual and p + "attn.v_lamb" in raw_sd:
+            lamb = raw_sd[p + "attn.v_lamb"]
+            if lamb.ndim == 0:
+                lamb = lamb.reshape(1)
+            sd[f"blocks.{i}.v_residual.lamb"] = lamb.astype("f32")
+
+        if cfg.ctrl_conditioning:
+            fc1_x_key = p + "ctrl_mlpfusion.fc1_x.weight"
+            fc1_c_key = p + "ctrl_mlpfusion.fc1_c.weight"
+            fc2_key = p + "ctrl_mlpfusion.fc2.weight"
+            if fc1_x_key in raw_sd:
+                sd[f"blocks.{i}.ctrl_fusion.fc1_x.weight"] = raw_sd[fc1_x_key]
+                sd[f"blocks.{i}.ctrl_fusion.fc1_c.weight"] = raw_sd[fc1_c_key]
+                sd[f"blocks.{i}.ctrl_fusion.fc2.weight"] = raw_sd[fc2_key]
+            elif p + "ctrl_mlpfusion.mlp.fc1.weight" in raw_sd:
+                fc1_cat = raw_sd[p + "ctrl_mlpfusion.mlp.fc1.weight"]
+                d_model = int(fc1_cat.shape[1]) // 2
+                sd[f"blocks.{i}.ctrl_fusion.fc1_x.weight"] = fc1_cat[:, :d_model]
+                sd[f"blocks.{i}.ctrl_fusion.fc1_c.weight"] = fc1_cat[:, d_model:]
+                sd[f"blocks.{i}.ctrl_fusion.fc2.weight"] = raw_sd[
+                    p + "ctrl_mlpfusion.mlp.fc2.weight"
+                ]
+
+    ctrl_fc1_key = "ctrl_emb.mlp.fc1.weight"
+    if cfg.ctrl_conditioning and ctrl_fc1_key in raw_sd:
+        fc1_w = raw_sd[ctrl_fc1_key]  # [d_mid, n_buttons+3]
+        # Pad columns to a multiple of 16 for GEMM tile alignment.
+        raw_k = int(fc1_w.shape[1])
+        padded_k = ((raw_k + 15) // 16) * 16
+        if padded_k > raw_k:
+            w_np = (fc1_w.astype("f32") if fc1_w.dtype != "f32" else fc1_w).to_numpy()
+            padded = np.zeros((w_np.shape[0], padded_k), dtype=np.float32)
+            padded[:, :raw_k] = w_np
+            half_dt = "f16" if cfg.use_f16 else "bf16"
+            fc1_w = QuarkTensor.from_numpy(padded, dtype=half_dt)
+        sd["ctrl_emb.fc1.weight"] = fc1_w
+        sd["ctrl_emb.fc2.weight"] = raw_sd["ctrl_emb.mlp.fc2.weight"]
+
+    return sd
+
+
 def _resolve_safetensors_path(model_uri: str) -> str:
     """Return a local path to ``model.safetensors`` for ``model_uri``.
 
@@ -152,8 +266,8 @@ class QuarkBackend:
         self.model = Waypoint15(cfg)
 
         if load_weights:
-            state = load_safetensors(_resolve_safetensors_path(model_uri), dtype="bf16")
-            self.model.load_state_dict(state)
+            raw = load_safetensors(_resolve_safetensors_path(model_uri), dtype="bf16")
+            self.model.load_state_dict(_remap_state_dict(raw, cfg), strict=False)
 
         if quant is None:
             fp8 = False
