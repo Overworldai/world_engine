@@ -296,7 +296,15 @@ class QuarkBackend:
                 else {}
             ),
         )
-        self.frm_shape = (1, 1, cfg.channels, cfg.height * pH, cfg.width * pW)
+        # Quark's Waypoint15 consumes a flat ``(1, C*H*W)`` latent; the
+        # Patchify kernel does the spatial reshape internally. The VAE
+        # however wants ``(1, C, H, W)``, so we track both shapes and
+        # reshape at the boundary.
+        pixel_h, pixel_w = cfg.height * pH, cfg.width * pW
+        self._pixel_shape = (1, cfg.channels, pixel_h, pixel_w)
+        self._flat_shape = (1, cfg.channels * pixel_h * pixel_w)
+        # Kept for backwards-compat with anything reading ``engine.frm_shape``.
+        self.frm_shape = (1, 1, cfg.channels, pixel_h, pixel_w)
 
         # Frame-rate mult retained for parity with the torch path. The
         # quark model owns ``frame_t`` on device; we keep a host mirror
@@ -307,12 +315,13 @@ class QuarkBackend:
         self._frame_counter = 0
 
         # Stable noise + output buffers for the graph hot path. torch
-        # owns the memory; quark borrows the pointer. Refill noise every
-        # frame via ``torch.randn(out=self._noise_torch)`` so the capture
-        # buffer stays at a fixed address (graph-stable).
-        self._noise_torch = torch.empty(self.frm_shape, device=self.device, dtype=self.dtype)
+        # owns the memory; quark borrows the pointer. Noise buffer is
+        # flat (quark's input shape); output buffer is 4D (VAE input).
+        # Refill noise every frame via ``torch.randn(out=...)`` so the
+        # capture buffer stays at a fixed address (graph-stable).
+        self._noise_torch = torch.empty(self._flat_shape, device=self.device, dtype=self.dtype)
         self._noise_qt = _qt_borrow(self._noise_torch)
-        self._latent_out_torch = torch.empty(self.frm_shape, device=self.device, dtype=self.dtype)
+        self._latent_out_torch = torch.empty(self._pixel_shape, device=self.device, dtype=self.dtype)
 
         # Stable ctrl device buffer (bf16). Filled in place per frame via
         # memcpy_htod so the graph captures a fixed pointer.
@@ -358,8 +367,11 @@ class QuarkBackend:
     def append_frame(self, img: torch.Tensor, ctrl=None) -> torch.Tensor:
         """VAE-encode ``img``, run a commit-only pass (no denoise) to
         write this frame's KV, then VAE-decode and return the image."""
-        x0 = self.vae.encode(img).unsqueeze(1).contiguous()
-        x0_qt = _qt_borrow(x0)
+        x0_pixel = self.vae.encode(img)  # (1, C, H, W) for VAE round-trip
+        # Quark's Waypoint15 consumes a flat (1, C*H*W) latent — Patchify
+        # does the spatial reshape internally.
+        x0_flat = x0_pixel.reshape(self._flat_shape).contiguous()
+        x0_qt = _qt_borrow(x0_flat)
         ctrl_qt = self._encode_ctrl(ctrl)
         ctrl_emb = self.model.encode_ctrl(ctrl_qt)
         self.model(
@@ -371,7 +383,7 @@ class QuarkBackend:
         )
         self.gen.frame_t.increment()
         self._frame_counter += 1
-        return self.vae.decode(x0.squeeze(1))
+        return self.vae.decode(x0_pixel)
 
     @torch.inference_mode()
     def gen_frame(self, ctrl=None, return_img: bool = True):
@@ -392,7 +404,7 @@ class QuarkBackend:
         # is a native kernel (~µs), much faster than QuarkTensor.randn's
         # scalar-Python-loop RNG — and refilling in place keeps the
         # borrowed QuarkTensor's pointer graph-stable.
-        torch.randn(self.frm_shape, out=self._noise_torch)
+        torch.randn(self._flat_shape, out=self._noise_torch)
         ctrl_qt = self._encode_ctrl(ctrl)
 
         if not self._graph_ready:
@@ -422,8 +434,8 @@ class QuarkBackend:
             self._latent_out_torch.data_ptr(), latent_qt.data_ptr(), nbytes
         )
 
-        x0 = self._latent_out_torch.squeeze(1)
-        return self.vae.decode(x0) if return_img else x0
+        # self._latent_out_torch is already (1, C, H, W) — the shape the VAE wants.
+        return self.vae.decode(self._latent_out_torch) if return_img else self._latent_out_torch
 
     def get_state(self):
         raise NotImplementedError(
