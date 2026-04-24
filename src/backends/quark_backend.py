@@ -119,14 +119,18 @@ class QuarkBackend:
             raw = load_safetensors(_resolve_safetensors_path(model_uri), dtype="bf16")
             self.model.load_state_dict(remap_world_engine_state_dict(raw, cfg), strict=False)
 
-        if quant is None:
-            fp8 = False
-        elif quant == "fp8w8a8":
-            fp8 = True
-        else:
+        # Quark defaults to fp8 cuBLAS on sm_89+. ``QUARK_NO_FP8`` flips
+        # the whole model to bf16 weights + activations everywhere — the
+        # safe fallback when fp8 is misbehaving or the device doesn't
+        # support it. The ``quant`` kwarg is kept for API parity with the
+        # torch backend but isn't the knob to use here (intw8a8/nvfp4
+        # are torch-only; set ``WORLD_ENGINE_BACKEND``'s default for those).
+        fp8 = os.environ.get("QUARK_NO_FP8", "").lower() not in ("1", "true", "yes")
+        if quant not in (None, "fp8w8a8"):
             raise NotImplementedError(
-                f"QuarkBackend: quant={quant!r} not supported (only fp8w8a8 / None). "
-                f"Unset WORLD_ENGINE_BACKEND for intw8a8/nvfp4."
+                f"QuarkBackend: quant={quant!r} not supported "
+                f"(set QUARK_NO_FP8=1 for bf16, or unset WORLD_ENGINE_BACKEND "
+                f"for intw8a8/nvfp4)."
             )
         self.model.prepare(fp8=fp8)
         self.gen = GenerateFrame(self.model)

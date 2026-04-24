@@ -3,7 +3,6 @@
 
 import cv2
 import imageio.v3 as iio
-import os
 import random
 import sys
 import urllib.request
@@ -14,11 +13,9 @@ import torch
 from world_engine import WorldEngine, CtrlInput
 
 
-# Match generate.py's default --bf16 --fp8 config on the quark path.
-quant = "fp8w8a8" if os.environ.get("WORLD_ENGINE_BACKEND") == "quark" else None
-
-# Create inference engine
-engine = WorldEngine(sys.argv[1], quant=quant, device="cuda")
+# Create inference engine. The quark backend runs bf16/fp8 cuBLAS by
+# default; set QUARK_NO_FP8=1 to force bf16 everywhere.
+engine = WorldEngine(sys.argv[1], device="cuda")
 
 
 # Define sequence of controller inputs applied
