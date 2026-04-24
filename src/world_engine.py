@@ -67,6 +67,7 @@ class WorldEngine:
             )
             self.device = self._delegate.device
             self.dtype = self._delegate.dtype
+            self.model_cfg = self._delegate.we_cfg
             return
         if backend != "torch":
             raise ValueError(f"backend must be 'torch' or 'quark', got {backend!r}")
