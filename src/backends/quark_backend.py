@@ -107,11 +107,30 @@ class QuarkBackend:
                 stacklevel=2,
             )
 
+        # Quark defaults to fp8 cuBLAS on sm_89+. ``QUARK_NO_FP8`` flips
+        # the whole model to bf16 weights, KV cache, and attention MMAs
+        # — the safe fallback when fp8 is misbehaving or the device
+        # doesn't support it. Must be decided BEFORE constructing
+        # ``Waypoint15``: the KV cache dtype and OwlAttn compute_dtype
+        # are baked in at ``TransformerBlock.__init__`` time, not in
+        # ``prepare()``. The ``quant`` kwarg is kept for API parity
+        # with the torch backend but isn't the knob to use here
+        # (intw8a8/nvfp4 are torch-only).
+        use_fp8 = os.environ.get("QUARK_NO_FP8", "").lower() not in ("1", "true", "yes")
+        if quant not in (None, "fp8w8a8"):
+            raise NotImplementedError(
+                f"QuarkBackend: quant={quant!r} not supported "
+                f"(set QUARK_NO_FP8=1 for bf16, or unset WORLD_ENGINE_BACKEND "
+                f"for intw8a8/nvfp4)."
+            )
+
         # ── Model ────────────────────────────────────────────────
         # use_f16=False pins the residual stream to bf16, which matches
         # the ``torch.bfloat16`` latent + ctrl + VAE pipe on this side
         # and avoids an f16↔bf16 cast at the borrowed-buffer boundary.
-        cfg = Waypoint15Config.from_world_engine(self.we_cfg, use_f16=False)
+        cfg = Waypoint15Config.from_world_engine(
+            self.we_cfg, use_f16=False, use_fp8=use_fp8
+        )
         self.cfg = cfg
         self.model = Waypoint15(cfg)
 
@@ -119,20 +138,7 @@ class QuarkBackend:
             raw = load_safetensors(_resolve_safetensors_path(model_uri), dtype="bf16")
             self.model.load_state_dict(remap_world_engine_state_dict(raw, cfg), strict=False)
 
-        # Quark defaults to fp8 cuBLAS on sm_89+. ``QUARK_NO_FP8`` flips
-        # the whole model to bf16 weights + activations everywhere — the
-        # safe fallback when fp8 is misbehaving or the device doesn't
-        # support it. The ``quant`` kwarg is kept for API parity with the
-        # torch backend but isn't the knob to use here (intw8a8/nvfp4
-        # are torch-only; set ``WORLD_ENGINE_BACKEND``'s default for those).
-        fp8 = os.environ.get("QUARK_NO_FP8", "").lower() not in ("1", "true", "yes")
-        if quant not in (None, "fp8w8a8"):
-            raise NotImplementedError(
-                f"QuarkBackend: quant={quant!r} not supported "
-                f"(set QUARK_NO_FP8=1 for bf16, or unset WORLD_ENGINE_BACKEND "
-                f"for intw8a8/nvfp4)."
-            )
-        self.model.prepare(fp8=fp8)
+        self.model.prepare()  # fp8 defaults to cfg.use_fp8 on the quark side
         self.gen = GenerateFrame(self.model)
         self._graph_ready = False
 
