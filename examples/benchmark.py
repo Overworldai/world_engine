@@ -1,5 +1,5 @@
 # MODEL_URI="Overworld/Waypoint-1.5-1B" uv run --dev pytest examples/benchmark.py
-# BACKEND=quark MODEL_URI="Overworld/Waypoint-1.5-1B" uv run --dev --with-editable /Users/work/popcorn pytest examples/benchmark.py
+# QUARK_MAX_AUTOTUNE=1 WORLD_ENGINE_BACKEND=quark MODEL_URI="Overworld/Waypoint-1.5-1B" uv run --dev --with-editable /Users/work/popcorn pytest examples/benchmark.py
 
 import os
 import pytest
@@ -10,12 +10,11 @@ from world_engine import WorldEngine, CtrlInput
 
 
 MODEL_URI = os.environ.get("MODEL_URI", "Overworld/Waypoint-1-Small")
-BACKEND = os.environ.get("BACKEND", "torch")
 
 # Match generate.py's --bf16 --fp8 config on the quark path; the quark
 # backend does not currently implement intw8a8 (that path pulls in
 # gemlite, which is torch-only).
-_QUANT = "fp8w8a8" if BACKEND == "quark" else "intw8a8"
+_QUANT = "fp8w8a8" if os.environ.get("WORLD_ENGINE_BACKEND") == "quark" else "intw8a8"
 
 
 def version_with_commit(pkg):
@@ -66,7 +65,6 @@ def get_warm_engine(model_uri, model_overrides=None):
         quant=_QUANT,
         device="cuda",
         load_weights=False,
-        backend=BACKEND,
     )
 
     # global warmup — first call on the quark backend also triggers the

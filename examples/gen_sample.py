@@ -1,8 +1,9 @@
 # uv run --dev examples/gen_sample.py Overworld/Waypoint-1.5-1B
-# uv run --dev --with-editable /Users/work/popcorn examples/gen_sample.py Overworld/Waypoint-1.5-1B --quark
+# WORLD_ENGINE_BACKEND=quark uv run --dev --with-editable /Users/work/popcorn examples/gen_sample.py Overworld/Waypoint-1.5-1B
 
 import cv2
 import imageio.v3 as iio
+import os
 import random
 import sys
 import urllib.request
@@ -13,14 +14,11 @@ import torch
 from world_engine import WorldEngine, CtrlInput
 
 
-backend = "quark" if "--quark" in sys.argv else "torch"
-argv = [a for a in sys.argv if a != "--quark"]
-
 # Match generate.py's default --bf16 --fp8 config on the quark path.
-quant = "fp8w8a8" if backend == "quark" else None
+quant = "fp8w8a8" if os.environ.get("WORLD_ENGINE_BACKEND") == "quark" else None
 
 # Create inference engine
-engine = WorldEngine(argv[1], quant=quant, device="cuda", backend=backend)
+engine = WorldEngine(sys.argv[1], quant=quant, device="cuda")
 
 
 # Define sequence of controller inputs applied

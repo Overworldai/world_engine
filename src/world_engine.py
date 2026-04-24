@@ -1,4 +1,5 @@
 from typing import Dict, Optional, Set, Tuple
+import os
 import torch
 from torch import Tensor
 from dataclasses import dataclass, field
@@ -42,18 +43,20 @@ class WorldEngine:
         device=None,
         dtype=torch.bfloat16,
         load_weights: bool = True,
-        backend: str = "torch",
     ):
         """
         model_uri: HF URI or local folder containing model.safetensors and config.yaml
         quant: None | intw8a8 | fp8w8a8 | nvfp4
         model_config_overrides: Dict to override model config values
         - auto_aspect_ratio: set to False to work in ae raw space, otherwise in/out are 720p or 360p
-        backend: "torch" (default) | "quark" — routes DiT inference through the
-            quark stack. The VAE stays on torch either way. backend="quark" does
-            not yet support prompt conditioning — see backends/quark_backend.py.
+
+        Set ``WORLD_ENGINE_BACKEND=quark`` to route DiT inference through
+        the quark stack (VAE stays on torch either way). Default is the
+        torch backend. The quark backend does not yet support prompt
+        conditioning — see ``backends/quark_backend.py``.
         """
         self._delegate = None
+        backend = os.environ.get("WORLD_ENGINE_BACKEND", "torch")
         if backend == "quark":
             from .backends import QuarkBackend
 
@@ -69,7 +72,9 @@ class WorldEngine:
             self.dtype = self._delegate.dtype
             return
         if backend != "torch":
-            raise ValueError(f"backend must be 'torch' or 'quark', got {backend!r}")
+            raise ValueError(
+                f"WORLD_ENGINE_BACKEND must be 'torch' or 'quark', got {backend!r}"
+            )
 
         self.dtype = torch.get_default_dtype() if dtype is None else dtype
         self.device = torch.device(torch.get_default_device() if device is None else device)

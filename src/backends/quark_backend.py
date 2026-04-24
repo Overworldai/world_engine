@@ -58,7 +58,7 @@ def _qt_borrow(t: torch.Tensor, dtype: str = "bf16"):
 
 
 class QuarkBackend:
-    """Delegate owned by ``WorldEngine`` when ``backend="quark"``.
+    """Delegate owned by ``WorldEngine`` when ``WORLD_ENGINE_BACKEND=quark``.
 
     Public surface matches the methods ``WorldEngine`` forwards:
     ``reset``, ``set_prompt``, ``append_frame``, ``gen_frame``,
@@ -102,7 +102,7 @@ class QuarkBackend:
                 "QuarkBackend: prompt_conditioning is enabled on this config "
                 "but prompt cross-attention has not been ported to quark yet. "
                 "The prompt will be ignored — outputs will be degraded vs. "
-                "the torch backend. Use backend='torch' for prompted inference.",
+                "the torch backend. Unset WORLD_ENGINE_BACKEND for prompted inference.",
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -126,7 +126,7 @@ class QuarkBackend:
         else:
             raise NotImplementedError(
                 f"QuarkBackend: quant={quant!r} not supported (only fp8w8a8 / None). "
-                f"Use backend='torch' for intw8a8/nvfp4."
+                f"Unset WORLD_ENGINE_BACKEND for intw8a8/nvfp4."
             )
         self.model.prepare(fp8=fp8)
         self.gen = GenerateFrame(self.model)
@@ -189,7 +189,7 @@ class QuarkBackend:
         # through ``Waypoint15``. For now, ignored.
         warnings.warn(
             "QuarkBackend.set_prompt: ignored — prompt cross-attention not "
-            "yet ported to quark. Switch to backend='torch' for prompted "
+            "yet ported to quark. Unset WORLD_ENGINE_BACKEND for prompted "
             "inference.",
             RuntimeWarning,
             stacklevel=2,
