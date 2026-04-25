@@ -17,10 +17,11 @@ dependencies = [
   "huggingface-hub>=1.7.0",
   "omegaconf",
   "accelerate==1.12.0",
-  # Triton (platform-specific)
+  "gemlite @ https://github.com/dropbox/gemlite/archive/ebfcc197d694acd4ca8dfaadf5fceb3570401df3.zip",
+
+  # Platform Specific:
   "triton==3.6.0; sys_platform == 'linux'",
   "triton-windows==3.6.0.post26; sys_platform == 'win32'",
-  "gemlite @ https://github.com/dropbox/gemlite/archive/ebfcc197d694acd4ca8dfaadf5fceb3570401df3.zip",
 ]
 
 [project.optional-dependencies]

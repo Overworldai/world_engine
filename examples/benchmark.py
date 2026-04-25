@@ -90,7 +90,7 @@ def test_img_decoder_only(benchmark, engine, last_latent):
 MODEL_OVERRIDES = [None]
 
 
-@pytest.mark.parametrize("blocking", [True, False])
+@pytest.mark.parametrize("blocking", [False])
 @pytest.mark.parametrize("dit_only", [True])
 @pytest.mark.parametrize("n_frames", [256])
 @pytest.mark.parametrize(
