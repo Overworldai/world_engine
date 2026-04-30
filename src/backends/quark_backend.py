@@ -141,6 +141,7 @@ class QuarkBackend:
         self.model.prepare()  # fp8 defaults to cfg.use_fp8 on the quark side
         self.gen = GenerateFrame(self.model)
         self._graph_ready = False
+        self._set_prompt_warned = False
 
         # Persistent ctrl input: stable bf16 device buffer + host packer.
         # ``fill(ctrl)`` memcpy_htod's into the same pointer every frame so
@@ -196,14 +197,17 @@ class QuarkBackend:
 
     def set_prompt(self, prompt: str) -> None:
         # TODO: port ``CrossAttention`` to ``quark.nn`` + wire prompt_emb
-        # through ``Waypoint15``. For now, ignored.
-        warnings.warn(
-            "QuarkBackend.set_prompt: ignored — prompt cross-attention not "
-            "yet ported to quark. Unset WORLD_ENGINE_BACKEND for prompted "
-            "inference.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
+        # through ``Waypoint15``. For now, ignored. Warn once per
+        # backend instance so a per-frame caller doesn't get spammed.
+        if not self._set_prompt_warned:
+            warnings.warn(
+                "QuarkBackend.set_prompt: ignored — prompt cross-attention not "
+                "yet ported to quark. Unset WORLD_ENGINE_BACKEND for prompted "
+                "inference.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self._set_prompt_warned = True
 
     @torch.inference_mode()
     def append_frame(self, img: torch.Tensor, ctrl=None) -> torch.Tensor:
