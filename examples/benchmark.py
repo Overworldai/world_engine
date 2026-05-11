@@ -56,7 +56,7 @@ def get_warm_engine(model_uri, model_overrides=None):
     engine = WorldEngine(
         model_uri,
         model_config_overrides=model_config_overrides,
-        quant="intw8a8",
+        quant=None,
         device="cuda",
         load_weights=False
     )
@@ -89,7 +89,7 @@ def test_img_decoder_only(benchmark, engine, last_latent):
 MODEL_OVERRIDES = [None]
 
 
-@pytest.mark.parametrize("blocking", [True, False])
+@pytest.mark.parametrize("blocking", [False])
 @pytest.mark.parametrize("dit_only", [True])
 @pytest.mark.parametrize("n_frames", [256])
 @pytest.mark.parametrize(

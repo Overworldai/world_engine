@@ -33,7 +33,13 @@ class BaseModel(nn.Module):
         dtype = torch.get_default_dtype() if dtype is None else dtype
 
         try:
-            path = huggingface_hub.snapshot_download(path)
+            path = huggingface_hub.snapshot_download(
+                path,
+                allow_patterns=[
+                    "config.yaml",
+                    "model.safetensors",
+                ],
+            )
         except Exception:
             pass
 
@@ -43,7 +49,9 @@ class BaseModel(nn.Module):
 
         if load_weights:
             safetensors_path = os.path.join(path, "model.safetensors")
-            model.load_state_dict(load_file(safetensors_path, device=device), strict=True)
+            assert device.type != "cuda" or device.index is not None
+            load_device = device.index if device.type == "cuda" else device.type
+            model.load_state_dict(load_file(safetensors_path, device=load_device), strict=True)
 
         return model
 

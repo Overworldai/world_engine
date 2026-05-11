@@ -79,6 +79,50 @@ class CFG(nn.Module):
         return x if is_conditioned else null
 
 
+class MoE(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.top_k = config.moe_top_k
+
+        d_intermediate = int(config.d_model * config.mlp_ratio / self.top_k)
+        self.router = nn.Linear(config.d_model, config.moe_n_experts, bias=False)
+        self.expert_in = nn.Parameter(torch.empty(config.moe_n_experts, d_intermediate, config.d_model))
+        self.expert_out = nn.Parameter(torch.empty(config.moe_n_experts, config.d_model, d_intermediate))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # grouped_mm requires bf16 inputs and breaks w/ autocast
+        assert x.is_cuda and not torch.is_autocast_enabled(x.device.type)
+        assert x.dtype == self.expert_in.dtype == self.expert_out.dtype == torch.bfloat16
+
+        orig_shape = x.shape
+        x = x.reshape(-1, orig_shape[-1])
+
+        # Route tokens to top_k experts and norm weights (must add to 1.0)
+        scores, expert = self.router(x).topk(self.top_k, dim=-1, sorted=False)
+        weights = (scores - scores.logsumexp(-1, True)).exp()
+
+        # Sort token/expert into expert-major order for grouped_mm
+        expert_sorted, sort_idx = expert.flatten().sort()
+        counts = expert_sorted.new_zeros(self.expert_in.size(0), dtype=torch.int32)
+        counts.scatter_add_(0, expert_sorted, torch.ones_like(expert_sorted, dtype=torch.int32))
+        offsets = torch.cumsum(counts, 0, dtype=torch.int32)
+
+        # Pack tokens by expert + append one dummy row for grouped_mm.
+        src = sort_idx // self.top_k
+        x_grouped = F.pad(x.index_select(0, src), (0, 0, 0, 1))
+
+        # Run the expert MLPs as two grouped GEMMs
+        h = F.grouped_mm(x_grouped, self.expert_in.transpose(-2, -1), offs=offsets)
+        h[-1].zero_()  # ensure last row initialized
+        h = F.silu(h)
+        y_grp = F.grouped_mm(h, self.expert_out.transpose(-2, -1), offs=offsets)[:-1]
+
+        # Restore token-major order and combine expert outputs
+        y = torch.empty_like(y_grp).index_copy_(0, sort_idx, y_grp).view(x.size(0), self.top_k, -1)
+        return (y.float() * weights.unsqueeze(-1)).sum(dim=1).type_as(x).reshape(orig_shape)
+
+
 class MLP(nn.Module):
     def __init__(self, dim_in, dim_middle, dim_out):
         super().__init__()
@@ -144,10 +188,13 @@ class WorldDiTBlock(nn.Module):
         super().__init__()
         self.config = config
         self.attn = Attn(config, layer_idx)
-        self.mlp = MLP(config.d_model, config.d_model * config.mlp_ratio, config.d_model)
+        if getattr(config, "moe", False):
+            self.mlp = MoE(config)
+        else:
+            self.mlp = MLP(config.d_model, config.d_model * config.mlp_ratio, config.d_model)
         self.cond_head = CondHead(config)
 
-        do_prompt_cond = config.prompt_conditioning is not None and layer_idx % config.prompt_conditioning_period == 0
+        do_prompt_cond = config.prompt_conditioning and layer_idx % config.prompt_conditioning_period == 0
         self.prompt_cross_attn = CrossAttention(config, config.prompt_embedding_dim) if do_prompt_cond else None
         do_ctrl_cond = config.ctrl_conditioning_period is not None and layer_idx % config.ctrl_conditioning_period == 0
         self.ctrl_mlpfusion = MLPFusion(config) if do_ctrl_cond else None
@@ -217,7 +264,6 @@ class WorldModel(BaseModel):
     """
     def __init__(self, config):
         super().__init__()
-
         self.config = config
         assert config.tokens_per_frame == config.height * config.width
 
@@ -308,6 +354,15 @@ class WorldModel(BaseModel):
 
         return x
 
+    def get_active_parameters(self) -> int:
+        total = sum(p.numel() for p in self.parameters())
+        c = self.config
+        if getattr(c, "moe", False):
+            moe_mlp_ratio = getattr(c, "moe_mlp_ratio", None) or c.mlp_ratio / c.moe_top_k
+            hidden, top_k = int(c.d_model * moe_mlp_ratio), min(c.moe_top_k, c.moe_n_experts)
+            total -= (c.moe_n_experts - top_k) * c.n_layers * c.d_model * hidden * 2
+        return total
+
     def load_state_dict(self, state_dict, strict=True, assign=False):
         if self.config.model_type != "waypoint-1.5":
             return super().load_state_dict(state_dict, strict=strict, assign=assign)
@@ -323,8 +378,7 @@ class WorldModel(BaseModel):
 
         for i in range(self.config.n_layers):
             p = f"transformer.blocks.{i}."
-
-            for name in ("fc1.weight", "fc2.weight"):
+            for name in ("fc1.weight", "fc2.weight", "expert_in", "expert_out", "router.weight"):
                 old = p + "dit_mlp." + name
                 if old in state_dict:
                     state_dict.setdefault(p + "mlp." + name, state_dict.pop(old))
