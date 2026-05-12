@@ -257,7 +257,7 @@ class Engine:
         assert self.seed is not None, "call set_seed() first"
         self.inner.reset()
         t = torch.from_numpy(self.seed).to(self.inner.device)  # uint8 (H, W, 3)
-        tc = self.inner.model_cfg.temporal_compression
+        tc = self.temporal_compression
         if tc > 1:
             # Multi-frame models (e.g. Waypoint-1.5) consume/produce a stack of
             # `temporal_compression` frames per step.
