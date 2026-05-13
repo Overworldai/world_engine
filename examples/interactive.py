@@ -252,8 +252,8 @@ class Engine:
         # .copy() — PIL's buffer is read-only and torch.from_numpy requires writable.
         self.seed = np.asarray(cropped).copy()
 
-    def prime(self) -> None:
-        """Reset state and encode the seed frame into the KV cache."""
+    def reset(self) -> None:
+        """Clear KV cache and re-encode the seed frame."""
         assert self.seed is not None, "call set_seed() first"
         self.inner.reset()
         t = torch.from_numpy(self.seed).to(self.inner.device)  # uint8 (H, W, 3)
@@ -262,7 +262,7 @@ class Engine:
             # Multi-frame models (e.g. Waypoint-1.5) consume/produce a stack of
             # `temporal_compression` frames per step.
             t = t.unsqueeze(0).expand(tc, -1, -1, -1).contiguous()
-        log.info("priming engine with seed shape=%s", tuple(t.shape))
+        log.info("resetting engine with seed shape=%s", tuple(t.shape))
         self.inner.append_frame(t)
 
     def warmup(self) -> torch.Tensor:
@@ -280,14 +280,6 @@ class Engine:
         """
         return self.inner.gen_frame(ctrl=ctrl)
 
-    def reset(self) -> None:
-        """Reset all state and re-prime the seed.
-
-        reset() clears the KV cache and all state, so the model must be
-        re-seeded with append_frame before it can produce coherent output.
-        """
-        self.prime()
-
 
 # --- gameplay ----------------------------------------------------------------
 
@@ -298,10 +290,10 @@ class GameState:
 
     renderer: Renderer
     engine: Engine
-    clock: pygame.time.Clock
     mouse_sensitivity: float
     uncap_fps: bool = False
     paused: bool = True
+    clock: pygame.time.Clock = field(init=False, default_factory=pygame.time.Clock)
     held_vks: set[int] = field(default_factory=set)
     """Currently pressed Windows VK codes, forwarded as `CtrlInput.button`."""
     scroll: int = 0
@@ -316,19 +308,11 @@ class GameState:
     _pace_s: float = 0.0
     """Pacing interval used by the last render_frame call."""
 
-    @property
-    def temporal_compression(self) -> int:
-        return self.engine.temporal_compression
-
-    @property
-    def fps_cap(self) -> int:
-        """0 = uncapped; otherwise the model's inference_fps."""
-        return 0 if self.uncap_fps else self.engine.inference_fps
-
     def _compute_pace(self) -> float:
         """Compute pacing interval for render_frame, accounting for overhead."""
-        # Target interval from the model's intended visual framerate.
-        target_s = self.temporal_compression / self.fps_cap if self.fps_cap > 0 else 0.0
+        # Target interval from the model's intended visual framerate. 0 = uncapped.
+        fps_cap = 0 if self.uncap_fps else self.engine.inference_fps
+        target_s = self.engine.temporal_compression / fps_cap if fps_cap > 0 else 0.0
         # Subtract measured non-render overhead so the *total* cycle hits target_s.
         # Use SLEEP_RATIO of batch_dt as a floor so the render never fills the entire
         # overlap window (batch_dt includes render time — pacing to 100% diverges).
@@ -340,7 +324,7 @@ class GameState:
             self.renderer.render_frame(
                 self.pending,
                 self.batch_dt,
-                self.temporal_compression,
+                self.engine.temporal_compression,
                 self._compute_pace(),
             )
             self.pending = None
@@ -430,7 +414,7 @@ class GameState:
         pipeline design. The first iteration after (un)pause has no previous
         batch to render, so there is no GPU overlap on that frame.
         """
-        self.renderer.render_frame(self.pending, 0.0, self.temporal_compression, 0.0)
+        self.renderer.render_frame(self.pending, 0.0, self.engine.temporal_compression, 0.0)
         self.pending = None
         log.info("ready")
 
@@ -462,7 +446,7 @@ class GameState:
                 self.renderer.render_frame(
                     self.pending,
                     self.batch_dt,
-                    self.temporal_compression,
+                    self.engine.temporal_compression,
                     self._pace_s,
                 )
             self.pending = next_frames.cpu()
@@ -516,21 +500,19 @@ def main() -> None:
 
     pygame.init()
     renderer = Renderer(args.model_uri)
-    clock = pygame.time.Clock()
 
     try:
         renderer.draw_status("Loading model…")
         engine = Engine(args.model_uri, args.quant, args.device)
         renderer.draw_status("Loading seed…")
         engine.set_seed(get_seed(args.seed))
-        renderer.draw_status("Priming engine…")
-        engine.prime()
+        renderer.draw_status("Resetting engine…")
+        engine.reset()
         renderer.draw_status("Warming up (torch.compile)…")
         first = engine.warmup()
         GameState(
             renderer,
             engine,
-            clock,
             args.mouse_sensitivity,
             uncap_fps=args.uncap_fps,
             pending=first,
