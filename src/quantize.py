@@ -14,18 +14,20 @@ try:
 except ImportError:
     pass
 try:
-    config_path = "gemlite_config.json"
     from gemlite.helper import A8W8_INT8_dynamic
     import gemlite
+except ImportError:
+    A8W8_INT8_dynamic = None
 
+
+def _gemlite_autotune():
+    config_path = "gemlite_config.json"
     if os.path.exists(config_path):
         gemlite.load_config(config_path)
-    else: 
+    else:
         gemlite.set_autotune("max")
         gemlite.helper.warmup(shapes=[(128,2048), (2048,2048), (2048,8192), (4096,2048), (8192,2048)], batch_sizes=[1], processor=A8W8_INT8_dynamic())
         gemlite.cache_config(config_path)
-except ImportError:
-    A8W8_INT8_dynamic = None
 
 
 @torch.library.custom_op("world_engine::fp4_linear", mutates_args=())
@@ -273,7 +275,10 @@ class INT8W8A8GemLite(nn.Module):
 def quantize_model(model: nn.Module, quant: str, _prefix: str = ""):
     if quant is None:
         return model
-    
+
+    if quant == "intw8a8" and A8W8_INT8_dynamic is not None and _prefix == "":
+        _gemlite_autotune()
+
     def eligible(m: nn.Module, fqn: str) -> bool:
         w = getattr(m, "weight", None)
         if not isinstance(m, nn.Linear):
