@@ -101,18 +101,17 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p results
-          # Use the PR's harness against BOTH engine installs so only the
-          # world_engine package differs between refs.
-          cp pr/examples/ci.py main/examples/ci.py
+          # Always invoke the PR's copy of the script, but switch the uv project
+          # per ref so only the world_engine install differs between runs.
+          script="$GITHUB_WORKSPACE/pr/.github/benchmark.py"
           while IFS='|' read -r id uri quant; do
             [ -z "$id" ] && continue
             for ref in main pr; do   # main first: it creates the shared state
-              ( cd "$ref" && uv sync --extra dev >/dev/null && \
-                uv run python examples/ci.py run \
-                  --config-id "$id" --ref "$ref" \
-                  --model-uri "$uri" --quant "$quant" \
-                  --shared-state "$GITHUB_WORKSPACE/results/state_${id}.pt" \
-                  --out "$GITHUB_WORKSPACE/results" )
+              uv run --project "$ref" --group dev python "$script" run \
+                --config-id "$id" --ref "$ref" \
+                --model-uri "$uri" --quant "$quant" \
+                --shared-state "$GITHUB_WORKSPACE/results/state_${id}.pt" \
+                --out "$GITHUB_WORKSPACE/results"
             done
           done <<< "${CONFIGS}"
       - uses: actions/upload-artifact@v4
@@ -133,7 +132,7 @@ jobs:
       - name: Build summary
         run: |
           pip install --quiet numpy
-          python examples/ci.py compare --results-dir results --out results/summary.md
+          python .github/benchmark.py compare --results-dir results --out results/summary.md
       - name: Comment on PR
         uses: actions/github-script@v7
         with:

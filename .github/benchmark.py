@@ -1,25 +1,20 @@
 #!/usr/bin/env python3
-"""world_engine CI perf + consistency harness (issue #48).
+"""GPU benchmark + consistency for the world_engine CI (issue #48).
 
-Provider-agnostic: this script knows nothing about GCP/GitHub Actions. Given a
-WorldEngine config it runs a performance rollout (LFPS) and/or a deterministic
-consistency forward pass, writing JSON results (+ a latent .npy for
-consistency) to --out. A separate `compare` subcommand turns a directory of
-per-ref results into a markdown table (perf delta + consistency MSE).
+Run on the ephemeral G4 runner by .github/workflows/benchmark.yml. `run` does a
+performance rollout (LFPS) and a deterministic consistency forward pass for one
+(config, ref) and writes a JSON result + a latent .npy. `compare` turns the
+collected results into a markdown table (perf delta + consistency MSE). The
+workflow runs `run` against both the main and PR world_engine installs (only
+the engine code differs); "main" runs first and creates the shared KV-cache
+state that "pr" then loads.
 
-The CI workflow runs the SAME copy of this script against two world_engine
-installs (main and the PR HEAD) so that only the engine code differs.
-
-Usage:
-  # produce results for one (config, ref); run "main" first so it creates the
-  # shared KV-cache state that "pr" then loads.
-  python examples/ci.py run \
+  python .github/benchmark.py run \
       --config-id wp15-1b-bf16 --ref main \
       --model-uri Overworld/Waypoint-1.5-1B --quant none \
       --shared-state results/state_wp15-1b-bf16.pt --out results
 
-  # aggregate
-  python examples/ci.py compare --results-dir results --out results/summary.md
+  python .github/benchmark.py compare --results-dir results --out results/summary.md
 """
 import argparse
 import json
