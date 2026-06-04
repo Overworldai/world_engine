@@ -10,8 +10,8 @@
 #   WIF_PROVIDER_DEV     - overworld-dev WIF provider (infra bootstrap output)
 #   WE_CI_PROVISIONER_SA - dev-we-ci-provisioner@overworld-dev.iam.gserviceaccount.com
 #   WE_CI_NODE_SA        - dev-we-ci-node@overworld-dev.iam.gserviceaccount.com
-#   GH_RUNNER_PAT        - PAT (or App token) with repo Administration:write,
-#                          used to mint runner registration tokens
+#   WE_CI_APP_ID         - GitHub App (Administration:write) id, for minting
+#                          runner registration tokens
 #   HF_TOKEN             - Hugging Face token for gated Overworld/* model pulls
 #
 # NOTE: requires the standard (non-preemptible) RTX PRO 6000 quota in
@@ -59,10 +59,18 @@ jobs:
           workload_identity_provider: ${{ secrets.WIF_PROVIDER_DEV }}
           service_account: ${{ secrets.WE_CI_PROVISIONER_SA }}
       - uses: google-github-actions/setup-gcloud@v2
+      # App installation token: carries the App's Administration:write directly.
+      # Auto-scoped to this repo (the App is installed only here), auto-masked, expires in 1h.
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.WE_CI_APP_ID }}
+          private-key: ${{ secrets.WE_CI_APP_PRIVATE_KEY }}
       - name: Mint runner registration token
         id: reg
         env:
-          GH_RUNNER_PAT: ${{ secrets.GH_RUNNER_PAT }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
           # Capture the HTTP status separately from the body so a failed mint
@@ -70,7 +78,7 @@ jobs:
           # empty token (the default shell here has no pipefail, so a plain
           # `curl -f | jq` masks curl's failure behind jq's exit 0).
           code=$(curl -sS -o resp.json -w '%{http_code}' -X POST \
-            -H "Authorization: Bearer ${GH_RUNNER_PAT}" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${{ github.repository }}/actions/runners/registration-token")
           echo "registration-token HTTP ${code}"
