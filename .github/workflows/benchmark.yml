@@ -36,8 +36,12 @@ env:
   MACHINE_TYPE: g4-standard-48
   IMAGE_FAMILY: common-cu129-ubuntu-2404-nvidia-580
   IMAGE_PROJECT: deeplearning-platform-release
-  RUNNER_NAME: we-ci-${{ github.run_id }}
-  RUNNER_LABEL: gha-${{ github.run_id }}
+  # NB: do NOT name these RUNNER_NAME / RUNNER_* — those are reserved built-in
+  # Actions env vars the runner overrides at runtime (RUNNER_NAME becomes the
+  # hosted runner's own name, e.g. "GitHub Actions 123"), which then gets passed
+  # as the GCE instance name and rejected as an invalid resource name.
+  GH_RUNNER_NAME: we-ci-${{ github.run_id }}
+  GH_RUNNER_LABEL: gha-${{ github.run_id }}
   # WorldEngine configs to test (issue #48 starter set). id|model_uri|quant
   CONFIGS: |
     wp15-1b-bf16|Overworld/Waypoint-1.5-1B|none
@@ -67,7 +71,7 @@ jobs:
           echo "token=$token" >> "$GITHUB_OUTPUT"
       - name: Create ephemeral GPU runner VM
         run: |
-          gcloud compute instances create "$RUNNER_NAME" \
+          gcloud compute instances create "$GH_RUNNER_NAME" \
             --project "$GCP_PROJECT" --zone "$ZONE" \
             --machine-type "$MACHINE_TYPE" \
             --maintenance-policy TERMINATE --provisioning-model STANDARD \
@@ -76,7 +80,7 @@ jobs:
             --service-account "${{ secrets.WE_CI_NODE_SA }}" --scopes cloud-platform \
             --max-run-duration 3h --instance-termination-action DELETE \
             --metadata-from-file startup-script=.github/runner-startup.sh \
-            --metadata "gh_repo=${{ github.repository }},runner_token=${{ steps.reg.outputs.token }},runner_name=$RUNNER_NAME,runner_labels=$RUNNER_LABEL"
+            --metadata "gh_repo=${{ github.repository }},runner_token=${{ steps.reg.outputs.token }},runner_name=$GH_RUNNER_NAME,runner_labels=$GH_RUNNER_LABEL"
 
   benchmark:
     needs: start-runner
@@ -158,5 +162,5 @@ jobs:
       - uses: google-github-actions/setup-gcloud@v2
       - name: Delete runner VM
         run: |
-          gcloud compute instances delete "$RUNNER_NAME" \
+          gcloud compute instances delete "$GH_RUNNER_NAME" \
             --project "$GCP_PROJECT" --zone "$ZONE" --quiet || true
