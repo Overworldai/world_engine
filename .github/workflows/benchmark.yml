@@ -61,14 +61,29 @@ jobs:
       - uses: google-github-actions/setup-gcloud@v2
       - name: Mint runner registration token
         id: reg
+        env:
+          GH_RUNNER_PAT: ${{ secrets.GH_RUNNER_PAT }}
         run: |
-          token=$(curl -fsX POST \
-            -H "Authorization: token ${{ secrets.GH_RUNNER_PAT }}" \
+          set -euo pipefail
+          # Capture the HTTP status separately from the body so a failed mint
+          # fails loudly with the real reason instead of silently yielding an
+          # empty token (the default shell here has no pipefail, so a plain
+          # `curl -f | jq` masks curl's failure behind jq's exit 0).
+          code=$(curl -sS -o resp.json -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer ${GH_RUNNER_PAT}" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/runners/registration-token" \
-            | jq -r .token)
-          echo "::add-mask::$token"
-          echo "token=$token" >> "$GITHUB_OUTPUT"
+            "https://api.github.com/repos/${{ github.repository }}/actions/runners/registration-token")
+          echo "registration-token HTTP ${code}"
+          if [ "${code}" != "201" ]; then
+            # .message/.documentation_url are non-sensitive error text, never the token
+            echo "::error::failed to mint runner registration token (HTTP ${code})"
+            jq -r '.message // "", .documentation_url // ""' resp.json || true
+            exit 1
+          fi
+          token=$(jq -er .token resp.json)
+          echo "::add-mask::${token}"
+          echo "token=${token}" >> "$GITHUB_OUTPUT"
+          rm -f resp.json
       - name: Create ephemeral GPU runner VM
         run: |
           gcloud compute instances create "$GH_RUNNER_NAME" \
