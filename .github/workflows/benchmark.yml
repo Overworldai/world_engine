@@ -105,8 +105,31 @@ jobs:
             --metadata-from-file startup-script=.github/runner-startup.sh \
             --metadata "gh_repo=${{ github.repository }},runner_token=${{ steps.reg.outputs.token }},runner_name=$GH_RUNNER_NAME,runner_labels=$GH_RUNNER_LABEL"
 
+      # The startup script registers the runner on the VM; its output goes to the
+      # serial console, invisible to Actions. Without this gate, a failed
+      # registration leaves the `benchmark` job queued (waiting for a runner that
+      # never comes) until GitHub's ~24h auto-fail, with no signal. Poll the
+      # runners API for our label; on timeout, dump the serial console so the
+      # startup failure is visible here, then fail fast so stop-runner tears down.
+      - name: Wait for runner to register
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 40); do            # ~10 min @ 15s
+            online=$(gh api "repos/${{ github.repository }}/actions/runners" \
+              --jq "[.runners[] | select(any(.labels[]; .name==\"$GH_RUNNER_LABEL\")) | select(.status==\"online\")] | length")
+            if [ "${online:-0}" -ge 1 ]; then echo "runner online"; exit 0; fi
+            echo "waiting for runner ($i/40)…"; sleep 15
+          done
+          echo "::error::runner '$GH_RUNNER_NAME' never came online — serial console follows:"
+          gcloud compute instances get-serial-port-output "$GH_RUNNER_NAME" \
+            --project "$GCP_PROJECT" --zone "$ZONE" || true
+          exit 1
+
   benchmark:
     needs: start-runner
+    timeout-minutes: 90   # backstop for a runner that registers then stalls mid-build
     runs-on: [self-hosted, "gha-${{ github.run_id }}"]
     env:
       CUBLAS_WORKSPACE_CONFIG: ":4096:8"   # required for deterministic cuBLAS

@@ -11,8 +11,13 @@
 # The base image (Deep Learning VM, common-cu129-…-nvidia-580) already has the
 # NVIDIA driver; world_engine deps are installed by the workflow's job steps.
 set -euo pipefail
+# Echo every command and announce the failing line. This output lands on the VM
+# serial console, which the workflow's "Wait for runner to register" step dumps
+# into the Actions log if registration doesn't complete in time.
+set -x
+trap 'echo "[runner-startup] FAILED at line ${LINENO} (exit $?)" >&2' ERR
 
-RUNNER_VERSION="2.323.0"   # TODO: pin to the current actions/runner release
+RUNNER_VERSION="2.334.0"
 meta() { curl -s -H "Metadata-Flavor: Google" \
   "http://metadata.google.internal/computeMetadata/v1/instance/attributes/$1"; }
 
@@ -29,6 +34,10 @@ mkdir -p /actions-runner && cd /actions-runner
 curl -sL -o runner.tar.gz \
   "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
 tar xzf runner.tar.gz
+
+# Install the runner's OS dependencies (libicu et al.). Missing libs are a
+# common silent cause of config.sh failing on minimal/base images.
+./bin/installdependencies.sh
 
 ./config.sh \
   --unattended \
