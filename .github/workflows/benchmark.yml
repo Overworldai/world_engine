@@ -15,7 +15,7 @@
 #   HF_TOKEN             - Hugging Face token for gated Overworld/* model pulls
 #
 # NOTE: requires the standard (non-preemptible) RTX PRO 6000 quota in
-# overworld-dev/us-central1, which is currently 0 (request pending). Until then
+# overworld-dev/us-south1, which is currently 0 (request pending). Until then
 # the create step fails on quota — switch --provisioning-model to SPOT to test
 # against the preemptible quota (subject to capacity / mid-run preemption).
 
@@ -32,7 +32,7 @@ permissions:
 
 env:
   GCP_PROJECT: overworld-dev
-  ZONE: us-central1-b
+  ZONE: us-south1-a
   MACHINE_TYPE: g4-standard-48
   IMAGE_FAMILY: common-cu129-ubuntu-2404-nvidia-580
   IMAGE_PROJECT: deeplearning-platform-release
